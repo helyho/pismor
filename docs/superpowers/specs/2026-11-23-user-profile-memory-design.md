@@ -77,7 +77,7 @@ stateDiagram-v2
     active --> degraded: 反证(refuted) / 90天无强化且conf<0.7(stale, taboo除外) / 矛盾落败(conflict_lost)
     degraded --> active: 新强化证据 conf>=0.85
     active --> archived: UPDATE 覆盖旧值(superseded)
-    degraded --> archived: 180天无引用(stale)
+    degraded --> archived: 180天无任何更新(stale)
     archived --> [*]: 压缩合并——初版不做(§18-4)，依赖原始日志可重建
 ```
 
@@ -206,26 +206,33 @@ regression_cases:
 
 ```sql
 CREATE TABLE entries (
-  id TEXT NOT NULL,              -- {dimension}_{topic}
   user_source TEXT NOT NULL, user_id TEXT NOT NULL,
   dimension TEXT NOT NULL, topic TEXT NOT NULL, scope TEXT NOT NULL,
+  id TEXT NOT NULL,              -- 展示用 {dimension}_{topic}；跨 scope 同 id 合法（scope 在键中区分）
   confidence REAL NOT NULL,
   status TEXT NOT NULL,          -- pending_review|orphan_topic|active|degraded|archived
   body TEXT NOT NULL,            -- 一句话正文 ≤200 字符
   created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+  last_reinforced_at TEXT NOT NULL,  -- 降级判定依据: "N天无强化"以此计, 区别于 updated_at(任何变更都刷新)
   degraded_reason TEXT, superseded_by TEXT, topic_new TEXT,
-  conflict_with TEXT,            -- JSON 数组: 对端条目 id
+  conflict_with TEXT,            -- JSON 数组: 对端条目
   reinforcements INTEGER NOT NULL DEFAULT 0,
   archived_at TEXT,
-  PRIMARY KEY (id, user_source, user_id),
-  UNIQUE (user_source, user_id, dimension, topic, scope)
+  PRIMARY KEY (user_source, user_id, dimension, topic, scope)  -- 同 key 唯一即主键; scope 必须在键内
 );
 CREATE TABLE sources (          -- 证据链 1:N，无 quote 入库被写入器拒绝
+  seq INTEGER PRIMARY KEY,      -- 自增: 同一轮可能对同一条目产生多条不同 kind 的证据
   entry_id TEXT, user_source TEXT, user_id TEXT,
   session TEXT NOT NULL, turn INTEGER NOT NULL,
   quote TEXT NOT NULL, kind TEXT NOT NULL,
-  PRIMARY KEY (entry_id, user_source, user_id, session, turn),
-  FOREIGN KEY (entry_id, user_source, user_id) REFERENCES entries(id, user_source, user_id)
+  FOREIGN KEY (entry_id, user_source, user_id) REFERENCES entries(user_source, user_id, dimension, topic, scope)
+);
+CREATE TABLE pending_clarifications (  -- 已发出的澄清问题, 供回流关联(§11)
+  user_source TEXT, user_id TEXT,
+  conflicting_ids TEXT NOT NULL,       -- JSON 数组
+  question TEXT NOT NULL, issued_at TEXT NOT NULL,
+  ttl_days INTEGER NOT NULL DEFAULT 7, -- 超期作废, 矛盾退回复核队列化解
+  PRIMARY KEY (user_source, user_id, issued_at)
 );
 CREATE TABLE review_history (   -- 复核判定与澄清判定留痕
   entry_id TEXT, user_source TEXT, user_id TEXT,
@@ -236,7 +243,7 @@ CREATE TABLE review_history (   -- 复核判定与澄清判定留痕
 CREATE TABLE events_seen (      -- 幂等键持久化，webhook 重放天然去重
   session TEXT, turn INTEGER, ts TEXT,
   PRIMARY KEY (session, turn)
-);
+);                              -- 前提: session_id 全局唯一由日志平台保证
 CREATE TABLE tombstones (       -- 用户删除权: 只留痕不存内容
   user_source TEXT, user_id TEXT, deleted_at TEXT, requested_by TEXT,
   PRIMARY KEY (user_source, user_id)
@@ -356,7 +363,7 @@ flowchart TD
 - **抽取输入只带 id 列表与词表**，不带现有条目正文——比对集中在决策步，防抽取器锚定现有画像导致错误自我固化（该分工不可合并）。id 列表按维度截断、只带同 scope 相关维度；截断的漏报风险由复核队列统计兜底。
 - **四路决策**：ADD / UPDATE（同 scope 同 topic 演进，旧值归档回填 superseded_by）/ CONFLICT-FLAG（真矛盾，见 §11）/ NOOP（重复，reinforcements+1）。决策由 LLM 输出但受 schema 枚举约束。
 - **per-user 串行**：由数据库唯一约束+事务替代（文件方案的文件级防竞争不再需要）；仍保留按用户分批提交以缩小事务粒度。
-- **每日聚合任务（跨用户）**：orphan_topic 观察区晋升/废弃（§8）、降级扫描（90 天无强化且 conf<0.7）、复核队列超期废弃、（taxonomy 变更时）回归样例执行。
+- **每日聚合任务（跨用户）**：orphan_topic 观察区晋升/废弃（§8.2）、pending_clarifications 过期清理（§11）、降级扫描（90 天无强化且 conf<0.7，以 last_reinforced_at 计）、degraded→archived（180 天无任何更新）、复核队列超期废弃、（taxonomy 变更时）回归样例执行。
 
 ### 成本模型
 
@@ -380,7 +387,7 @@ flowchart TD
 2. **taboo 不参与时间衰减降级**——恒胜约束的是优先级，寿命由反证决定。降级仅两条路径：反证（后续行为明确违背该禁忌，feedback 证据触发，degraded_reason=refuted）、同 topic 归并（多个同 topic taboo 合并为一条桶式表述，如十条格式禁忌归并为 `taboo_format`）。
 3. 必带集中 taboo 超顶（>40 条）：本响应按得分截 taboo 尾部至预算 60%，**同时触发归并复审任务**——不静默截断了事。
 
-**澄清回流（初版实现）**：装配器检测到同 scope 同 topic 的 conflict_with 对时，从两条矛盾条目的摘要按模板拼出 `clarification_needed: [{conflicting_ids, question}]`（模板拼接，不调 LLM）。是否向用户发问由消费方决定；用户回答随对话轮回流入管线，抽取时标 `kind: clarification`，视同 explicit 直通决策步——据此完成 UPDATE、作用域拆分或单侧降级，矛盾消除后 conflict_with 清空、字段归空。澄清的价值常在二选一之外：用户的回答往往揭示真实的作用域边界（如"聊天随意、写东西正式"→ scope 拆分），比人工复核的二元判定产出更精确。
+**澄清回流（初版实现）**：装配器检测到同 scope 同 topic 的 conflict_with 对时，从两条矛盾条目的摘要按模板拼出 `clarification_needed: [{conflicting_ids, question}]`（模板拼接，不调 LLM），同时写入 `pending_clarifications` 表（TTL 默认 7 天）。是否向用户发问由消费方决定；收到该用户新消息时管线先查该表——存在未过期问题且消息被 LLM 判定为对问题的回答，则该轮证据标 `kind: clarification`，视同 explicit 直通决策步——据此完成 UPDATE、作用域拆分或单侧降级，矛盾消除后 conflict_with 清空、pending 记录删除、字段归空；判定为无关消息则走普通流程。TTL 超期的 pending 记录由每日聚合清理，矛盾退回复核队列化解。澄清的价值常在二选一之外：用户的回答往往揭示真实的作用域边界（如"聊天随意、写东西正式"→ scope 拆分），比人工复核的二元判定产出更精确。
 
 ## 12. 淘汰与归档
 
@@ -388,7 +395,7 @@ flowchart TD
 
 - 降级触发：被 UPDATE 否决（superseded）；90 天无强化且 conf<0.7（stale；taboo 除外，见 §11）；矛盾复核落败（conflict_lost）。
 - degraded 不进默认画像包，仅检索显式命中时以"曾观察：…"前缀注入——降级不是删除，用户回到旧项目时旧偏好仍可被召回。
-- archived：status 变更 + `archived_at` 时间戳，库内保留全部字段与证据链（§18-4 压缩合并推迟，初版只进不出）。
+- archived：status 变更 + `archived_at` 时间戳，库内保留全部字段与证据链（§18-4 压缩合并推迟，初版只进不出）。180 天无任何更新（updated_at 计）即由每日扫描归档。
 - 压缩合并初版不做（§18-4）。
 
 ## 13. 装配（加载）
@@ -397,7 +404,7 @@ flowchart TD
 
 ```mermaid
 flowchart TD
-    A[装配请求] --> B[(SQLite 查询: status=active<br/>按维度/作用域/置信过滤)]
+    A[装配请求] --> B[(SQLite 查询<br/>status IN (active, degraded)<br/>按维度/作用域过滤)]
     B --> C[必带集: taboo 全量 + identity 全量]
     C --> T{taboo 条数 > 40?}
     T -->|是| T1[按得分截 taboo 至预算 60%<br/>触发归并复审任务]
@@ -494,7 +501,7 @@ taxonomy 回归样例随版本变更必跑（§7），反例（转述、敏感�
 | 演进项 | 触发条件（可测） |
 |---|---|
 | 嵌入检索启用 | 词面未召回占比 >15% 或变化检测漏检率 >15%；基础设施已随本期就位（§20），触发后仅开配置开关 |
-| 多实例 | 管线排队延迟 >5s 持续一周 |
+| 多实例 | 管线排队延迟 >5s 持续一周；SQLite 单写者架构下多实例与服务端数据库迁移联动（§19 下一条），二者同时切换 |
 | 服务端数据库（Postgres+pgvector） | SQLite 操作 P99 >100ms 或用户数 >1 万 |
 | Git 版本化 | §18-5 事故触发 |
 | archive 压缩 | §18-4 容量触发 |
@@ -506,6 +513,8 @@ taxonomy 回归样例随版本变更必跑（§7），反例（转述、敏感�
 **选型**：SQLite + sqlite-vec。嵌入式零部署零运维、事务原生、WAL 持久性，与单体进程架构同构。服务端数据库（Postgres+pgvector）保留为多用户产品化演进项（§19）。
 
 **备份与恢复（真相源的必须项）**：每日 `VACUUM INTO 'backup-YYYYMMDD.db'` 快照至独立路径（保留 30 份）；启动时 `PRAGMA integrity_check`。库损坏恢复顺序：最近备份 → 日志重放重建管线（兜底，§0 原则 1）。
+
+**删除权与备份滞留声明**：用户行使删除权只清空主库；历史备份快照中的该用户数据继续存在至该快照轮换过期（≤30 天）——这是删除的传播延迟上限，写入 tombstones 表可追溯。合规敏感部署可缩短备份保留期或对备份加密；快照不作查阅用途，仅用于灾难恢复。
 
 **嵌入服务（外部，配置化）**：向量化不本地推理，调用外部 embedding 服务，全部经配置提供、不绑定供应商（默认假设 OpenAI 兼容 `/v1/embeddings` 协议）：
 
@@ -527,4 +536,4 @@ embedding:
 
 ## 21. 评审后修复与决策变更记录
 
-设计经多轮评审收敛：第一轮 10 条不足（成本触发、锚定效应、key 归一化、词面匹配、可靠性、合规、预算语义等）全部合入；第二轮 15 条（4 P0：注入载体、写竞争、taboo 积压、回放矛盾；5 P1：闭环缺失；6 P2：取舍写明）全部合入；第三轮 YAGNI 瘦身见 §18。第四轮决策变更（2026-11-23）：clarification_needed 澄清回流恢复为初版实现（§11、§14）；orphan_topic 两段式晋升恢复为初版实现（§6、§8、§10）；新增 SQLite 索引层与外部嵌入服务配置化（§20）。第五轮决策变更（2026-11-23）：**存储翻转——SQLite 升级为唯一真相源（§20），md 降为导出视图（§8.2）**；连带修订：条目+证据+向量同事务（双写一致性消除）、`events_seen` 幂等表（§18-7 关闭）、per-user 文件锁被唯一约束替代、降级链与备份策略重写（§0 原则 4、§13）、导出接口新增（§16-5）、md 模板章节改为导出视图模板（§9）。
+设计经多轮评审收敛：第一轮 10 条不足（成本触发、锚定效应、key 归一化、词面匹配、可靠性、合规、预算语义等）全部合入；第二轮 15 条（4 P0：注入载体、写竞争、taboo 积压、回放矛盾；5 P1：闭环缺失；6 P2：取舍写明）全部合入；第三轮 YAGNI 瘦身见 §18。第四轮决策变更（2026-11-23）：clarification_needed 澄清回流恢复为初版实现（§11、§14）；orphan_topic 两段式晋升恢复为初版实现（§6、§8、§10）；新增 SQLite 索引层与外部嵌入服务配置化（§20）。第五轮决策变更（2026-11-23）：**存储翻转——SQLite 升级为唯一真相源（§20），md 降为导出视图（§8.2）**；连带修订：条目+证据+向量同事务（双写一致性消除）、`events_seen` 幂等表（§18-7 关闭）、per-user 文件锁被唯一约束替代、降级链与备份策略重写（§0 原则 4、§13）、导出接口新增（§16-5）、md 模板章节改为导出视图模板（§9）。第六轮复审（2026-11-23，针对存储翻转）：修复 entries 主键缺 scope 导致跨作用域同 topic 冲突的 schema bug；补 `last_reinforced_at`（降级判定依据）与 `pending_clarifications`（澄清回流关联+TTL）两表；声明删除权与备份滞留（≤30 天）的合规边界；sources 改自增主键；澄清"180 天无引用"为"无任何更新"；多实例演进与服务端数据库迁移联动。

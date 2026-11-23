@@ -46,7 +46,7 @@ id: pref_lang                     # {dimension}_{topic}，topic 受词表枚举�
 dimension: preference             # 五维之一，见 §7
 scope: global                     # global | project:{name}
 confidence: 0.92                  # 流水线闸门参数，非统计概率
-status: active                    # active | degraded | archived
+status: active                    # pending_review | orphan_topic | active | degraded | archived
 created_at: 2026-11-23T10:00:00+08:00   # 单时间戳（瘦身后：occurred_at 不独立存在）
 updated_at: 2026-12-02T09:14:00+08:00
 sources:                          # 证据链，无 quote 不允许入库（schema 硬约束）
@@ -70,7 +70,10 @@ superseded_by: null
 ```mermaid
 stateDiagram-v2
     [*] --> active: 词表内; explicit>=0.85 直通; inferred<=0.8 复核通过后
+    [*] --> pending_review: inferred 0.6~0.85 / 审计隔离, 落 pending_review.md
     [*] --> orphan_topic: 词表外主题(topic_new), 入观察区 pending_topics.md
+    pending_review --> active: 复核 approve/fix
+    pending_review --> [*]: discard 或超期自动废弃
     orphan_topic --> active: 每日聚合晋升(归并优先或新建桶)+re-key
     orphan_topic --> [*]: 30天未达门槛(复现<3次/30天), 废弃
     active --> degraded: 反证(refuted) / 90天无强化且conf<0.7(stale, taboo除外) / 矛盾落败(conflict_lost)
@@ -80,7 +83,7 @@ stateDiagram-v2
     archived --> [*]: 压缩合并——初版不做(§18-4)，依赖原始日志可重建
 ```
 
-非法迁移（archived→active、degraded 直接归档跳级等）由写入器拒绝，每日审计按此图校验存量。taboo 维度的降级特则见 §11。
+非法迁移（archived→active、degraded 直接归档跳级、pending 两种未生效态之间的互跳等）由写入器拒绝，每日审计按此图校验存量。taboo 维度的降级特则见 §11。
 
 ## 7. Taxonomy（五维，瘦身后）
 
@@ -209,11 +212,12 @@ profiles/{source}/{native_id}/      # user_ref 双段隔离，多平台互不污
   shell.md               # preference + fact + context（易变外壳）
   projects/{name}.md     # 项目域
   pending_topics.md      # 观察区：orphan_topic 条目（词表外），不进 _index.md
+  pending_review.md      # 复核队列条目（inferred 0.6~0.85 / 审计隔离），不进 _index.md
   archive/               # 降级条目按月归档，初版只进不出
     2026-11.md
 ```
 
-观察区约定：`pending_topics.md` 内条目 `status: orphan_topic`、带 `topic_new` 字段（一句主题描述），不进 `_index.md`、不参与 UPDATE/冲突判定、不进装配——索引行与小节一一对应的 invariant 改述为“_index 行与各文件非 orphan 小节一一对应”。每日聚合任务（跨用户全局跑）统计各 `topic_new` 的复现度：归并到现有桶优先（LLM 比对候选描述与词表），复现 ≥3 次/30 天判定为真实主题 → 经 `auto_promote` 开关决定自动写入 taxonomy.yaml（自动生成回归样例）或进人工队列 → 观察区相关条目 re-key 后转正进主索引；未达门槛且超 30 天废弃。**taboo 维度与 sensitive 挂载 topic 禁止自动建桶**，其词表外候选只进人工队列。
+观察区约定：`pending_topics.md` 内条目 `status: orphan_topic`、带 `topic_new` 字段（一句主题描述），不进 `_index.md`、不参与 UPDATE/冲突判定、不进装配——索引行与小节一一对应的 invariant 改述为“_index 行与各文件非 orphan/pending 小节一一对应”。复核队列条目同规则落 `pending_review.md`（status: pending_review），approve/fix 后移入正式维度文件并进索引。每日聚合任务（跨用户全局跑）统计各 `topic_new` 的复现度：归并到现有桶优先（LLM 比对候选描述与词表），复现 ≥3 次/30 天判定为真实主题 → 经 `auto_promote` 开关决定自动写入 taxonomy.yaml（自动生成回归样例）或进人工队列 → 观察区相关条目 re-key 后转正进主索引；未达门槛且超 30 天废弃。**taboo 维度与 sensitive 挂载 topic 禁止自动建桶**，其词表外候选只进人工队列。
 
 `_index.md` 一行一条目：`| id | dimension | scope | 摘要≤20字 | conf | status | 文件 | updated |`。条目按维度聚合为文件（避免数十万碎文件），小节级 Git-free diff 依赖文件内小节结构。
 

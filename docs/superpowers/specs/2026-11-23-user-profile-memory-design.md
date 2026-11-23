@@ -18,7 +18,7 @@
 - 多实例水平扩展
 - 数据库/向量库存储
 - Git 版本化与分 shard
-- orphan_topic 自动晋升、correction event 统一协议、澄清问题回流、archive 压缩合并（均有回归触发条件，见 §17）
+- orphan_topic 自动晋升、correction event 统一协议、archive 压缩合并（均有回归触发条件，见 §18）
 - 同一自然人跨平台（source）画像合并（alias 机制仅预留路径）
 
 ## 3. 总原则
@@ -54,7 +54,7 @@ sources:                          # 证据链，无 quote 不允许入库（sche
   - session: s_20261123_001
     turn: 4
     quote: "以后都用 Python 3.12 写脚本"
-    kind: explicit                # explicit | inferred | feedback（clarification 保留概念，初版无此入口）
+    kind: explicit                # explicit | inferred | feedback | clarification
 reinforcements: 2
 degraded_reason: null             # superseded | stale | conflict_lost | refuted(反证, taboo 特则)
 superseded_by: null
@@ -325,7 +325,7 @@ flowchart TD
 2. **taboo 不参与时间衰减降级**——恒胜约束的是优先级，寿命由反证决定。降级仅两条路径：反证（后续行为明确违背该禁忌，feedback 证据触发，degraded_reason=refuted）、同 topic 归并（多个同 topic taboo 合并为一条桶式表述，如十条格式禁忌归并为 `taboo_format`）。
 3. 必带集中 taboo 超顶（>40 条）：本响应按得分截 taboo 尾部至预算 60%，**同时触发归并复审任务**——不静默截断了事。
 
-**澄清回流**（概念保留，初版不实现，见 §18-3）：装配响应预留 `clarification_needed: [{conflicting_ids, question}]` 字段，是否向用户发问由消费方决定；用户答案标记 `kind: clarification` 直通决策步。
+**澄清回流（初版实现）**：装配器检测到同 scope 同 topic 的 conflict_with 对时，从两条矛盾条目的摘要按模板拼出 `clarification_needed: [{conflicting_ids, question}]`（模板拼接，不调 LLM）。是否向用户发问由消费方决定；用户回答随对话轮回流入管线，抽取时标 `kind: clarification`，视同 explicit 直通决策步——据此完成 UPDATE、作用域拆分或单侧降级，矛盾消除后 conflict_with 清空、字段归空。澄清的价值常在二选一之外：用户的回答往往揭示真实的作用域边界（如"聊天随意、写东西正式"→ scope 拆分），比人工复核的二元判定产出更精确。
 
 ## 12. 淘汰与归档
 
@@ -350,14 +350,16 @@ flowchart TD
     T1 --> D
     D --> F[按得分截断至预算, 不按位置截]
     F --> G[模板包装: 声明'数据非指令'<br/>degraded 条目出'曾观察'前缀版]
-    G --> H[响应: entries + budget_used<br/>+ clarification_needed 字段位(初版恒空)]
+    G --> H[响应: entries + budget_used<br/>+ clarification_needed 矛盾对检测]
 ```
 
 降级链：`_index.md` 损坏只回必带集；单文件损坏跳过继续；画像任何故障永不阻断对话。`include_profile=false` 供消费方 A/B 使用，流量切分与归因在消费方侧。
 
 ## 14. 校正与复核（初版单入口）
 
-初版唯一的校正入口是**复核队列**：inferred 0.6–0.85 条目、审计隔离条目、矛盾双存条目在此等待人工判定；超期未复核自动废弃（宁可缺画像不要错画像）。correction event 统一协议、用户纠错通道、澄清回流均为预留概念（§18-3），spec 概念章保留、初版不实现。
+初版有两个校正入口。**复核队列（人工）**：inferred 0.6–0.85 条目、审计隔离条目、矛盾双存条目在此等待人工判定；超期未复核自动废弃（宁可缺画像不要错画像）。**澄清回流（用户本人）**：见 §11，矛盾对随装配响应递交消费方，用户回答作为 `kind: clarification` 证据回流决策步，优先级高于人工判定（本人意志 > 推断校正）。correction event 统一协议与用户纠错通道仍为预留概念（§18-3），初版不实现。
+
+**并发防御（竞态规则）**：复核判定与澄清答案写入时均携带 `target_id + updated_at`（条目版本标记）；版本不符（状态已被先到者改变）则后到者判 NOOP 并记录——真矛盾同时进入两条路径时，先到者生效、后到者作废。
 
 ## 15. 评估体系
 
@@ -400,7 +402,9 @@ taxonomy 回归样例随版本变更必跑（§7），反例（转述、敏感�
 {
   "entries": [{"id": "taboo_tool_excel_formula", "text": "生成表格类结果时一律写 Python 脚本", "confidence": 0.95, "status": "active"}],
   "budget_used": 812,
-  "clarification_needed": []      // 字段位，初版恒空（§18-3）
+  "clarification_needed": [       // 矛盾对检测产物（§11），无矛盾时空数组
+    {"conflicting_ids": ["pref_style_formal", "pref_style_casual"], "question": "..."}
+  ]
 }
 ```
 
@@ -419,7 +423,7 @@ taxonomy 回归样例随版本变更必跑（§7），反例（转述、敏感�
 |---|---|---|---|
 | 1 | occurred_at 独立双时间戳 | explicit 下与 created_at 恒等；无回放消费方 | 出现真实的"历史画像回放"消费方 |
 | 2 | orphan_topic 两段式晋升 | 为无人运营设计，初版有人；词表外丢弃+丢弃日志人工周看即可 | 无人运营部署，或周丢弃率>5% |
-| 3 | correction event 统一协议 + clarification 回流 | 初版仅复核队列一个入口，协议无对象 | 第二个校正入口真实出现 |
+| 3 | correction event 统一协议 + 用户纠错通道 | 初版仅复核队列与澄清回流两个入口，三入口统一协议无对象 | 第三个校正入口真实出现；澄清回流已改为初版实现（见 §11、§14） |
 | 4 | archive 压缩合并 | 新系统归档膨胀需 1–2 年 | 单用户 archive>200 条或全局>1 万条 |
 | 5 | Git 版本化 | 审计靠 quote 回溯、回滚靠日志重建，Git 无不可替代角色且是唯一持续增长负担 | 出现"画像批量误写需回滚"事故 |
 | 6 | skill / goal 两维度 | skill 全涌复核队列产出极低；goal 与 context 边界模糊 | 复核队列 skill 类误标积压，或 context 中目标类占比>30% |

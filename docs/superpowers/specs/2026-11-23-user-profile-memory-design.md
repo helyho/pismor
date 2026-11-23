@@ -18,7 +18,7 @@
 - 多实例水平扩展
 - 数据库/向量库存储
 - Git 版本化与分 shard
-- orphan_topic 自动晋升、correction event 统一协议、archive 压缩合并（均有回归触发条件，见 §18）
+- correction event 统一协议、archive 压缩合并（均有回归触发条件，见 §18）
 - 同一自然人跨平台（source）画像合并（alias 机制仅预留路径）
 
 ## 3. 总原则
@@ -70,7 +70,9 @@ superseded_by: null
 ```mermaid
 stateDiagram-v2
     [*] --> active: 词表内; explicit>=0.85 直通; inferred<=0.8 复核通过后
-    [*] --> active_or_discard: 词表外主题 → 丢弃并记 drop log(§18-2)
+    [*] --> orphan_topic: 词表外主题(topic_new), 入观察区 pending_topics.md
+    orphan_topic --> active: 每日聚合晋升(归并优先或新建桶)+re-key
+    orphan_topic --> [*]: 30天未达门槛(复现<3次/30天), 废弃
     active --> degraded: 反证(refuted) / 90天无强化且conf<0.7(stale, taboo除外) / 矛盾落败(conflict_lost)
     degraded --> active: 新强化证据 conf>=0.85
     active --> archived: UPDATE 覆盖旧值(superseded)
@@ -205,9 +207,12 @@ profiles/{source}/{native_id}/      # user_ref 双段隔离，多平台互不污
   taboo.md               # 必带集成员
   shell.md               # preference + fact + context（易变外壳）
   projects/{name}.md     # 项目域
+  pending_topics.md      # 观察区：orphan_topic 条目（词表外），不进 _index.md
   archive/               # 降级条目按月归档，初版只进不出
     2026-11.md
 ```
+
+观察区约定：`pending_topics.md` 内条目 `status: orphan_topic`、带 `topic_new` 字段（一句主题描述），不进 `_index.md`、不参与 UPDATE/冲突判定、不进装配——索引行与小节一一对应的 invariant 改述为“_index 行与各文件非 orphan 小节一一对应”。每日聚合任务（跨用户全局跑）统计各 `topic_new` 的复现度：归并到现有桶优先（LLM 比对候选描述与词表），复现 ≥3 次/30 天判定为真实主题 → 经 `auto_promote` 开关决定自动写入 taxonomy.yaml（自动生成回归样例）或进人工队列 → 观察区相关条目 re-key 后转正进主索引；未达门槛且超 30 天废弃。**taboo 维度与 sensitive 挂载 topic 禁止自动建桶**，其词表外候选只进人工队列。
 
 `_index.md` 一行一条目：`| id | dimension | scope | 摘要≤20字 | conf | status | 文件 | updated |`。条目按维度聚合为文件（避免数十万碎文件），小节级 Git-free diff 依赖文件内小节结构。
 
@@ -302,6 +307,7 @@ flowchart TD
 - **抽取输入只带 id 列表与词表**，不带现有条目正文——比对集中在决策步，防抽取器锚定现有画像导致错误自我固化（该分工不可合并）。id 列表按维度截断、只带同 scope 相关维度；截断的漏报风险由复核队列统计兜底。
 - **四路决策**：ADD / UPDATE（同 scope 同 topic 演进，旧值归档回填 superseded_by）/ CONFLICT-FLAG（真矛盾，见 §11）/ NOOP（重复，reinforcements+1）。决策由 LLM 输出但受 schema 枚举约束。
 - **per-user 串行**：同一用户轮次严格串行处理，杜绝同文件写竞争；跨用户并行。
+- **每日聚合任务（跨用户）**：orphan_topic 观察区晋升/废弃（§8）、降级扫描（90 天无强化且 conf<0.7）、复核队列超期废弃、（taxonomy 变更时）回归样例执行。
 
 ### 成本模型
 
@@ -422,7 +428,7 @@ taxonomy 回归样例随版本变更必跑（§7），反例（转述、敏感�
 | # | 砍掉/推迟项 | 理由 | 回归触发条件 |
 |---|---|---|---|
 | 1 | occurred_at 独立双时间戳 | explicit 下与 created_at 恒等；无回放消费方 | 出现真实的"历史画像回放"消费方 |
-| 2 | orphan_topic 两段式晋升 | 为无人运营设计，初版有人；词表外丢弃+丢弃日志人工周看即可 | 无人运营部署，或周丢弃率>5% |
+| 2 | ~~orphan_topic 两段式晋升~~ **已恢复，本期实现**（2026-11-23 决策） | — | 机制见 §6 状态机、§8 观察区、§10 每日聚合；taboo 与 sensitive topic 仍禁止自动建桶 |
 | 3 | correction event 统一协议 + 用户纠错通道 | 初版仅复核队列与澄清回流两个入口，三入口统一协议无对象 | 第三个校正入口真实出现；澄清回流已改为初版实现（见 §11、§14） |
 | 4 | archive 压缩合并 | 新系统归档膨胀需 1–2 年 | 单用户 archive>200 条或全局>1 万条 |
 | 5 | Git 版本化 | 审计靠 quote 回溯、回滚靠日志重建，Git 无不可替代角色且是唯一持续增长负担 | 出现"画像批量误写需回滚"事故 |

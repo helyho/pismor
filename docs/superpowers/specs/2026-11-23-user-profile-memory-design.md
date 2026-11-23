@@ -10,12 +10,12 @@
 
 核心需求：user 区分；多 md 保存；冲突处理；历史内容淘汰；自动分类；画像索引；大模型通过索引加载。
 
-运行形态（已确认）：**实时注入为主**（每轮对话前装配画像包），无历史存量、纯增量积累，存储用**纯文件系统**（v2 瘦身后暂不引入 Git 版本化），架构为**单体管线进程**。
+运行形态（已确认）：**实时注入为主**（每轮对话前装配画像包），无历史存量、纯增量积累；存储为 **md 文件真相源 + SQLite 派生索引层（§20）**，暂不引入 Git 版本化，架构为**单体管线进程**。
 
 ## 2. 非目标（初版明确不做）
 
 - 服务端数据库与专用向量库（SQLite 派生索引层除外，见 §20）
-- 嵌入检索默认关闭：基础设施本期就位（§20），到达 §19 触发条件后开开关启用
+- 嵌入检索默认关闭（开关与降级见 §20），按 §19 触发条件启用
 - Git 版本化与分 shard
 - correction event 统一协议、archive 压缩合并（均有回归触发条件，见 §18）
 - 同一自然人跨平台（source）画像合并（alias 机制仅预留路径）
@@ -56,6 +56,7 @@ sources:                          # 证据链，无 quote 不允许入库（sche
     kind: explicit                # explicit | inferred | feedback | clarification
 reinforcements: 2
 degraded_reason: null             # superseded | stale | conflict_lost | refuted(反证, taboo 特则)
+topic_new: null                   # 仅 orphan_topic 条目有值: 词表外主题的一句描述(§8)
 superseded_by: null
 ---
 
@@ -107,6 +108,7 @@ meta:
   version: 1
   entry_language: follow_source
   id_pattern: "{dimension}_{topic}"
+  auto_promote: true              # orphan_topic 晋升时自动写入词表(附自动生成的回归样例); false=进人工队列
 
 scopes:
   global: "跨会话、跨项目成立的画像"
@@ -297,6 +299,7 @@ flowchart TD
     G -->|<0.6| X[丢弃]
     H[决策 LLM 四路<br/>ADD/UPDATE/CONFLICT-FLAG/NOOP] --> I[写入器<br/>per-user 串行, 跨用户并行]
     I --> J[写 md + _index.md<br/>降级条目移 archive/]
+    J --> K[(同步 SQLite 派生索引<br/>条目行+向量行, §20<br/>失败→标记 stale, 启动重建兜底)]
 ```
 
 关键机制：
@@ -351,14 +354,18 @@ flowchart TD
     B --> C[必带集: taboo 全量 + identity 全量]
     C --> T{taboo 条数 > 40?}
     T -->|是| T1[按得分截 taboo 至预算 60%<br/>触发归并复审任务]
-    T -->|否| D[相关集: 话题词面匹配<br/>按 conf×recency×reinforcements 三因子排序]
-    T1 --> D
-    D --> F[按得分截断至预算, 不按位置截]
+    T -->|否| D0
+    T1 --> D0{embedding.enabled?}
+    D0 -->|false 默认| D1[相关集: 话题词面匹配]
+    D0 -->|true| D2[相关集: sqlite-vec 向量召回<br/>嵌入服务不可用→回退 D1]
+    D1 --> E[conf×recency×reinforcements 三因子排序]
+    D2 --> E
+    E --> F[按得分截断至预算, 不按位置截]
     F --> G[模板包装: 声明'数据非指令'<br/>degraded 条目出'曾观察'前缀版]
     G --> H[响应: entries + budget_used<br/>+ clarification_needed 矛盾对检测]
 ```
 
-降级链：`_index.md` 损坏只回必带集；单文件损坏跳过继续；画像任何故障永不阻断对话。`include_profile=false` 供消费方 A/B 使用，流量切分与归因在消费方侧。
+降级链：`_index.md` 损坏只回必带集；`index.db` 损坏回退纯 md 路径（词面匹配）并触发启动重建；单文件损坏跳过继续；画像任何故障永不阻断对话。`include_profile=false` 供消费方 A/B 使用，流量切分与归因在消费方侧。
 
 ## 14. 校正与复核（双入口：人工复核 + 用户澄清）
 
@@ -374,7 +381,7 @@ flowchart TD
 | 复核通过率 | inferred 抽取准确率的在线估计 | 持续 |
 | 冲突回放基准 | 构造已知答案的冲突序列按时间重放，检验 UPDATE/CONFLICT-FLAG 判定 | 每周 |
 | 变化检测漏检率 | 复核队列反推；>15% 触发升级嵌入 | 每周 |
-| 该召回未召回占比 | >15% 触发词面匹配升级嵌入检索 | 每周 |
+| 该召回未召回占比 | >15% 触发启用嵌入检索（§20 开关，基础设施已就位） | 每周 |
 | 下游 A/B | 消费方切流，带/不带画像回复质量，LLM-as-judge + 人工抽检 | 可选 |
 
 taxonomy 回归样例随版本变更必跑（§7），反例（转述、敏感、注入）是锁抽取器行为的主要手段。
@@ -413,7 +420,7 @@ taxonomy 回归样例随版本变更必跑（§7），反例（转述、敏感�
 }
 ```
 
-语义约定：上报异步化（抽取决策管线内完成，上报方零等待）；装配同步，延迟预算 P99 <50ms（纯文件读+词面匹配）；`include_profile=false` 时 `entries=[]` 其余照常（A/B 对照组等价请求）；tombstone 用户装配返回空包，删除动作留痕（何时删、谁请求）但内容不留，画像索引层按用户要求清空、原始对话仍在日志平台。
+语义约定：上报异步化（抽取决策管线内完成，上报方零等待）；装配同步，延迟预算 P99 <50ms（索引查询+词面匹配；向量召回模式下含一次嵌入服务往返，预算放宽至 P99 <200ms）；`include_profile=false` 时 `entries=[]` 其余照常（A/B 对照组等价请求）；tombstone 用户装配返回空包，删除动作留痕（何时删、谁请求）但内容不留，画像索引层按用户要求清空、原始对话仍在日志平台。
 
 ## 17. 消费与部署边界
 
@@ -462,7 +469,7 @@ embedding:
   batch_size: 32
 ```
 
-**同步与一致性**：写入器完成 md + `_index.md` 修改后，在同一事务内同步 SQLite（条目行 upsert + 向量行）；进程启动时校验 `md_count == row_count`，不符即全量重建（逐条读 frontmatter + 批量嵌入）。嵌入服务不可用时：同步降级为仅写条目行、向量行标记 stale，装配自动回退词面匹配——嵌入是增强不是依赖。
+**同步与一致性**：写入器先写文件（fsync）再提交 SQLite 事务（条目行 upsert + 向量行）——文件与 SQLite 无法共享事务，两侧一致性靠启动校验兜底：进程启动时校验 `md 条目数 == SQLite 行数`，不符即全量重建（逐条读 frontmatter + 批量嵌入，幂等）。嵌入服务不可用时：同步降级为仅写条目行、向量行标记 stale，装配自动回退词面匹配——嵌入是增强不是依赖。
 
 **装配路径**：`embedding.enabled=false`（默认）走词面匹配；`true` 时相关集改为向量召回（当前话题消息嵌入 → sqlite-vec KNN top-K → 三因子排序照旧），词面匹配保留为降级路径。模型或 dimensions 变更 → 启动时全量 re-embed（幂等）。
 

@@ -70,12 +70,12 @@ superseded_by: null
 ```mermaid
 stateDiagram-v2
     [*] --> active: 词表内; explicit>=0.85 直通; inferred<=0.8 复核通过后
-    [*] --> active_or_discard: 词表外主题 → 丢弃并记 drop log(§17-2)
+    [*] --> active_or_discard: 词表外主题 → 丢弃并记 drop log(§18-2)
     active --> degraded: 反证(refuted) / 90天无强化且conf<0.7(stale, taboo除外) / 矛盾落败(conflict_lost)
     degraded --> active: 新强化证据 conf>=0.85
     active --> archived: UPDATE 覆盖旧值(superseded)
     degraded --> archived: 180天无引用(stale)
-    archived --> [*]: 压缩合并——初版不做(§17-4)，依赖原始日志可重建
+    archived --> [*]: 压缩合并——初版不做(§18-4)，依赖原始日志可重建
 ```
 
 非法迁移（archived→active、degraded 直接归档跳级等）由写入器拒绝，每日审计按此图校验存量。taboo 维度的降级特则见 §11。
@@ -92,7 +92,7 @@ stateDiagram-v2
 | fact | shell.md | 3 | 用户第一人称陈述的客观事实；转述他人一律拒绝；health 敏感（仅概括级） |
 | context | shell.md | 4 | 当前任务/约束/一次性要求；生命周期最短，降级参数 90 天（其余维度 180 天） |
 
-已被瘦身砍掉的维度及回归触发条件见 §17-6。
+已被瘦身砍掉的维度及回归触发条件见 §18-6。
 
 作用域：`global` / `project:{name}`。主题词表（topics）是 key 归一化的实际载体：条目 id 的 topic 部分受限枚举，杜绝 `pref_lang`/`pref_language` 类重复——UPDATE 判定、冲突过滤、敏感规则、检索过滤全部以 topic 相等或结构化匹配驱动。
 
@@ -297,7 +297,7 @@ flowchart TD
 
 关键机制：
 
-- **幂等键** session+turn，webhook 重放安全。可靠性前提：日志平台 webhook 具备失败重试（部署前确认；若无重试保证，必须加 SQLite WAL 事件表——见 §17-7 边界线）。
+- **幂等键** session+turn，webhook 重放安全。可靠性前提：日志平台 webhook 具备失败重试（部署前确认；若无重试保证，必须加 SQLite WAL 事件表——见 §18-7 边界线）。
 - **触发分级**（成本控制核心）：explicit 声明与反馈事件零阈值直通；普通消息先过规则版变化检测，无变化仅批内累加 reinforcement，不调 LLM。
 - **抽取输入只带 id 列表与词表**，不带现有条目正文——比对集中在决策步，防抽取器锚定现有画像导致错误自我固化（该分工不可合并）。id 列表按维度截断、只带同 scope 相关维度；截断的漏报风险由复核队列统计兜底。
 - **四路决策**：ADD / UPDATE（同 scope 同 topic 演进，旧值归档回填 superseded_by）/ CONFLICT-FLAG（真矛盾，见 §11）/ NOOP（重复，reinforcements+1）。决策由 LLM 输出但受 schema 枚举约束。
@@ -325,7 +325,7 @@ flowchart TD
 2. **taboo 不参与时间衰减降级**——恒胜约束的是优先级，寿命由反证决定。降级仅两条路径：反证（后续行为明确违背该禁忌，feedback 证据触发，degraded_reason=refuted）、同 topic 归并（多个同 topic taboo 合并为一条桶式表述，如十条格式禁忌归并为 `taboo_format`）。
 3. 必带集中 taboo 超顶（>40 条）：本响应按得分截 taboo 尾部至预算 60%，**同时触发归并复审任务**——不静默截断了事。
 
-**澄清回流**（概念保留，初版不实现，见 §17-3）：装配响应预留 `clarification_needed: [{conflicting_ids, question}]` 字段，是否向用户发问由消费方决定；用户答案标记 `kind: clarification` 直通决策步。
+**澄清回流**（概念保留，初版不实现，见 §18-3）：装配响应预留 `clarification_needed: [{conflicting_ids, question}]` 字段，是否向用户发问由消费方决定；用户答案标记 `kind: clarification` 直通决策步。
 
 ## 12. 淘汰与归档
 
@@ -334,7 +334,7 @@ flowchart TD
 - 降级触发：被 UPDATE 否决（superseded）；90 天无强化且 conf<0.7（stale；taboo 除外，见 §11）；矛盾复核落败（conflict_lost）。
 - degraded 不进默认画像包，仅检索显式命中时以"曾观察：…"前缀注入——降级不是删除，用户回到旧项目时旧偏好仍可被召回。
 - archived 移入 `archive/` 按月文件，索引删行、frontmatter 全保留。
-- 压缩合并初版不做（§17-4）。
+- 压缩合并初版不做（§18-4）。
 
 ## 13. 装配（加载）
 
@@ -357,7 +357,7 @@ flowchart TD
 
 ## 14. 校正与复核（初版单入口）
 
-初版唯一的校正入口是**复核队列**：inferred 0.6–0.85 条目、审计隔离条目、矛盾双存条目在此等待人工判定；超期未复核自动废弃（宁可缺画像不要错画像）。correction event 统一协议、用户纠错通道、澄清回流均为预留概念（§17-3），spec 概念章保留、初版不实现。
+初版唯一的校正入口是**复核队列**：inferred 0.6–0.85 条目、审计隔离条目、矛盾双存条目在此等待人工判定；超期未复核自动废弃（宁可缺画像不要错画像）。correction event 统一协议、用户纠错通道、澄清回流均为预留概念（§18-3），spec 概念章保留、初版不实现。
 
 ## 15. 评估体系
 
@@ -372,14 +372,48 @@ flowchart TD
 
 taxonomy 回归样例随版本变更必跑（§7），反例（转述、敏感、注入）是锁抽取器行为的主要手段。
 
-## 16. 消费与部署边界
+## 16. 对外接口
+
+| # | 接口 | 消费方 | 用途 |
+|---|---|---|---|
+| 1 | `POST /events/conversation` | 对话平台 | 对话轮上报（管线唯一入口），异步处理 |
+| 2 | `GET /profile/{source}/{native_id}` | 任意 LLM 应用 | 每轮对话前装配画像包 |
+| 3 | `GET /review/queue` / `POST /review/{entry_id}/verdict` | 人工复核 | 待复核列表与判定（approve/discard/fix） |
+| 4 | `DELETE /profile/{source}/{native_id}` | 运营/合规 | 用户删除权：物理删除画像目录 + tombstone 留痕 |
+| 5 | `GET /healthz` | 部署探针 | 进程健康 |
+
+请求/响应核心 schema：
+
+```jsonc
+// POST /events/conversation → 202 Accepted；幂等键 session+turn，重复返回 200 {"deduplicated": true}
+{
+  "source": "webchat",
+  "user_ref": "u_1024",
+  "session_id": "s_20261123_001",
+  "turn": 12,
+  "ts": "2026-11-23T10:00:00+08:00",
+  "messages": [{"role": "user", "text": "..."}, {"role": "assistant", "text": "..."}],
+  "feedback": [{"kind": "dislike|regenerate|edit|interrupt", "turn": 11, "detail": "..."}]
+}
+
+// GET /profile/{source}/{native_id}?budget=2000&dimensions=taboo,preference&include_profile=false
+{
+  "entries": [{"id": "taboo_tool_excel_formula", "text": "生成表格类结果时一律写 Python 脚本", "confidence": 0.95, "status": "active"}],
+  "budget_used": 812,
+  "clarification_needed": []      // 字段位，初版恒空（§18-3）
+}
+```
+
+语义约定：上报异步化（抽取决策管线内完成，上报方零等待）；装配同步，延迟预算 P99 <50ms（纯文件读+词面匹配）；`include_profile=false` 时 `entries=[]` 其余照常（A/B 对照组等价请求）；tombstone 用户装配返回空包，删除动作留痕（何时删、谁请求）但内容不留，画像索引层按用户要求清空、原始对话仍在日志平台。
+
+## 17. 消费与部署边界
 
 - 画像系统只提供装配 API 与注入模板；prompt 组装格式、澄清插话决策、A/B 切流均属消费方。
 - 冷启动（新用户画像为空）是预期行为；可选的 3 条 onboarding 声明引导属产品层，系统层不做。
-- 部署前提：日志平台保留原始对话 ≥180 天；webhook 有失败重试（否则加 SQLite WAL，§17-7）。
+- 部署前提：日志平台保留原始对话 ≥180 天；webhook 有失败重试（否则加 SQLite WAL，§18-7）。
 - 技术栈：Python 3.12 + FastAPI（webhook 与装配 API 同进程）、LLM SDK 结构化输出、零数据库依赖。
 
-## 17. 瘦身决策记录（每项带回归触发条件）
+## 18. 瘦身决策记录（每项带回归触发条件）
 
 | # | 砍掉/推迟项 | 理由 | 回归触发条件 |
 |---|---|---|---|
@@ -391,16 +425,16 @@ taxonomy 回归样例随版本变更必跑（§7），反例（转述、敏感�
 | 6 | skill / goal 两维度 | skill 全涌复核队列产出极低；goal 与 context 边界模糊 | 复核队列 skill 类误标积压，或 context 中目标类占比>30% |
 | 7 | SQLite WAL | 边界线：webhook 有重试即可内存队列 | 部署确认平台无失败重试时必须加回 |
 
-## 18. 演进触发条件汇总
+## 19. 演进触发条件汇总
 
 | 演进项 | 触发条件（可测） |
 |---|---|
 | 嵌入检索 | 词面未召回占比 >15% 或变化检测漏检率 >15% |
 | 多实例 | 管线排队延迟 >5s 持续一周 |
 | 数据库 | 文件操作 P99 >100ms 或用户数 >1 万 |
-| Git 版本化 | §17-5 事故触发 |
-| archive 压缩 | §17-4 容量触发 |
+| Git 版本化 | §18-5 事故触发 |
+| archive 压缩 | §18-4 容量触发 |
 
-## 19. 评审后修复记录
+## 20. 评审后修复记录
 
 设计经两轮评审收敛：第一轮 10 条不足（成本触发、锚定效应、key 归一化、词面匹配、可靠性、合规、预算语义等）全部合入；第二轮 15 条（4 P0：注入载体、写竞争、taboo 积压、回放矛盾；5 P1：闭环缺失；6 P2：取舍写明）全部合入，落点分布于 §0–§16 对应小节。第三轮 YAGNI 瘦身 6+1 项见 §17。

@@ -10,11 +10,11 @@
 
 核心需求：user 区分；多 md 保存；冲突处理；历史内容淘汰；自动分类；画像索引；大模型通过索引加载。
 
-运行形态（已确认）：**实时注入为主**（每轮对话前装配画像包），无历史存量、纯增量积累；存储为 **md 文件真相源 + SQLite 派生索引层（§20）**，暂不引入 Git 版本化，架构为**单体管线进程**。
+运行形态（已确认）：**实时注入为主**（每轮对话前装配画像包），无历史存量、纯增量积累；存储为 **SQLite 单文件数据库（含 sqlite-vec 向量）作为唯一真相源**，md 为导出视图（满足"每用户一个或多个 md 画像"的交付形态，经 API 或定时快照生成），架构为**单体管线进程**。
 
 ## 2. 非目标（初版明确不做）
 
-- 服务端数据库与专用向量库（SQLite 派生索引层除外，见 §20）
+- 服务端数据库（Postgres/Milvus 等，SQLite 单文件库为本期选型，见 §20）
 - 嵌入检索默认关闭（开关与降级见 §20），按 §19 触发条件启用
 - Git 版本化与分 shard
 - correction event 统一协议、archive 压缩合并（均有回归触发条件，见 §18）
@@ -22,9 +22,10 @@
 
 ## 3. 总原则
 
-1. **回放的真相源是日志平台的原始对话**。画像只是索引，可压缩、可重建。"永不物理删除"指画像索引层；日志平台自身保留期（部署前提：≥180 天）是本系统的真实外部约束。
+1. **回放的真相源是日志平台的原始对话**。画像库的灾难恢复兜底：SQLite 库损坏时，可从备份恢复；极端情况下可从日志按时间重放全部管线重建画像（代价高，仅兜底）。日志平台自身保留期（部署前提：≥180 天）是本系统的真实外部约束。
 2. **画像数据不是指令**。条目正文永远是"关于用户的陈述"；对话中出现的"对 AI 行为的要求"不属于画像——要么是 taboo（用户约束自己收到的输出），要么是注入攻击（拒绝入库，见 §4）。
 3. **宁可缺画像，不要错画像**。低置信、词表外、待复核超期一律向"不注入"倾斜。
+4. **持久性靠 SQLite WAL + 定期备份**：`PRAGMA journal_mode=WAL` 保证写前日志；每日 `VACUUM INTO` 快照备份到独立路径——真相源损坏不再是"重建即可"，备份是必须项（见 §20）。
 
 ## 4. 安全设计
 
@@ -38,10 +39,9 @@
 
 ## 5. 数据模型
 
-原子单元是**条目**，物理形态为 md 文件内的小节：
+原子单元是**条目**，存储于 SQLite `entries` 表（一行一条目，证据链在 `sources` 表 1:N）；下述字段同时是 md 导出视图的 frontmatter 格式：
 
-```markdown
----
+```yaml
 id: pref_lang                     # {dimension}_{topic}，topic 受词表枚举约束
 dimension: preference             # 五维之一，见 §7
 scope: global                     # global | project:{name}
@@ -58,20 +58,18 @@ reinforcements: 2
 degraded_reason: null             # superseded | stale | conflict_lost | refuted(反证, taboo 特则)
 topic_new: null                   # 仅 orphan_topic 条目有值: 词表外主题的一句描述(§8)
 superseded_by: null
----
-
-主语言 Python 3.12。              # 一句可注入 prompt 的陈述，硬顶 200 字符
+body: 主语言 Python 3.12。         # 一句可注入 prompt 的陈述，硬顶 200 字符
 ```
 
-三条硬约束：无 `sources[0].quote` 的条目拒绝入库；正文一句话且 ≤200 字符；frontmatter 给机器读、正文给装配读。
+三条硬约束：无 `sources[0].quote` 的条目拒绝入库；正文一句话且 ≤200 字符；`UNIQUE(user_source, user_id, dimension, topic, scope)` 约束同 key 唯一（替代原文件方案的 per-user 文件锁——数据库约束即并发防线，同 key 二次写入由约束拒绝并转 NOOP）。
 
 ## 6. 条目状态机
 
 ```mermaid
 stateDiagram-v2
     [*] --> active: 词表内; explicit>=0.85 直通; inferred<=0.8 复核通过后
-    [*] --> pending_review: inferred 0.6~0.85 / 审计隔离, 落 pending_review.md
-    [*] --> orphan_topic: 词表外主题(topic_new), 入观察区 pending_topics.md
+    [*] --> pending_review: inferred 0.6~0.85 / 审计隔离(entries.status)
+    [*] --> orphan_topic: 词表外主题(topic_new), 观察区(entries.status)
     pending_review --> active: 复核 approve/fix
     pending_review --> [*]: discard 或超期自动废弃
     orphan_topic --> active: 每日聚合晋升(归并优先或新建桶)+re-key
@@ -89,7 +87,7 @@ stateDiagram-v2
 
 `taxonomy.yaml` 是维度的唯一来源，驱动抽取打标、文件分组、索引校验、装配排序。LLM 只能在 taxonomy 内打标，禁止发明类别与主题词。
 
-| 维度 | 归属文件 | 装配优先级 | 说明 |
+| 维度 | 导出归属文件 | 装配优先级 | 说明 |
 |---|---|---|---|
 | taboo | taboo.md | 0（恒第一） | 用户明确说"不要/别再/拒绝"；必须含否定词 quote；跨一切作用域全局生效；**禁止自动建新主题词** |
 | identity | identity.md | 1 | 称谓/语言/时区/职业/组织；仅自述或强证据；region 敏感（脱敏到城市级） |
@@ -202,28 +200,74 @@ regression_cases:
     expect: {dimension: null, note: "指令类内容拒绝入库"}
 ```
 
-## 8. 目录与索引
+## 8. 存储布局与导出视图
+
+### 8.1 SQLite 主存储（真相源）
+
+```sql
+CREATE TABLE entries (
+  id TEXT NOT NULL,              -- {dimension}_{topic}
+  user_source TEXT NOT NULL, user_id TEXT NOT NULL,
+  dimension TEXT NOT NULL, topic TEXT NOT NULL, scope TEXT NOT NULL,
+  confidence REAL NOT NULL,
+  status TEXT NOT NULL,          -- pending_review|orphan_topic|active|degraded|archived
+  body TEXT NOT NULL,            -- 一句话正文 ≤200 字符
+  created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+  degraded_reason TEXT, superseded_by TEXT, topic_new TEXT,
+  conflict_with TEXT,            -- JSON 数组: 对端条目 id
+  reinforcements INTEGER NOT NULL DEFAULT 0,
+  archived_at TEXT,
+  PRIMARY KEY (id, user_source, user_id),
+  UNIQUE (user_source, user_id, dimension, topic, scope)
+);
+CREATE TABLE sources (          -- 证据链 1:N，无 quote 入库被写入器拒绝
+  entry_id TEXT, user_source TEXT, user_id TEXT,
+  session TEXT NOT NULL, turn INTEGER NOT NULL,
+  quote TEXT NOT NULL, kind TEXT NOT NULL,
+  PRIMARY KEY (entry_id, user_source, user_id, session, turn),
+  FOREIGN KEY (entry_id, user_source, user_id) REFERENCES entries(id, user_source, user_id)
+);
+CREATE TABLE review_history (   -- 复核判定与澄清判定留痕
+  entry_id TEXT, user_source TEXT, user_id TEXT,
+  verdict TEXT NOT NULL, actor TEXT NOT NULL,   -- reviewer | clarification | audit
+  ts TEXT NOT NULL, note TEXT,
+  entry_version TEXT NOT NULL                   -- 竞态防御: 不匹配则判定作废(§14)
+);
+CREATE TABLE events_seen (      -- 幂等键持久化，webhook 重放天然去重
+  session TEXT, turn INTEGER, ts TEXT,
+  PRIMARY KEY (session, turn)
+);
+CREATE TABLE tombstones (       -- 用户删除权: 只留痕不存内容
+  user_source TEXT, user_id TEXT, deleted_at TEXT, requested_by TEXT,
+  PRIMARY KEY (user_source, user_id)
+);
+-- sqlite-vec 虚表: embeddings(entry_id, user_source, user_id, vec)
+```
+
+并发与持久性：`PRAGMA journal_mode=WAL` + `busy_timeout`；条目+证据+向量同一事务写入（向量与条目的原子性是 SQLite 方案相对文件方案的直接收益）；`events_seen` 使幂等键持久化——内存队列崩溃丢事件后平台重放不会重复处理（瘦身项 §18-7 的 SQLite WAL 事件表由本表天然覆盖，该项关闭）。per-user 串行锁不再必要：唯一约束+事务替代文件级防竞争。
+
+### 8.2 md 导出视图（交付形态）
+
+md 集不再是存储，按需生成（`GET /export/{source}/{native_id}`）或定时快照，满足"每用户一个或多个 md 画像"的交付形态：
 
 ```
-profiles/{source}/{native_id}/      # user_ref 双段隔离，多平台互不污染
-  _index.md              # 摘要索引：装配每轮必读的唯一文件
-  identity.md            # 必带集成员
-  taboo.md               # 必带集成员
-  shell.md               # preference + fact + context（易变外壳）
+exports/{source}/{native_id}/       # 导出根（与库文件分离，可随时删除重生成）
+  identity.md            # 必带集成员维度
+  taboo.md               # 禁忌
+  shell.md               # preference + fact + context
   projects/{name}.md     # 项目域
-  pending_topics.md      # 观察区：orphan_topic 条目（词表外），不进 _index.md
-  pending_review.md      # 复核队列条目（inferred 0.6~0.85 / 审计隔离），不进 _index.md
-  archive/               # 降级条目按月归档，初版只进不出
-    2026-11.md
+  archive.md             # archived 条目
+  pending.md             # 观察区 + 复核队列（供人工浏览）
+  _index.md              # 摘要表
 ```
 
-观察区约定：`pending_topics.md` 内条目 `status: orphan_topic`、带 `topic_new` 字段（一句主题描述），不进 `_index.md`、不参与 UPDATE/冲突判定、不进装配——索引行与小节一一对应的 invariant 改述为“_index 行与各文件非 orphan/pending 小节一一对应”。复核队列条目同规则落 `pending_review.md`（status: pending_review），approve/fix 后移入正式维度文件并进索引。每日聚合任务（跨用户全局跑）统计各 `topic_new` 的复现度：归并到现有桶优先（LLM 比对候选描述与词表），复现 ≥3 次/30 天判定为真实主题 → 经 `auto_promote` 开关决定自动写入 taxonomy.yaml（自动生成回归样例）或进人工队列 → 观察区相关条目 re-key 后转正进主索引；未达门槛且超 30 天废弃。**taboo 维度与 sensitive 挂载 topic 禁止自动建桶**，其词表外候选只进人工队列。
+导出格式沿用原文件方案的条目小节格式（§9）；导出器只读库，手工编辑导出文件无效（下次导出覆盖）——纠错走复核队列或澄清回流。
 
-`_index.md` 一行一条目：`| id | dimension | scope | 摘要≤20字 | conf | status | 文件 | updated |`。条目按维度聚合为文件（避免数十万碎文件），小节级 Git-free diff 依赖文件内小节结构。
+观察区与复核队列在库内即状态字段（`status: orphan_topic / pending_review`）：不参与 UPDATE/冲突判定、不进装配。每日聚合任务（跨用户全局跑）统计各 `topic_new` 复现度：归并到现有桶优先（LLM 比对候选描述与词表），复现 ≥3 次/30 天判定为真实主题 → 经 `auto_promote` 开关决定自动写入 taxonomy.yaml（自动生成回归样例）或进人工队列 → 条目 re-key 转正；未达门槛且超 30 天废弃。**taboo 维度与 sensitive 挂载 topic 禁止自动建桶**，其词表外候选只进人工队列。
 
-多源身份（user_ref = {source, native_id}）是有意隔离；alias 合并路径预留（`aliases: {native_id: canonical_id}` 映射表，装配按 canonical_id 聚合读），初版不实现。
+多源身份（user_ref = {source, native_id}）是有意隔离；alias 合并路径预留（`aliases` 映射表，装配按 canonical_id 聚合读），初版不实现。
 
-## 9. 文件模板（以 taboo.md 为例）
+## 9. md 导出视图模板（以 taboo.md 为例）
 
 ```markdown
 # taboo.md — 禁忌清单（webchat/u_1024）
@@ -283,7 +327,7 @@ superseded_by: null
 回复中不使用 emoji。
 ```
 
-约定：小节即条目（`## [id] 标题` + `---` 围栏 YAML + 一句正文），管线自写解析器按 `---` 分隔（文件中间的 `---` 被通用 md 渲染器当水平线属预期行为）。taboo.md 的文件级 invariants：每条 quote 含否定词、id 前缀 `taboo_`、dimension=taboo。degraded 仍留本文件（降级是状态，归档才是位置）。identity.md / shell.md / archive 结构同此，仅条目内容与文件级规则不同。
+约定：导出视图沿用原条目小节格式（`## [id] 标题` + `---` 围栏 YAML + 一句正文）。taboo.md 导出的文件级 invariants：每条 quote 含否定词、id 前缀 `taboo_`、dimension=taboo（库内审计按同规则跑 SQL）。degraded 条目仍在原维度文件导出（降级是状态，归档才是位置：archived 条目导出至 archive.md）。identity.md / shell.md / archive 结构同此，仅条目内容与文件级规则不同。
 
 ## 10. 写入管线
 
@@ -302,17 +346,16 @@ flowchart TD
     G -->|0.6~0.85 inferred| R[复核队列<br/>超期自动废弃]
     G -->|<0.6| X[丢弃]
     H[决策 LLM 四路<br/>ADD/UPDATE/CONFLICT-FLAG/NOOP] --> I[写入器<br/>per-user 串行, 跨用户并行]
-    I --> J[写 md + _index.md<br/>降级条目移 archive/]
-    J --> K[(同步 SQLite 派生索引<br/>条目行+向量行, §20<br/>失败→标记 stale, 启动重建兜底)]
+    I --> J[(SQLite 事务写入<br/>entries+sources+向量 同事务<br/>降级=status变更+archived_at)]
 ```
 
 关键机制：
 
-- **幂等键** session+turn，webhook 重放安全。可靠性前提：日志平台 webhook 具备失败重试（部署前确认；若无重试保证，必须加 SQLite WAL 事件表——见 §18-7 边界线）。
+- **幂等键** session+turn 持久化于 `events_seen` 表（§8.1），webhook 重放天然去重，崩溃后已处理事件不重复处理；未处理事件依赖平台重试（部署前确认）。
 - **触发分级**（成本控制核心）：explicit 声明与反馈事件零阈值直通；普通消息先过规则版变化检测，无变化仅批内累加 reinforcement，不调 LLM。
 - **抽取输入只带 id 列表与词表**，不带现有条目正文——比对集中在决策步，防抽取器锚定现有画像导致错误自我固化（该分工不可合并）。id 列表按维度截断、只带同 scope 相关维度；截断的漏报风险由复核队列统计兜底。
 - **四路决策**：ADD / UPDATE（同 scope 同 topic 演进，旧值归档回填 superseded_by）/ CONFLICT-FLAG（真矛盾，见 §11）/ NOOP（重复，reinforcements+1）。决策由 LLM 输出但受 schema 枚举约束。
-- **per-user 串行**：同一用户轮次严格串行处理，杜绝同文件写竞争；跨用户并行。
+- **per-user 串行**：由数据库唯一约束+事务替代（文件方案的文件级防竞争不再需要）；仍保留按用户分批提交以缩小事务粒度。
 - **每日聚合任务（跨用户）**：orphan_topic 观察区晋升/废弃（§8）、降级扫描（90 天无强化且 conf<0.7）、复核队列超期废弃、（taxonomy 变更时）回归样例执行。
 
 ### 成本模型
@@ -345,7 +388,7 @@ flowchart TD
 
 - 降级触发：被 UPDATE 否决（superseded）；90 天无强化且 conf<0.7（stale；taboo 除外，见 §11）；矛盾复核落败（conflict_lost）。
 - degraded 不进默认画像包，仅检索显式命中时以"曾观察：…"前缀注入——降级不是删除，用户回到旧项目时旧偏好仍可被召回。
-- archived 移入 `archive/` 按月文件，索引删行、frontmatter 全保留。
+- archived：status 变更 + `archived_at` 时间戳，库内保留全部字段与证据链（§18-4 压缩合并推迟，初版只进不出）。
 - 压缩合并初版不做（§18-4）。
 
 ## 13. 装配（加载）
@@ -354,13 +397,13 @@ flowchart TD
 
 ```mermaid
 flowchart TD
-    A[装配请求] --> B[读 _index.md 唯一必读]
+    A[装配请求] --> B[(SQLite 查询: status=active<br/>按维度/作用域/置信过滤)]
     B --> C[必带集: taboo 全量 + identity 全量]
     C --> T{taboo 条数 > 40?}
     T -->|是| T1[按得分截 taboo 至预算 60%<br/>触发归并复审任务]
     T -->|否| D0
     T1 --> D0{embedding.enabled?}
-    D0 -->|false 默认| D1[相关集: 话题词面匹配]
+    D0 -->|false 默认| D1[相关集: 话题词面匹配<br/>SQL LIKE + 摘要匹配]
     D0 -->|true| D2[相关集: sqlite-vec 向量召回<br/>嵌入服务不可用→回退 D1]
     D1 --> E[conf×recency×reinforcements 三因子排序]
     D2 --> E
@@ -369,7 +412,7 @@ flowchart TD
     G --> H[响应: entries + budget_used<br/>+ clarification_needed 矛盾对检测]
 ```
 
-降级链：`_index.md` 损坏只回必带集；`index.db` 损坏回退纯 md 路径（词面匹配）并触发启动重建；单文件损坏跳过继续；画像任何故障永不阻断对话。`include_profile=false` 供消费方 A/B 使用，流量切分与归因在消费方侧。
+降级链：主查询失败只回必带集（taboo+identity 单独查询）；向量召回失败回退词面匹配；单维度查询失败跳过继续；库损坏按 §0 原则 4 从备份恢复（每日 `VACUUM INTO` 快照），极端情况从日志重放重建；画像任何故障永不阻断对话。`include_profile=false` 供消费方 A/B 使用，流量切分与归因在消费方侧。
 
 ## 14. 校正与复核（双入口：人工复核 + 用户澄清）
 
@@ -381,7 +424,7 @@ flowchart TD
 
 | 项目 | 内容 | 频率 |
 |---|---|---|
-| 一致性审计 | invariants 校验 + 状态机迁移校验 + 索引行与小节一一对应 + quote 抽样回查日志 + 正文指令模式扫描 | 每日 |
+| 一致性审计 | invariants 校验 + 状态机迁移校验 + 同 key 唯一约束核对 + quote 抽样回查日志 + 正文指令模式扫描（全部 SQL 化） | 每日 |
 | 复核通过率 | inferred 抽取准确率的在线估计 | 持续 |
 | 冲突回放基准 | 构造已知答案的冲突序列按时间重放，检验 UPDATE/CONFLICT-FLAG 判定 | 每周 |
 | 变化检测漏检率 | 复核队列反推；>15% 触发升级嵌入 | 每周 |
@@ -396,9 +439,10 @@ taxonomy 回归样例随版本变更必跑（§7），反例（转述、敏感�
 |---|---|---|---|
 | 1 | `POST /events/conversation` | 对话平台 | 对话轮上报（管线唯一入口），异步处理 |
 | 2 | `GET /profile/{source}/{native_id}` | 任意 LLM 应用 | 每轮对话前装配画像包 |
-| 3 | `GET /review/queue` / `POST /review/{entry_id}/verdict` | 人工复核 | 待复核列表与判定（approve/discard/fix） |
-| 4 | `DELETE /profile/{source}/{native_id}` | 运营/合规 | 用户删除权：物理删除画像目录 + tombstone 留痕 |
-| 5 | `GET /healthz` | 部署探针 | 进程健康 |
+| 3 | `GET /review/queue` / `POST /review/{entry_id}/verdict` | 人工复核 | 待复核列表与判定（approve/discard/fix），写 review_history |
+| 4 | `DELETE /profile/{source}/{native_id}` | 运营/合规 | 用户删除权：删条目行 + tombstones 表留痕 |
+| 5 | `GET /export/{source}/{native_id}` | 人工/交付 | 导出 md 画像视图（§8.2），可定时快照 |
+| 6 | `GET /healthz` | 部署探针 | 进程健康 |
 
 请求/响应核心 schema：
 
@@ -424,13 +468,13 @@ taxonomy 回归样例随版本变更必跑（§7），反例（转述、敏感�
 }
 ```
 
-语义约定：上报异步化（抽取决策管线内完成，上报方零等待）；装配同步，延迟预算 P99 <50ms（索引查询+词面匹配；向量召回模式下含一次嵌入服务往返，预算放宽至 P99 <200ms）；`include_profile=false` 时 `entries=[]` 其余照常（A/B 对照组等价请求）；tombstone 用户装配返回空包，删除动作留痕（何时删、谁请求）但内容不留，画像索引层按用户要求清空、原始对话仍在日志平台。
+语义约定：上报异步化（抽取决策管线内完成，上报方零等待）；装配同步，延迟预算 P99 <50ms（SQL 查询+词面匹配；向量召回模式下含一次嵌入服务往返，预算放宽至 P99 <200ms）；`include_profile=false` 时 `entries=[]` 其余照常（A/B 对照组等价请求）；tombstone 用户装配返回空包，删除动作写入 tombstones 表（何时删、谁请求）但内容不留，画像数据按用户要求清除、原始对话仍在日志平台。
 
 ## 17. 消费与部署边界
 
 - 画像系统只提供装配 API 与注入模板；prompt 组装格式、澄清插话决策、A/B 切流均属消费方。
 - 冷启动（新用户画像为空）是预期行为；可选的 3 条 onboarding 声明引导属产品层，系统层不做。
-- 部署前提：日志平台保留原始对话 ≥180 天；webhook 有失败重试（否则加 SQLite WAL，§18-7）。
+- 部署前提：日志平台保留原始对话 ≥180 天（画像灾难恢复的最终兜底，§0 原则 1）。
 - 技术栈：Python 3.12 + FastAPI（webhook 与装配 API 同进程）、LLM SDK 结构化输出、SQLite（sqlite-vec）为唯一存储依赖（§20）。
 
 ## 18. 瘦身决策记录（每项带回归触发条件）
@@ -443,7 +487,7 @@ taxonomy 回归样例随版本变更必跑（§7），反例（转述、敏感�
 | 4 | archive 压缩合并 | 新系统归档膨胀需 1–2 年 | 单用户 archive>200 条或全局>1 万条 |
 | 5 | Git 版本化 | 审计靠 quote 回溯、回滚靠日志重建，Git 无不可替代角色且是唯一持续增长负担 | 出现"画像批量误写需回滚"事故 |
 | 6 | skill / goal 两维度 | skill 全涌复核队列产出极低；goal 与 context 边界模糊 | 复核队列 skill 类误标积压，或 context 中目标类占比>30% |
-| 7 | SQLite WAL | 边界线：webhook 有重试即可内存队列 | 部署确认平台无失败重试时必须加回 |
+| 7 | ~~SQLite WAL 事件表~~ **被 §20 存储方案吸收关闭**（2026-11-23）：`events_seen` 表随 SQLite 真相源天然提供幂等持久化 | — | — |
 
 ## 19. 演进触发条件汇总
 
@@ -451,15 +495,17 @@ taxonomy 回归样例随版本变更必跑（§7），反例（转述、敏感�
 |---|---|
 | 嵌入检索启用 | 词面未召回占比 >15% 或变化检测漏检率 >15%；基础设施已随本期就位（§20），触发后仅开配置开关 |
 | 多实例 | 管线排队延迟 >5s 持续一周 |
-| 服务端数据库（Postgres+pgvector） | 文件/SQLite 操作 P99 >100ms 或用户数 >1 万 |
+| 服务端数据库（Postgres+pgvector） | SQLite 操作 P99 >100ms 或用户数 >1 万 |
 | Git 版本化 | §18-5 事故触发 |
 | archive 压缩 | §18-4 容量触发 |
 
-## 20. 索引与嵌入层（派生索引，本期实现）
+## 20. 存储层（SQLite 主存储，本期实现）
 
-**定位**：派生索引层。md 文件仍是唯一真相源（§3 原则 1），SQLite 库（含向量）任何时刻可从 md 全量重建——索引损坏不算事故，重建即可。若让数据库当真相源、md 降为导出视图，违背本系统初衷，不做。
+**定位**：唯一真相源。全部画像数据（条目、证据链、向量、复核历史、幂等记录、tombstone）都在单文件库 `index.db`；md 为导出视图（§8.2），任何时刻可从库重新生成。第五轮决策（2026-11-23）由"md 真相源 + SQLite 派生索引"翻转而来——翻转动机：条目级事务原子性（条目+证据+向量同事务，消除文件方案的双写一致性问题）、SQL 化审计与统计、并发防线由唯一约束承担；代价是持久性责任转移到备份策略（§0 原则 4）。
 
-**选型**：SQLite + sqlite-vec，单文件库 `index.db`。嵌入式零部署零运维、事务原生，与单体进程架构同构；条目表覆盖关系查询（维度/状态/置信/时间组合过滤、复核队列、运营统计），sqlite-vec 覆盖向量 KNN。服务端数据库（Postgres+pgvector）保留为多用户产品化演进项（§19）。
+**选型**：SQLite + sqlite-vec。嵌入式零部署零运维、事务原生、WAL 持久性，与单体进程架构同构。服务端数据库（Postgres+pgvector）保留为多用户产品化演进项（§19）。
+
+**备份与恢复（真相源的必须项）**：每日 `VACUUM INTO 'backup-YYYYMMDD.db'` 快照至独立路径（保留 30 份）；启动时 `PRAGMA integrity_check`。库损坏恢复顺序：最近备份 → 日志重放重建管线（兜底，§0 原则 1）。
 
 **嵌入服务（外部，配置化）**：向量化不本地推理，调用外部 embedding 服务，全部经配置提供、不绑定供应商（默认假设 OpenAI 兼容 `/v1/embeddings` 协议）：
 
@@ -469,16 +515,16 @@ embedding:
   endpoint: "https://llm.bitv-ex.com/v1/embeddings"
   model: "bge-m3"                 # 供应商模型名
   api_key_env: EMBEDDING_API_KEY  # 密钥从环境变量读，不落配置文件
-  dimensions: 1024                # 须与模型输出一致；变更触发全量重建
+  dimensions: 1024                # 须与模型输出一致；变更触发全量重嵌入
   batch_size: 32
 ```
 
-**同步与一致性**：写入器先写文件（fsync）再提交 SQLite 事务（条目行 upsert + 向量行）——文件与 SQLite 无法共享事务，两侧一致性靠启动校验兜底：进程启动时校验 `md 条目数 == SQLite 行数`，不符即全量重建（逐条读 frontmatter + 批量嵌入，幂等）。嵌入服务不可用时：同步降级为仅写条目行、向量行标记 stale，装配自动回退词面匹配——嵌入是增强不是依赖。
+**写入原子性**：条目行 + sources 行 + embeddings 行同一 SQLite 事务——向量与数据天然一致（文件方案的双写问题不复存在）。嵌入服务不可用时：事务只写条目行，向量行缺失标记，装配自动回退词面匹配——嵌入是增强不是依赖；服务恢复后补嵌入（按缺失标记批量补，幂等）。
 
-**装配路径**：`embedding.enabled=false`（默认）走词面匹配；`true` 时相关集改为向量召回（当前话题消息嵌入 → sqlite-vec KNN top-K → 三因子排序照旧），词面匹配保留为降级路径。模型或 dimensions 变更 → 启动时全量 re-embed（幂等）。
+**装配路径**：`embedding.enabled=false`（默认）走词面匹配（SQL LIKE + 摘要匹配）；`true` 时相关集改为向量召回（当前话题消息嵌入 → sqlite-vec KNN top-K → 三因子排序照旧），词面匹配保留为降级路径。模型或 dimensions 变更 → 全量重嵌入（幂等）。
 
-**成本**：索引写入时每条 1 次嵌入、查询时 1 次；外部服务按调用计费，单用户画像条目数十条量级，成本可忽略。
+**成本**：写入时每条 1 次嵌入、查询时 1 次；外部服务按调用计费，单用户画像条目数十条量级，成本可忽略。
 
 ## 21. 评审后修复与决策变更记录
 
-设计经多轮评审收敛：第一轮 10 条不足（成本触发、锚定效应、key 归一化、词面匹配、可靠性、合规、预算语义等）全部合入；第二轮 15 条（4 P0：注入载体、写竞争、taboo 积压、回放矛盾；5 P1：闭环缺失；6 P2：取舍写明）全部合入；第三轮 YAGNI 瘦身见 §18。第四轮决策变更（2026-11-23）：clarification_needed 澄清回流恢复为初版实现（§11、§14）；orphan_topic 两段式晋升恢复为初版实现（§6、§8、§10）；新增 SQLite 派生索引层与外部嵌入服务配置化（§20），嵌入检索默认关闭、按 §19 触发启用。
+设计经多轮评审收敛：第一轮 10 条不足（成本触发、锚定效应、key 归一化、词面匹配、可靠性、合规、预算语义等）全部合入；第二轮 15 条（4 P0：注入载体、写竞争、taboo 积压、回放矛盾；5 P1：闭环缺失；6 P2：取舍写明）全部合入；第三轮 YAGNI 瘦身见 §18。第四轮决策变更（2026-11-23）：clarification_needed 澄清回流恢复为初版实现（§11、§14）；orphan_topic 两段式晋升恢复为初版实现（§6、§8、§10）；新增 SQLite 索引层与外部嵌入服务配置化（§20）。第五轮决策变更（2026-11-23）：**存储翻转——SQLite 升级为唯一真相源（§20），md 降为导出视图（§8.2）**；连带修订：条目+证据+向量同事务（双写一致性消除）、`events_seen` 幂等表（§18-7 关闭）、per-user 文件锁被唯一约束替代、降级链与备份策略重写（§0 原则 4、§13）、导出接口新增（§16-5）、md 模板章节改为导出视图模板（§9）。

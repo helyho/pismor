@@ -56,7 +56,7 @@ sources:                          # 证据链，无 quote 不允许入库（sche
     quote: "以后都用 Python 3.12 写脚本"
     kind: explicit                # explicit | inferred | feedback（clarification 保留概念，初版无此入口）
 reinforcements: 2
-degraded_reason: null             # superseded | stale | conflict_lost（仅 degraded/archived 有值）
+degraded_reason: null             # superseded | stale | conflict_lost | refuted(反证, taboo 特则)
 superseded_by: null
 ---
 
@@ -71,7 +71,7 @@ superseded_by: null
 stateDiagram-v2
     [*] --> active: 词表内; explicit>=0.85 直通; inferred<=0.8 复核通过后
     [*] --> active_or_discard: 词表外主题 → 丢弃并记 drop log(§17-2)
-    active --> degraded: 反证 / 90天无强化且conf<0.7 / 矛盾落败(conflict_lost)
+    active --> degraded: 反证(refuted) / 90天无强化且conf<0.7(stale, taboo除外) / 矛盾落败(conflict_lost)
     degraded --> active: 新强化证据 conf>=0.85
     active --> archived: UPDATE 覆盖旧值(superseded)
     degraded --> archived: 180天无引用(stale)
@@ -252,17 +252,21 @@ superseded_by: null
 id: taboo_tone_emoji
 dimension: taboo
 scope: global
-confidence: 0.68
+confidence: 0.62
 status: degraded
 created_at: 2026-06-10T15:30:00+08:00
-updated_at: 2026-09-10T03:00:00+08:00
+updated_at: 2026-10-01T12:00:00+08:00
 sources:
   - session: s_20260610_002
     turn: 2
     quote: "不要在回复里加 emoji"
     kind: explicit
+  - session: s_20261001_004
+    turn: 9
+    quote: "这条是发朋友圈的，帮我加上 emoji 吧"
+    kind: feedback
 reinforcements: 0
-degraded_reason: stale
+degraded_reason: refuted          # 反证降级: taboo 不参与时间衰减, 仅反证/归并两条路径
 superseded_by: null
 ---
 
@@ -318,7 +322,7 @@ flowchart TD
 **taboo 特则**（恒胜规则的完整定义）：
 
 1. taboo 与 preference 同主题冲突时 taboo 恒胜：装配出全句，对方只出"曾观察"前缀版。
-2. **taboo 不参与时间衰减降级**——恒胜约束的是优先级，寿命由反证决定。降级仅两条路径：反证（后续行为明确违背该禁忌，feedback 证据触发降级）、同 topic 归并（多个同 topic taboo 合并为一条桶式表述，如十条格式禁忌归并为 `taboo_format`）。
+2. **taboo 不参与时间衰减降级**——恒胜约束的是优先级，寿命由反证决定。降级仅两条路径：反证（后续行为明确违背该禁忌，feedback 证据触发，degraded_reason=refuted）、同 topic 归并（多个同 topic taboo 合并为一条桶式表述，如十条格式禁忌归并为 `taboo_format`）。
 3. 必带集中 taboo 超顶（>40 条）：本响应按得分截 taboo 尾部至预算 60%，**同时触发归并复审任务**——不静默截断了事。
 
 **澄清回流**（概念保留，初版不实现，见 §17-3）：装配响应预留 `clarification_needed: [{conflicting_ids, question}]` 字段，是否向用户发问由消费方决定；用户答案标记 `kind: clarification` 直通决策步。

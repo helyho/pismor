@@ -1,3 +1,6 @@
+import pytest
+from pydantic import ValidationError
+
 from mem.intake import intake_event
 
 CONV = {"source": "webchat", "user_ref": "u1", "event_id": "e1", "event_type": "conversation",
@@ -22,9 +25,23 @@ def test_hash_fallback_event_id(conn):
     assert row["event_id"] and row["event_id"].startswith("sha256:")
 
 def test_unknown_event_type_rejected(conn):
-    import pytest
-    with pytest.raises(Exception):
+    with pytest.raises(ValidationError):
         intake_event(conn, dict(CONV, event_id="e2", event_type="audio"))
+
+def test_text_over_8192_rejected(conn):  # Review Important #1：8K 硬顶，拒绝且不落库
+    ev = {"source": "docs", "user_ref": "u1", "event_id": "e10", "event_type": "text",
+          "ts": "2026-11-24T09:00:00+08:00", "content": "x" * 8193}
+    with pytest.raises(ValidationError):
+        intake_event(conn, ev)
+    assert conn.execute("SELECT COUNT(*) c FROM events_seen").fetchone()["c"] == 0
+    assert conn.execute("SELECT COUNT(*) c FROM entries").fetchone()["c"] == 0
+
+@pytest.mark.parametrize("field", ["source", "user_ref", "session_id", "ts"])
+def test_missing_required_field_rejected(conn, field):  # Review Important #1：缺必填字段拒绝且不落库
+    ev = {k: v for k, v in CONV.items() if k != field} | {"event_id": "e11"}
+    with pytest.raises(ValidationError):
+        intake_event(conn, ev)
+    assert conn.execute("SELECT COUNT(*) c FROM events_seen").fetchone()["c"] == 0
 
 def test_text_event_accepted(conn):
     ev = {"source": "docs", "user_ref": "u1", "event_id": "e9", "event_type": "text",

@@ -1,10 +1,11 @@
 """一致性审计（spec §4/§6/§7 invariants SQL 化）：只读扫描，产 violations，不改数据。
 
 规则集（spec §7 invariants + §4 指令扫描 + §6 状态机静态校验）：
-- taboo_no_overlap: 同 user 的 taboo 与 preference 存活行（active/degraded）近似同主题
-  （相等/子串/共享词根）且 scope 相容（相等或一方 global）——SQL 拉行 + Python 近似判定。
-  注：写入器恒胜产物（preference 侧 degraded/conflict_lost）按裁决字面同样在列，
-  detail 携带 degraded_reason 供复核区分正常恒胜与异常并存。
+- taboo_no_overlap: 同 user 的 taboo 与 preference 存活行近似同主题（相等/子串/共享词根）
+  且 scope 相容（相等或一方 global），仅报"矛盾未经裁决"（修复轮 1 裁决）：
+  preference 侧 degraded/conflict_lost 或双方 conflict_with 互标 = spec §11 恒胜已裁决
+  终态，排除；双方 active、或 preference degraded 但 reason≠conflict_lost，且无互标 → 违规。
+  ——SQL 拉行 + Python 近似判定。
 - quote_required: entries 左连 sources 无证据行（~ 轨迹行豁免：证据链已转移至自身键，
   不因归档时间线差异误报）。
 - inferred_cap: sources.kind='inferred' 且 entry confidence>0.8（上限含 0.8 合法）。
@@ -16,6 +17,7 @@
 
 taxonomy 参数为接口契约保留：当前规则集是 spec 固定不变量，不依赖词表内容。
 """
+import json
 import re
 
 from mem.prompts import INSTRUCTION_RE
@@ -42,7 +44,8 @@ def _loc(row):
 
 def _taboo_no_overlap(conn):
     rows = conn.execute(
-        "SELECT user_source, user_id, dimension, topic, scope, degraded_reason FROM entries"
+        "SELECT user_source, user_id, dimension, topic, scope, id, degraded_reason,"
+        " conflict_with FROM entries"
         " WHERE dimension IN ('taboo','preference') AND status IN ('active','degraded')").fetchall()
     taboos = [r for r in rows if r["dimension"] == "taboo"]
     prefs = [r for r in rows if r["dimension"] == "preference"]
@@ -53,12 +56,23 @@ def _taboo_no_overlap(conn):
                 continue
             if not _scope_compatible(tb["scope"], pf["scope"]):
                 continue
-            if _topics_near(tb["topic"], pf["topic"]):
-                out.append({"rule": "taboo_no_overlap", "detail":
-                            f"{_loc(tb)} 与 {pf['dimension']}/{pf['topic']}@{pf['scope']}"
-                            f" 近似同主题并存（taboo reason={tb['degraded_reason']},"
-                            f" preference reason={pf['degraded_reason']}）"})
+            if not _topics_near(tb["topic"], pf["topic"]):
+                continue
+            if _adjudicated(tb, pf):
+                continue  # conflict_lost 终态或 conflict_with 互标：spec §11 已裁决，非违规
+            out.append({"rule": "taboo_no_overlap", "detail":
+                        f"{_loc(tb)} 与 {pf['dimension']}/{pf['topic']}@{pf['scope']}"
+                        f" 近似同主题矛盾未经裁决（taboo reason={tb['degraded_reason']},"
+                        f" preference reason={pf['degraded_reason']}, 无 conflict_with 互标）"})
     return out
+
+
+def _adjudicated(tb, pf):
+    """已裁决：preference 恒胜落败（conflict_lost）或双方互标 conflict_with。"""
+    if pf["degraded_reason"] == "conflict_lost":
+        return True
+    marked = lambda r: set(json.loads(r["conflict_with"] or "[]"))  # noqa: E731
+    return tb["id"] in marked(pf) or pf["id"] in marked(tb)
 
 
 def _scope_compatible(a, b):

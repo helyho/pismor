@@ -95,14 +95,15 @@ def _entry(db, dim, topic, *, us="webchat", uid="u1"):
 
 
 def _seed(db, dim, topic, body, *, status="active", conf=0.9, scope="global",
-          us="webchat", uid="u1"):
+          us="webchat", uid="u1", degraded_reason=None, conflict_with=None):
     entry_id = f"{dim}_{topic}"
     db.execute(
         "INSERT INTO entries (user_source,user_id,dimension,topic,scope,id,confidence,status,"
-        " body,summary,created_at,updated_at,last_reinforced_at,reinforcements)"
-        " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,0)",
+        " body,summary,created_at,updated_at,last_reinforced_at,reinforcements,"
+        " degraded_reason,conflict_with)"
+        " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,0,?,?)",
         (us, uid, dim, topic, scope, entry_id, conf, status, body, body[:20],
-         NOW, NOW, NOW))
+         NOW, NOW, NOW, degraded_reason, conflict_with))
     db.execute(
         "INSERT INTO sources (entry_id,user_source,user_id,origin_type,origin_ref,quote,kind)"
         " VALUES (?,?,?,?,?,?,?)",
@@ -204,6 +205,55 @@ def test_full_lifecycle(client_with_script, db):
     shell = (root / "shell.md").read_text(encoding="utf-8")
     assert "preference_style" in shell and "fact_event" in shell
     assert "~style" in (root / "archive.md").read_text(encoding="utf-8")
+
+
+def test_repeated_get_keeps_clarification(client_with_script, db):
+    # ① 同一秒内重复装配：issue 去重复用问题，不再吞空/累积 pending 行
+    client, _llm = client_with_script([])
+    _seed(db, "preference", "style", "回复使用正式书面语", conf=0.76, status="degraded",
+          degraded_reason="conflict_lost", conflict_with='["preference_+style"]')
+    _seed(db, "preference", "+style", "聊天回复随意自然", conf=0.72, status="degraded",
+          degraded_reason="conflict_lost", conflict_with='["preference_style"]')
+
+    first = client.get("/profile/webchat/u1?budget=2000").json()["clarification_needed"]
+    second = client.get("/profile/webchat/u1?budget=2000").json()["clarification_needed"]
+    assert len(first) == 1 and second == first
+    assert db.execute("SELECT COUNT(*) FROM pending_clarifications").fetchone()[0] == 1
+
+
+def test_clarification_updates_canonical_main_row(client_with_script, db):
+    # ② 新证据置信更高（0.95 > 旧行 0.90）→ conflicting_ids 首项是 '+style' 变形行，
+    # 回答仍必须写规范主行 preference_style，变形行只清冲突标记
+    pref_v1 = cand("preference", "style", "回复使用正式书面语", "正式书面语",
+                   "以后回复都用正式书面语", confidence=0.9)
+    pref_v2 = cand("preference", "style", "聊天回复随意自然", "随意自然",
+                   "以后聊天回复随意一点，别太正式", confidence=0.95)
+    answer = "平时聊天随意点，写东西的时候再正式"
+    client, llm = client_with_script([
+        S("extract_candidates", {"candidates": [pref_v1]}),
+        S("extract_candidates", {"candidates": [pref_v2]}),
+        S("resolve_decision", {"decision": "CONFLICT", "reason": "正式与随意互斥"}),
+        S("clarification_answer_check", {"is_answer": True}),
+        S("extract_candidates", {"candidates": []}),
+        S("resolve_decision", {"decision": "UPDATE", "reason": "本人澄清"}),
+    ])
+
+    _post(client, llm, conv("evt_h1", "以后回复都用正式书面语"))
+    _post(client, llm, conv("evt_h2", "以后聊天回复随意一点，别太正式", turn=2))
+    pack = client.get("/profile/webchat/u1?budget=2000").json()
+    assert pack["clarification_needed"][0]["conflicting_ids"] == \
+        ["preference_+style", "preference_style"]  # 高置信变形行在首项
+
+    _post(client, llm, conv("evt_h3", answer, turn=3))
+    _assert_consumed(llm)
+    main = _entry(db, "preference", "style")
+    plus = _entry(db, "preference", "+style")
+    assert main["status"] == "active" and main["body"] == answer
+    assert main["summary"] == answer[:20] and main["confidence"] == 1.0
+    assert main["conflict_with"] is None and plus["conflict_with"] is None
+    assert plus["status"] == "active" and plus["degraded_reason"] is None
+    assert db.execute("SELECT COUNT(*) FROM pending_clarifications").fetchone()[0] == 0
+    assert client.get("/profile/webchat/u1?budget=2000").json()["clarification_needed"] == []
 
 
 def test_idempotent_duplicate_200(client_with_script, db):

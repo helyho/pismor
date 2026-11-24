@@ -64,6 +64,32 @@ def test_issue_persists_row(conn):
     assert row["ttl_days"] == 7
 
 
+def test_issue_idempotent_same_pair_same_second(conn):
+    # ① 同秒重复装配：返回同一 question、不重复 INSERT（PK 为 user+issued_at 秒）
+    q1 = issue(conn, "w", "u", ["a", "b"], {"a": "要正式书面", "b": "要口语化"})
+    q2 = issue(conn, "w", "u", ["a", "b"], {"a": "要正式书面", "b": "要口语化"})
+    assert q2 == q1
+    assert conn.execute("SELECT COUNT(*) c FROM pending_clarifications").fetchone()["c"] == 1
+
+
+def test_issue_dedupes_by_id_set_not_order(conn):
+    # 集合相同即同一矛盾对：顺序反转也复用在案问题
+    q1 = issue(conn, "w", "u", ["a", "b"], {"a": "要正式", "b": "要口语化"})
+    q2 = issue(conn, "w", "u", ["b", "a"], {"a": "要正式", "b": "要口语化"})
+    assert q2 == q1
+    assert conn.execute("SELECT COUNT(*) c FROM pending_clarifications").fetchone()["c"] == 1
+
+
+def test_issue_different_pair_inserts_new(conn):
+    issue(conn, "w", "u", ["a", "b"], {"a": "要正式", "b": "要口语化"})
+    # 先把已有行挪到不同秒，避免复用本测试未覆盖的“不同对同秒 PK”路径
+    conn.execute("UPDATE pending_clarifications SET issued_at='2026-11-23T00:00:00+00:00'")
+    conn.commit()
+    q2 = issue(conn, "w", "u", ["a", "c"], {"a": "要正式", "c": "要简洁"})
+    assert conn.execute("SELECT COUNT(*) c FROM pending_clarifications").fetchone()["c"] == 2
+    assert "要简洁" in q2
+
+
 def test_no_pending_returns_none_without_llm(conn, fake_llm_yes):
     assert match_incoming(conn, "w", "u", "今天天气不错", fake_llm_yes) is None
     assert fake_llm_yes.calls == []  # 无 pending 不进 LLM

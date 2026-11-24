@@ -87,19 +87,29 @@ def _last_user_text(event: dict) -> str:
 
 
 def _clarify_candidates(conn, us, uid, hit: dict) -> list[dict]:
-    """澄清回答构造为单条 clarification 候选（取矛盾对主行 key），直通决策步。"""
+    """澄清回答构造为单条 clarification 候选，目标取矛盾对的规范主行。
+
+    优先 topic 不以 '+'/'~' 开头的行（CONFLICT 变形行只作冲突对方）；全是变形行时
+    才退回 conflicting_ids 原序（置信序）。避免回答写进 '+topic' 行、主行保留旧值。
+    """
     answer = hit["answer"]
-    for eid in hit["conflicting_ids"]:
-        row = conn.execute(
-            "SELECT dimension, topic, scope FROM entries"
-            " WHERE user_source=? AND user_id=? AND id=? AND status IN ('active','degraded')"
-            " ORDER BY updated_at DESC LIMIT 1", (us, uid, eid)).fetchone()
-        if row is None:
-            continue
-        return [{"dimension": row["dimension"], "topic": row["topic"], "scope": row["scope"],
-                 "body": answer, "summary": answer[:20], "confidence": 1.0,
-                 "kind": "clarification", "quote": answer, "topic_new": None}]
-    return []
+    ids = list(hit["conflicting_ids"])
+    rows = [r for r in (_clarify_target_row(conn, us, uid, eid) for eid in ids) if r is not None]
+    ordered = ([r for r in rows if not r["topic"].startswith(("+", "~"))]
+               + [r for r in rows if r["topic"].startswith(("+", "~"))])
+    if not ordered:
+        return []
+    row = ordered[0]
+    return [{"dimension": row["dimension"], "topic": row["topic"], "scope": row["scope"],
+             "body": answer, "summary": answer[:20], "confidence": 1.0,
+             "kind": "clarification", "quote": answer, "topic_new": None}]
+
+
+def _clarify_target_row(conn, us, uid, entry_id: str):
+    return conn.execute(
+        "SELECT dimension, topic, scope FROM entries"
+        " WHERE user_source=? AND user_id=? AND id=? AND status IN ('active','degraded')"
+        " ORDER BY updated_at DESC LIMIT 1", (us, uid, entry_id)).fetchone()
 
 
 def _write_pending(conn, us, uid, candidates, origin_type, origin_ref, now) -> int:

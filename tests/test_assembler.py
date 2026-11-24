@@ -233,5 +233,24 @@ def test_include_profile_false_keeps_rest(conn, seeded):
 
 
 def test_dimensions_filter(conn, seeded):
+    # 无 query 时相关集为空，entries 即必带集全量（白名单不削减）
     pack = assemble(conn, None, "w", "u1", budget=2000, dimensions=["taboo"])
-    assert [e["id"] for e in pack["entries"]] == ["taboo_excel"]
+    assert {e["id"] for e in pack["entries"]} == {"taboo_excel", "identity_role"}
+
+
+def test_dimensions_keeps_must_have_set(conn, seeded):
+    # 必带集恒在：白名单 ["preference"] 不得静默过滤 taboo+identity
+    pack = assemble(conn, None, "w", "u1", budget=2000, dimensions=["preference"])
+    ids = [e["id"] for e in pack["entries"]]
+    assert "taboo_excel" in ids and "identity_role" in ids
+
+
+def test_dimensions_filters_related_only(conn, seeded):
+    # 白名单只筛相关集：seed 一条 context 条目（词面可命中），dimensions=["preference"] 时不入相关集
+    _entry(conn, "context", "city", "用户住在海淀区", conf=0.8, uid="u1")
+    conn.commit()
+    pack = assemble(conn, None, "w", "u1", budget=2000, query="海淀区咖啡", dimensions=["preference"])
+    ids = [e["id"] for e in pack["entries"]]
+    assert "preference_coffee" in ids          # 白名单内的相关集条目入选
+    assert "context_city" not in ids           # 白名单外的相关维度被筛掉
+    assert "taboo_excel" in ids and "identity_role" in ids  # 必带集不受影响

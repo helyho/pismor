@@ -48,10 +48,10 @@ def assemble(conn, embedder, user_source, user_id, budget=2000, dimensions=None,
                         (user_source, user_id)).fetchone():
             return _empty_pack()
         try:
-            must = _must_have(conn, user_source, user_id, dimensions)
+            must = _must_have(conn, user_source, user_id)
             related = _related(conn, embedder, user_source, user_id, query, dimensions)
         except sqlite3.Error:
-            must = _must_have(conn, user_source, user_id, dimensions)  # 只回必带集
+            must = _must_have(conn, user_source, user_id)  # 只回必带集
             related = []
         pack = _build(must, related, budget, now, user_id, include_profile, audit_sink)
         try:
@@ -63,14 +63,12 @@ def assemble(conn, embedder, user_source, user_id, budget=2000, dimensions=None,
         return _empty_pack()
 
 
-def _must_have(conn, user_source, user_id, dimensions) -> list[dict]:
+def _must_have(conn, user_source, user_id) -> list[dict]:
+    # dimensions 白名单只作用于相关集；必带集（taboo+identity）无条件恒在
     sql = ("SELECT {} FROM entries WHERE user_source=? AND user_id=?"
            " AND dimension IN ('taboo','identity')"
            " AND status IN ('active','degraded')").format(_MUST_COLS)
     args = [user_source, user_id]
-    if dimensions:
-        sql += " AND dimension IN ({})".format(",".join("?" * len(dimensions)))
-        args += dimensions
     sql += f" ORDER BY {_PRIORITY_ORDER_BY}"
     return [dict(r) for r in conn.execute(sql, args).fetchall()]
 

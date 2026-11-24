@@ -5,7 +5,7 @@ taxonomy_path: ./config/taxonomy.yaml
 export_root: ./exports
 
 llm:
-  endpoint: "https://llm.bitv-ex.com/v1"
+  endpoint: "http://10.242.0.11:8080/v1/"
   model: "auto"
   api_key_env: LLM_API_KEY
   timeout_seconds: 120            # 单次请求超时；结构化输出慢模型建议 ≥120
@@ -27,7 +27,7 @@ llm:
 
 embedding:
   enabled: false                  # 默认关闭：词面匹配为默认装配路径
-  endpoint: "http://10.80.2.245:8000/v1/embeddings"
+  endpoint: "http://10.11.11.108:8000/v1/embeddings"
   model: "BAAI/bge-m3"
   api_key_env: EMBEDDING_API_KEY
   dimensions: 1024                # 须与模型输出一致；变更触发全量重嵌入

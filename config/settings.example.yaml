@@ -1,0 +1,18 @@
+# 画像系统配置示例。复制为 settings.yaml 后按环境修改；
+# api_key_env 指向的密钥从环境变量读取，不落配置文件。
+db_path: ./data/index.db
+taxonomy_path: ./config/taxonomy.yaml
+export_root: ./exports
+
+llm:
+  endpoint: "https://llm.bitv-ex.com/v1"
+  model: "gpt-4o-mini"
+  api_key_env: LLM_API_KEY
+
+embedding:
+  enabled: false                  # 默认关闭：词面匹配为默认装配路径
+  endpoint: "https://llm.bitv-ex.com/v1/embeddings"
+  model: "bge-m3"
+  api_key_env: EMBEDDING_API_KEY
+  dimensions: 1024                # 须与模型输出一致；变更触发全量重嵌入
+  batch_size: 32

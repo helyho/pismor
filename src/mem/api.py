@@ -103,55 +103,89 @@ def create_app(settings: Settings, llm=None, embedder=None) -> FastAPI:
         body: str | None = None  # fix 判定的覆盖内容
         summary: str | None = None
 
-    @app.post("/review/{user_source}/{user_id}/{entry_id}/verdict")
-    def review_verdict(user_source: str, user_id: str, entry_id: str, payload: VerdictIn):
+    @app.post("/review/{user_source}/{user_id}/{scope}/{entry_id}/verdict")
+    def review_verdict(user_source: str, user_id: str, scope: str, entry_id: str, payload: VerdictIn):
         with closing(get_conn(settings.db_path)) as conn:
             with conn:  # 判定+版本推进+矛盾收尾同事务：先到者生效、后到者版本失配 noop
-                rows = conn.execute(
-                    "SELECT * FROM entries WHERE user_source=? AND user_id=? AND id=?"
+                row = conn.execute(
+                    "SELECT * FROM entries WHERE user_source=? AND user_id=? AND id=? AND scope=?"
                     " AND updated_at=? AND topic NOT LIKE '~%'"
                     " AND status IN ('pending_review','active','degraded')",
-                    (user_source, user_id, entry_id, payload.entry_version)).fetchall()
-                if not rows:
+                    (user_source, user_id, entry_id, scope, payload.entry_version)).fetchone()
+                if row is None:
                     return {"noop": True}  # 版本已被先到者改写 → 后到者作废（spec §14）
                 now = _utcnow()
-                for r in rows:
-                    if payload.verdict == "discard":
-                        conn.execute(
-                            "DELETE FROM sources WHERE user_source=? AND user_id=? AND entry_id=?",
-                            (user_source, user_id, f"{r['id']}@{r['scope']}"))
-                        conn.execute(
-                            "DELETE FROM entries WHERE user_source=? AND user_id=?"
-                            " AND dimension=? AND topic=? AND scope=?",
-                            (user_source, user_id, r["dimension"], r["topic"], r["scope"]))
-                    else:
-                        if payload.verdict == "fix" and (payload.body or payload.summary):
-                            conn.execute(
-                                "UPDATE entries SET body=COALESCE(?, body),"
-                                " summary=COALESCE(?, summary)"
-                                " WHERE user_source=? AND user_id=? AND dimension=?"
-                                " AND topic=? AND scope=?",
-                                (payload.body, payload.summary, user_source, user_id,
-                                 r["dimension"], r["topic"], r["scope"]))
-                        # orphan 候选 approve → 观察区（spec §8.2 晋升链入口），其余 → active
-                        new_status = ("orphan_topic" if r["dimension"] == "orphan"
-                                      else "active")
-                        conn.execute(
-                            "UPDATE entries SET status=?, degraded_reason=NULL,"
-                            " conflict_with=NULL, updated_at=?"
-                            " WHERE user_source=? AND user_id=? AND dimension=?"
-                            " AND topic=? AND scope=?",
-                            (new_status, now, user_source, user_id,
-                             r["dimension"], r["topic"], r["scope"]))
-                        # 矛盾收尾（I-2/C-1）：清对方行标记、conflict_lost 恢复 active、
-                        # 删相关 pending——'+' 行随之移出复核队列
-                        writer.resolve_conflicts(conn, user_source, user_id, entry_id, now)
+                if payload.verdict == "discard":
+                    # CAS：删除同样以 updated_at 为条件，行数 0 即判定作废
+                    cur = conn.execute(
+                        "DELETE FROM entries WHERE user_source=? AND user_id=? AND id=? AND scope=?"
+                        " AND updated_at=?",
+                        (user_source, user_id, entry_id, scope, payload.entry_version))
+                    if cur.rowcount == 0:
+                        return {"noop": True}
                     conn.execute(
-                        "INSERT INTO review_history (entry_id, user_source, user_id, verdict,"
-                        " actor, ts, note, entry_version) VALUES (?, ?, ?, ?, 'reviewer', ?, ?, ?)",
-                        (entry_id, user_source, user_id, payload.verdict, now,
-                         payload.note, payload.entry_version))
-        return {"noop": False, "updated": len(rows)}
+                        "DELETE FROM sources WHERE user_source=? AND user_id=? AND entry_id=?",
+                        (user_source, user_id, f"{row['id']}@{scope}"))
+                else:
+                    # orphan 候选 approve → 观察区（spec §8.2 晋升链入口），其余 → active
+                    new_status = ("orphan_topic" if row["dimension"] == "orphan"
+                                  else "active")
+                    new_topic, new_id = row["topic"], row["id"]
+                    fix_body = payload.body if payload.verdict == "fix" else None
+                    fix_summary = payload.summary if payload.verdict == "fix" else None
+                    if row["topic"].startswith("!"):
+                        # 待复核快照 approve：规范键已被新证据占用 → 快照归档（不复活旧猜测）
+                        canonical = row["topic"][1:]
+                        occupied = conn.execute(
+                            "SELECT 1 FROM entries WHERE user_source=? AND user_id=?"
+                            " AND dimension=? AND topic=? AND scope=? AND id<>?",
+                            (user_source, user_id, row["dimension"], canonical, scope,
+                             row["id"])).fetchone()
+                        if occupied:
+                            cur = conn.execute(
+                                "UPDATE entries SET status='archived', archived_at=?,"
+                                " conflict_with=NULL, degraded_reason=NULL, updated_at=?"
+                                " WHERE user_source=? AND user_id=? AND dimension=?"
+                                " AND topic=? AND scope=? AND updated_at=?",
+                                (now, now, user_source, user_id, row["dimension"],
+                                 row["topic"], scope, payload.entry_version))
+                            if cur.rowcount == 0:
+                                return {"noop": True}
+                            conn.execute(
+                                "INSERT INTO review_history (entry_id, user_source, user_id,"
+                                " verdict, actor, ts, note, entry_version)"
+                                " VALUES (?, ?, ?, ?, 'reviewer', ?, ?, ?)",
+                                (entry_id, user_source, user_id, payload.verdict, now,
+                                 payload.note or "superseded_by_evolution",
+                                 payload.entry_version))
+                            return {"noop": False, "updated": 1}
+                        new_topic, new_id = canonical, f"{row['dimension']}_{canonical}"
+                    cur = conn.execute(
+                        "UPDATE entries SET status=?, topic=?, id=?,"
+                        " body=COALESCE(?, body), summary=COALESCE(?, summary),"
+                        " degraded_reason=NULL, conflict_with=NULL, updated_at=?"
+                        " WHERE user_source=? AND user_id=? AND dimension=?"
+                        " AND topic=? AND scope=? AND updated_at=?",
+                        (new_status, new_topic, new_id, fix_body, fix_summary, now,
+                         user_source, user_id, row["dimension"], row["topic"], scope,
+                         payload.entry_version))
+                    if cur.rowcount == 0:  # 并发：先到者已改版本 → 本判定作废
+                        return {"noop": True}
+                    if new_id != row["id"]:  # 快照转正：证据链键跟随
+                        conn.execute(
+                            "UPDATE sources SET entry_id=? WHERE user_source=? AND user_id=?"
+                            " AND entry_id=?",
+                            (f"{new_id}@{scope}", user_source, user_id,
+                             f"{row['id']}@{scope}"))
+                    # 矛盾收尾（C-1）：按 (id,scope) 清对方行标记、conflict_lost 恢复 active
+                    writer.resolve_conflicts(conn, user_source, user_id, entry_id, scope, now,
+                                            revive=True, clear_pending=True)
+                conn.execute(
+                    "INSERT INTO review_history (entry_id, user_source, user_id, verdict,"
+                    " actor, ts, note, entry_version) VALUES (?, ?, ?, ?, 'reviewer', ?, ?, ?)",
+                    (entry_id, user_source, user_id, payload.verdict, now,
+                     payload.note, payload.entry_version))
+        return {"noop": False, "updated": 1}
 
     @app.delete("/profile/{source}/{native_id}")
     def delete_profile(source: str, native_id: str, request: Request):
@@ -169,12 +203,20 @@ def create_app(settings: Settings, llm=None, embedder=None) -> FastAPI:
                     "INSERT OR REPLACE INTO tombstones (user_source, user_id, deleted_at,"
                     " requested_by) VALUES (?, ?, ?, ?)",
                     (source, native_id, _utcnow(), requested_by))
+        # 删除权覆盖导出副本：导出目录与库分离，但同为用户画像数据（spec §16#4）
+        try:
+            exporter.remove_export(settings.export_root, source, native_id)
+        except (ValueError, OSError):
+            pass  # 非法路径段/IO 失败：删除权以主库为准，不阻断删除响应
         return {"deleted": True}
 
     @app.get("/export/{source}/{native_id}")
     def export_profile(source: str, native_id: str):
         with closing(get_conn(settings.db_path)) as conn:
-            root = exporter.export(conn, source, native_id, settings.export_root)
+            try:
+                root = exporter.export(conn, source, native_id, settings.export_root)
+            except ValueError as exc:  # 路径穿越/非法路径段 → 400，不写任何文件
+                return JSONResponse({"detail": str(exc)}, status_code=400)
         return {"root": str(root)}
 
     @app.get("/healthz")

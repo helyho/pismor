@@ -48,3 +48,33 @@ def test_text_event_accepted(conn):
           "ts": "2026-11-24T09:00:00+08:00", "content": "用户本周笔记……"}
     ok, _ = intake_event(conn, ev)
     assert ok
+
+
+# ---- fix wave 新增：入口校验 / hash 兜底回写 ----
+
+def test_empty_messages_rejected(conn):
+    with pytest.raises(ValidationError):
+        intake_event(conn, dict(CONV, event_id="e20", messages=[]))
+    assert conn.execute("SELECT COUNT(*) c FROM events_seen").fetchone()["c"] == 0
+
+
+@pytest.mark.parametrize("message", [{"role": "user"}, {"role": "user", "text": " "},
+                                     {"role": "system", "text": "x"}])
+def test_invalid_message_rejected(conn, message):
+    with pytest.raises(ValidationError):
+        intake_event(conn, dict(CONV, event_id="e21", messages=[message]))
+    assert conn.execute("SELECT COUNT(*) c FROM events_seen").fetchone()["c"] == 0
+
+
+@pytest.mark.parametrize("ts", ["not-a-time", "2026-11-24T10:00:00"])
+def test_invalid_ts_rejected(conn, ts):
+    # 无时区/非 ISO 的 ts 会让 julianday 归 NULL，降级/归档静默失效
+    with pytest.raises(ValidationError):
+        intake_event(conn, dict(CONV, event_id="e22", ts=ts))
+    assert conn.execute("SELECT COUNT(*) c FROM events_seen").fetchone()["c"] == 0
+
+
+def test_hash_fallback_writes_back_event_id(conn):
+    ev = dict(CONV, event_id=None)
+    ok, ack = intake_event(conn, ev)
+    assert ok and ev["event_id"] == ack["event_id"] and ev["event_id"].startswith("sha256:")

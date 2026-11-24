@@ -12,6 +12,9 @@
 """
 from pathlib import Path
 import re
+import shutil
+from urllib.parse import unquote
+
 import yaml
 
 from mem.taxonomy import load_taxonomy
@@ -21,14 +24,49 @@ _REPO = Path(__file__).resolve().parents[2]  # editable/repo 布局下 config/ �
 # name 必须过白名单（字母数字下划线中文连字符，禁 / \ .. 空白点号），不匹配跳过该
 # 文件并记入 export-warnings.txt
 _PROJECT_NAME_RE = re.compile(r"^[\w\u4e00-\u9fa5-]+$")
+# source/native_id 路径段白名单：URL 解码后校验，禁 ..、分隔符、控制字符
+_SEGMENT_RE = re.compile(r"^[\w\u4e00-\u9fa5.@-]+$")
 _WARNINGS_FILE = "export-warnings.txt"
 _SECTION_KEYS = ("id", "dimension", "scope", "confidence", "status",
                  "created_at", "updated_at", "sources", "reinforcements",
                  "degraded_reason", "superseded_by")
 
 
+def _safe_segment(value: str, label: str) -> str:
+    """URL 解码后的路径段白名单 + 穿越防护（%2e%2e → .. 亦拒绝）。"""
+    decoded = unquote(value)
+    if (not decoded or decoded in (".", "..") or ".." in decoded
+            or "/" in decoded or "\\" in decoded or "\x00" in decoded
+            or _SEGMENT_RE.fullmatch(decoded) is None):
+        raise ValueError(f"invalid {label}: {value!r}")
+    return decoded
+
+
+def _user_root(out_root: Path, user_source: str, user_id: str) -> tuple[Path, Path]:
+    """解析并校验导出根：解码后仍须 containment 在 out_root 内。"""
+    base = Path(out_root).resolve()
+    source = _safe_segment(user_source, "source")
+    native = _safe_segment(user_id, "native_id")
+    root = (base / source / native).resolve()
+    try:
+        root.relative_to(base)
+    except ValueError as exc:  # 理论上白名单已挡住，防御性兜底
+        raise ValueError(f"export path escapes root: {root}") from exc
+    return base, root
+
+
+def remove_export(out_root: Path, user_source: str, user_id: str) -> bool:
+    """删除该用户的导出目录（删除权同步清理画像副本）。"""
+    _base, root = _user_root(out_root, user_source, user_id)
+    if not root.exists():
+        return False
+    shutil.rmtree(root)
+    return True
+
+
 def export(conn, user_source, user_id, out_root: Path) -> Path:
     taxonomy = load_taxonomy(_REPO / "config" / "taxonomy.yaml")
+    _base, root = _user_root(out_root, user_source, user_id)
     rows = conn.execute(
         "SELECT * FROM entries WHERE user_source=? AND user_id=?"
         " ORDER BY dimension, scope, id",
@@ -67,7 +105,7 @@ def export(conn, user_source, user_id, out_root: Path) -> Path:
             dim_file = taxonomy.dimensions[r["dimension"]].file
             if r["scope"].startswith("project:") and dim_file == "shell.md":
                 name = r["scope"].split(":", 1)[1]
-                if not _PROJECT_NAME_RE.match(name):
+                if not _PROJECT_NAME_RE.fullmatch(name):
                     warnings.append(f"{r['id']}\tinvalid project scope: {r['scope']}")
                     continue  # 白名单外跳过该文件（防路径穿越），_index 亦不列（无归宿可指）
                 fname = f"projects/{name}.md"
@@ -80,7 +118,8 @@ def export(conn, user_source, user_id, out_root: Path) -> Path:
         files.setdefault("_index.md", [])
         index_rows.append(_index_row(r, fname))
 
-    root = out_root / user_source / user_id
+    if root.exists():
+        shutil.rmtree(root)  # 导出前清理本用户旧文件（删除条目后不留陈旧 md）
     root.mkdir(parents=True, exist_ok=True)
     for fname, sections in files.items():
         if fname == "_index.md":

@@ -1,41 +1,47 @@
-"""事件 → 画像候选：对话/文本双模板抽取 + 指令/敏感安全防线。
+"""事件 → 画像候选：对话/文本双模板抽取 + 指令/敏感安全防线 + 澄清回答规范化。
 
 Candidate 键固定：dimension/topic/scope/body/summary/confidence/kind/quote/topic_new，
 orphan 候选额外带 status="orphan_topic"（dimension 占位 "orphan"）。
+
+词表硬约束（spec §7/§8）：
+- dimension 合法但 topic ∉ 该维度 topics → 非 taboo 转 orphan（topic_new 必填，topic 用
+  topic_new 作观察区键）；taboo 维度词表外候选强制人工队列（force_review），不得自动建桶。
+- summary 在出口截断到 20 字（spec §5）。
 """
 import re
 
-from mem.prompts import EXTRACT_CONVERSATION, EXTRACT_TEXT, INSTRUCTION_RE, MAX_BODY
+from mem.prompts import (CLARIFY_EXTRACT_SYSTEM, CLARIFY_EXTRACT_USER,
+                         EXTRACT_CONVERSATION, EXTRACT_TEXT, INSTRUCTION_RE, MAX_BODY)
 
 # sensitive topic 概括级校验：含精确位置/医疗细节特征（数字门牌、楼栋、确诊、处方）→ 整条丢弃
 _SENSITIVE_DETAIL_RE = re.compile(r"\d+号|\d+栋|确诊|处方")
 
-_OUTPUT_SCHEMA = {
-    "name": "extract_candidates",
-    "schema": {
-        "type": "object",
-        "properties": {
-            "candidates": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "dimension": {"type": ["string", "null"]},
-                        "topic": {"type": "string"},
-                        "scope": {"type": "string"},
-                        "body": {"type": "string"},
-                        "summary": {"type": "string"},
-                        "confidence": {"type": "number"},
-                        "kind": {"type": "string", "enum": ["explicit", "inferred", "feedback"]},
-                        "quote": {"type": ["string", "null"]},
-                        "topic_new": {"type": ["string", "null"]},
-                    },
-                },
-            }
-        },
-        "required": ["candidates"],
+_CANDIDATE_ITEM = {
+    "type": "object",
+    "properties": {
+        "dimension": {"type": ["string", "null"]},
+        "topic": {"type": "string"},
+        "scope": {"type": "string"},
+        "body": {"type": "string"},
+        "summary": {"type": "string"},
+        "confidence": {"type": "number"},
+        "kind": {"type": "string", "enum": ["explicit", "inferred", "feedback"]},
+        "quote": {"type": ["string", "null"]},
+        "topic_new": {"type": ["string", "null"]},
     },
 }
+
+
+def _schema(name: str) -> dict:
+    return {"name": name, "schema": {
+        "type": "object",
+        "properties": {"candidates": {"type": "array", "items": _CANDIDATE_ITEM}},
+        "required": ["candidates"],
+    }}
+
+
+_OUTPUT_SCHEMA = _schema("extract_candidates")
+_CLARIFY_SCHEMA = _schema("clarify_candidates")
 
 
 def extract(ev: dict, taxonomy, llm, known_ids: list[str]) -> list[dict]:
@@ -58,6 +64,31 @@ def extract(ev: dict, taxonomy, llm, known_ids: list[str]) -> list[dict]:
     return out
 
 
+def extract_clarification(answer: str, taxonomy, llm, pair_rows) -> list[dict]:
+    """把澄清回答规范化为画像候选（body/summary 来自抽取，不直接使用用户原句）。
+
+    pair_rows 为矛盾对现存行（dimension/topic/scope/summary），仅作理解上下文。
+    输出候选 kind 统一为 clarification（证据类别，spec §5/§11），scope 可拆分。
+    """
+    pairs = "\n".join(
+        f"- {r['dimension']}/{r['topic']}@{r['scope']}：{r['summary']}" for r in pair_rows
+    ) or "（无）"
+    system = CLARIFY_EXTRACT_SYSTEM.format(dimension_block=_dimension_block(taxonomy), pairs=pairs)
+    result = llm.chat_json(system, CLARIFY_EXTRACT_USER.format(answer=answer),
+                           _CLARIFY_SCHEMA)
+    out = []
+    for raw in result.get("candidates", []):
+        cand = _to_candidate(raw, taxonomy)
+        if not cand or cand["dimension"] == "orphan" or cand.get("status") == "orphan_topic":
+            continue  # 澄清回答只收敛既有矛盾主题，不新建观察区桶
+        if not cand.get("quote"):
+            cand["quote"] = answer
+        cand["kind"] = "clarification"
+        cand["confidence"] = max(float(cand.get("confidence") or 0), 0.85)
+        out.append(cand)
+    return out
+
+
 def _dimension_block(taxonomy) -> str:
     return "\n".join(f"- {d.key}({d.name}): {', '.join(d.topics)}"
                      for d in taxonomy.dimensions.values())
@@ -77,8 +108,9 @@ def _is_sensitive(taxonomy, dimension: str, topic: str) -> bool:
 def _to_candidate(raw: dict, taxonomy) -> dict | None:
     dimension = raw.get("dimension")
     topic_new = raw.get("topic_new")
-    topic = raw.get("topic") or ""
-    # null 或词表外（幻觉维度名）→ 一律走 orphan 路径，禁止发明类别
+    topic = str(raw.get("topic") or "").strip()
+    force_review = False
+    # 1) dimension 不在词表 → orphan（禁止发明类别）
     if not dimension or dimension not in taxonomy.dimensions:
         if not topic_new:
             # null 路径: topic_new 必填（LLM 未填即丢弃）；
@@ -87,12 +119,30 @@ def _to_candidate(raw: dict, taxonomy) -> dict | None:
         if not topic_new:
             return None
         dimension, status = "orphan", "orphan_topic"
+        topic = topic_new
     else:
-        status, topic_new = None, None
-    body = raw.get("body") or ""
-    quote = raw.get("quote") or ""
-    # 安全层 1: 指令类内容不是画像
-    if INSTRUCTION_RE.search(body or quote):
+        dim = taxonomy.dimensions[dimension]
+        if topic not in (dim.topics or []):
+            # 2) 合法维度 + 词表外 topic（spec §7 禁止发明主题词）
+            if dimension == "taboo":
+                # taboo 词表禁止运行期扩充：保留维度进人工队列，不自动建桶
+                topic = topic or (topic_new or "unclassified")
+                topic_new = None  # 非 orphan 行不得带 topic_new（审计字段互斥）
+                status = None
+                force_review = True
+            else:
+                topic_new = topic_new or (f"{dimension}/{topic}" if topic else None)
+                if not topic_new:
+                    return None
+                dimension, status = "orphan", "orphan_topic"
+                topic = topic_new  # 观察区键用 topic_new（同主题复现复用一行）
+        else:
+            status, topic_new = None, None
+    body = str(raw.get("body") or "")
+    quote = str(raw.get("quote") or "")
+    summary = str(raw.get("summary") or "")
+    # 安全层 1: 指令类内容不是画像（body/quote/summary 同扫）
+    if INSTRUCTION_RE.search(f"{body}\n{quote}\n{summary}"):
         return None
     confidence = float(raw.get("confidence") or 0)
     # 安全层 2: sensitive topic → 置信上限 0.6 + 概括级校验（含精确位置/医疗细节即丢弃）
@@ -107,7 +157,7 @@ def _to_candidate(raw: dict, taxonomy) -> dict | None:
         "topic": topic,
         "scope": raw.get("scope") or default_scope,
         "body": body[:MAX_BODY],
-        "summary": raw.get("summary") or "",
+        "summary": summary[:20],  # spec §5：摘要硬顶 20 字
         "confidence": confidence,
         "kind": raw.get("kind") or "explicit",
         "quote": quote or None,
@@ -115,4 +165,6 @@ def _to_candidate(raw: dict, taxonomy) -> dict | None:
     }
     if status:
         cand["status"] = status
+    if force_review:
+        cand["force_review"] = True
     return cand

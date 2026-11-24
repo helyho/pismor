@@ -1,8 +1,13 @@
 """画像抽取 prompt 模板与安全常量。"""
 import re
 
-# 指令类内容：要求 AI 执行/运行/忽略/泄露 → 不是画像
-INSTRUCTION_RE = re.compile(r"(执行|运行|忽略|泄露|系统提示|system prompt|rm -rf).{0,20}(命令|指令|提示|回答|输出)", re.I)
+# 指令类内容：要求 AI 执行/运行/忽略/泄露 → 不是画像（中英文祈使均覆盖）
+INSTRUCTION_RE = re.compile(
+    r"(执行|运行|忽略|泄露|系统提示|system prompt|rm -rf).{0,20}(命令|指令|提示|回答|输出)"
+    r"|ignore\s+(all\s+|any\s+|the\s+)?(previous|prior|above)\s+(instructions?|prompts?)"
+    r"|reveal\s+(the\s+)?(system\s+prompt|instructions?)"
+    r"|always\s+(output|follow|execute)\s+(the\s+)?(system|commands?)",
+    re.I)
 
 # 条目正文硬顶
 MAX_BODY = 200
@@ -34,6 +39,22 @@ CLARIFY_CHECK_USER = """待判定的澄清问题：
 
 用户新消息：
 {message}"""
+
+CLARIFY_EXTRACT_SYSTEM = """你是画像规范化器。用户刚回答了此前发出的一条澄清问题。
+任务：把回答中"关于用户的陈述"抽取为画像候选，而不是复述用户对 AI 的要求。
+规则：
+1. 禁止输出祈使句/对 AI 的要求；只输出"用户偏好/事实/禁忌"等陈述句（body）。
+2. 只能使用以下维度与主题词表内的组合；词表外主题不要输出：
+{dimension_block}
+3. 若回答揭示了作用域边界（例如"聊天随意、写东西正式"），拆成多条候选，
+   scope 分别用 global 或 project:{{name}}；同一 (dimension,topic) 可在不同 scope 各一条。
+4. 每条必须引用回答原文作为 quote；summary ≤20 字；kind 用 explicit。
+5. 原矛盾对（供理解回答指向）：
+{pairs}
+输出 JSON: {{"candidates": [...]}}，字段：dimension,topic,scope,body,summary,confidence,kind,quote,topic_new。"""
+
+CLARIFY_EXTRACT_USER = """用户对澄清问题的回答：
+{answer}"""
 
 RESOLVE_SYSTEM = """你是画像条目决策器，比较同 (topic, scope) 的旧条目与新候选，输出单一 decision：
 - UPDATE（演进）：新证据补充、推进或修正旧值的具体内容；

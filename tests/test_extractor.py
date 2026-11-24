@@ -92,3 +92,43 @@ def test_body_truncated_to_max(taxonomy):
     ev = {"event_type": "text", "source": "d", "user_ref": "u", "content": "c", "ts": "t"}
     out = extract(ev, taxonomy, llm, known_ids=[])
     assert len(out[0]["body"]) == 200
+
+
+# ---- fix wave 新增：词表外 topic 拦截 / summary 截断 ----
+
+def _text_ev(content="c"):
+    return {"event_type": "text", "source": "d", "user_ref": "u", "content": content, "ts": "t"}
+
+
+def test_off_vocab_topic_becomes_orphan(taxonomy):
+    # C-3：合法维度 + 自造 topic → 观察区（topic_new 必填），不得直接 active
+    llm = FakeLLM([{"candidates": [{"dimension": "preference", "topic": "tabsize",
+        "scope": "global", "body": "偏好两个空格缩进", "summary": "缩进两空格",
+        "confidence": 0.95, "kind": "explicit", "quote": "以后缩进都用两个空格",
+        "topic_new": None}]}])
+    out = extract(_text_ev("以后缩进都用两个空格"), taxonomy, llm, known_ids=[])
+    assert out and out[0]["dimension"] == "orphan" and out[0]["status"] == "orphan_topic"
+    assert out[0]["topic_new"] == "preference/tabsize"
+    assert out[0]["topic"] == out[0]["topic_new"]  # 观察区键用 topic_new
+
+
+def test_taboo_off_vocab_topic_forced_to_review(taxonomy):
+    # C-3：taboo 维度词表外主题只进人工队列，禁止自动建桶
+    from mem.gate import gate
+    llm = FakeLLM([{"candidates": [{"dimension": "taboo", "topic": "invented",
+        "scope": "global", "body": "不要使用某工具", "summary": "禁用某工具",
+        "confidence": 0.95, "kind": "explicit", "quote": "别再让我用那个工具",
+        "topic_new": "invented"}]}])
+    out = extract(_text_ev("别再让我用那个工具"), taxonomy, llm, known_ids=[])
+    assert out[0]["dimension"] == "taboo" and out[0]["force_review"] is True
+    auto, review, dropped = gate(out)
+    assert auto == [] and len(review) == 1 and dropped == []
+
+
+def test_summary_truncated_to_20(taxonomy):
+    # I-13/T13：summary 出口硬顶 20 字
+    llm = FakeLLM([{"candidates": [{"dimension": "preference", "topic": "style",
+        "scope": "global", "body": "正文", "summary": "摘" * 80,
+        "confidence": 0.9, "kind": "explicit", "quote": "q", "topic_new": None}]}])
+    out = extract(_text_ev("q"), taxonomy, llm, known_ids=[])
+    assert len(out[0]["summary"]) == 20

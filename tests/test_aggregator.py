@@ -328,3 +328,29 @@ def test_demote_timezone_consistency(conn, taxonomy):
     assert stats["demoted"] == 2
     c = conn.execute("SELECT COUNT(*) c FROM entries WHERE status='degraded'").fetchone()["c"]
     assert c == 2
+
+
+# ---- fix wave 新增：orphan 组禁止建 taboo 桶 / 多 topic_new 不合并 ----
+
+def test_orphan_group_never_creates_taboo_bucket(conn, taxonomy_writable):
+    _seed_orphans(conn)
+    before = taxonomy_writable.path.read_text(encoding="utf-8")
+    llm = FakeLLM({"action": "new_topic", "dimension": "taboo", "topic": "weirdtool"})
+    stats = run_daily(conn, taxonomy_writable, llm, auto_promote=True, now=NOW)
+    assert stats["promoted"] == 0
+    assert taxonomy_writable.path.read_text(encoding="utf-8") == before  # 词表未污染
+    assert conn.execute("SELECT COUNT(*) c FROM entries WHERE status='orphan_topic'"
+                        ).fetchone()["c"] == 3
+    notes = [r["note"] for r in conn.execute(
+        "SELECT note FROM review_history WHERE actor='audit'").fetchall()]
+    assert any("taboo_new_topic_queued" in n for n in notes)
+
+
+def test_same_user_multiple_topic_new_not_merged(conn, taxonomy, fake_llm_merge):
+    # I-1：同用户不同 topic_new 的观察条目各自成组，不压成一行
+    for i, tn in enumerate(("多肉养护", "茶叶品鉴", "小说创作")):
+        _entry(conn, uid="u1", topic=f"orphan{i}", topic_new=tn)
+    stats = run_daily(conn, taxonomy, fake_llm_merge, auto_promote=True, now=NOW)
+    assert stats["promoted"] == 0 and stats["dropped_orphan"] == 0
+    rows = conn.execute("SELECT topic_new FROM entries WHERE status='orphan_topic'").fetchall()
+    assert {r["topic_new"] for r in rows} == {"多肉养护", "茶叶品鉴", "小说创作"}

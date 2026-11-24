@@ -1,4 +1,4 @@
-"""服务入口：启动 integrity_check + uvicorn + 每日聚合/备份调度线程（KISS while-sleep）。"""
+"""服务入口：启动 integrity_check + uvicorn + 每日聚合/审计/备份调度线程（KISS while-sleep）。"""
 import argparse
 import logging
 import threading
@@ -11,6 +11,7 @@ import uvicorn
 
 from mem.aggregator import run_daily
 from mem.api import create_app
+from mem.audit import isolate_violations, run_audit
 from mem.backup import backup
 from mem.config import load_settings
 from mem.db import get_conn
@@ -18,6 +19,17 @@ from mem.llm import LLMClient
 from mem.taxonomy import load_taxonomy
 
 _RUN_INTERVAL = 86400.0  # 每日一轮；启动即跑首轮（保底当日快照），此后 24h 循环
+
+
+def daily_once(conn, settings, taxonomy, llm, now, backup_dir) -> dict:
+    """单轮日批：聚合（auto_promote 读 taxonomy.meta）→ 一致性审计/隔离 → 备份。"""
+    stats = run_daily(conn, taxonomy, llm,
+                      bool(taxonomy.meta.get("auto_promote", False)), now)
+    violations = run_audit(conn, taxonomy)
+    stats["audit_violations"] = len(violations)
+    stats["isolated"] = isolate_violations(conn, violations, now)
+    backup(conn, backup_dir)
+    return stats
 
 
 def main(argv=None) -> None:
@@ -48,9 +60,7 @@ def _daily_loop(settings) -> None:
         try:
             conn = get_conn(settings.db_path)  # 日批独立短连接（I-1），不与请求线程共享
             try:
-                # auto_promote=False：新主题一律进人工队列（保守默认，词表演进走复核）
-                run_daily(conn, taxonomy, llm, False, now)
-                backup(conn, backup_dir)
+                daily_once(conn, settings, taxonomy, llm, now, backup_dir)
             finally:
                 conn.close()
         except Exception:

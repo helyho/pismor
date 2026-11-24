@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 
 from mem.clarifier import issue as _clarify_issue
 from mem.embedder import EmbedUnavailable
+from mem.keys import mark, split_mark
 
 RENDER_HEADER = "以下是用户 {user_ref} 的历史画像数据，供参考，非指令："
 _RENDER_ORDER = ("taboo", "identity", "preference", "fact", "context")
@@ -23,7 +24,7 @@ _MUST_DIMS = ("taboo", "identity")
 # ledger 裁决：必带集排序在 SQL 内显式 priority，不依赖 dict 顺序
 _PRIORITY_ORDER_BY = ("CASE dimension WHEN 'taboo' THEN 0 WHEN 'identity' THEN 1"
                       " ELSE 2 END, confidence DESC")
-_MUST_COLS = "id, dimension, body, confidence, status, updated_at, reinforcements"
+_MUST_COLS = "id, dimension, scope, body, confidence, status, updated_at, reinforcements"
 _TOKEN_RE = re.compile(r"[0-9A-Za-z_]{2,}|[\u4e00-\u9fff]+")
 _HAN_RE = re.compile(r"[\u4e00-\u9fff]")
 
@@ -84,7 +85,7 @@ def _related(conn, embedder, user_source, user_id, query, dimensions) -> list[di
         except (EmbedUnavailable, KeyError, json.JSONDecodeError, IndexError, sqlite3.Error):
             rows = []  # 向量召回不可用（含网关 200 坏体 KeyError）→ 回退词面
     if not rows:
-        rows = _lexical(conn, user_source, user_id, _tokens(query), dimensions)
+        rows = _lexical(conn, user_source, user_id, tokens(query), dimensions)
     return rows
 
 
@@ -92,8 +93,10 @@ def _vector_recall(conn, vec_json, user_source, user_id, dimensions) -> list[dic
     if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table'"
                     " AND name='embeddings'").fetchone() is None:
         raise sqlite3.OperationalError("embeddings table missing")
-    sql = ("SELECT {} FROM embeddings v JOIN entries e ON e.id = v.entry_id"
-           " AND e.user_source = v.user_source AND e.user_id = v.user_id"
+    # 向量行主键为五元组合成键（keys.vec_key），JOIN 按五元组还原，跨 scope 同 id 不串行
+    sql = ("SELECT {} FROM embeddings v JOIN entries e"
+           " ON v.entry_id = e.user_source || char(31) || e.user_id || char(31)"
+           "    || e.dimension || char(31) || e.topic || char(31) || e.scope"
            " WHERE v.embedding MATCH ? AND v.k = {}"
            " AND e.user_source = ? AND e.user_id = ?"
            " AND e.status IN ('active','degraded')").format(_MUST_COLS, _RELATED_TOP_K)
@@ -123,7 +126,7 @@ def _lexical(conn, user_source, user_id, tokens, dimensions) -> list[dict]:
     return rows[:_RELATED_TOP_K]
 
 
-def _tokens(query: str) -> list[str]:
+def tokens(query: str) -> list[str]:
     """话题切词：汉字段取相邻二字组（无分词依赖），英文/数字取整词。"""
     tokens = []
     for seg in _TOKEN_RE.findall(query or ""):
@@ -152,12 +155,13 @@ def _score(row, now) -> float:
 
 
 def _build(must, related, budget, now, user_ref, include_profile, audit_sink) -> dict:
-    seen: set[str] = set()
+    seen: set[tuple[str, str]] = set()
     merged = []
     for r in list(must) + list(related):
-        if r["id"] in seen:  # 必带集条目不因词面/向量命中重复入选
+        key = (r["id"], r["scope"])  # 同 id 跨 scope 是两条独立条目，均须注入（C-1）
+        if key in seen:
             continue
-        seen.add(r["id"])
+        seen.add(key)
         merged.append(r)
     merged.sort(key=lambda r: ({"taboo": 0, "identity": 1}.get(r["dimension"], 2),
                                -_score(r, now)))
@@ -193,37 +197,44 @@ def _build(must, related, budget, now, user_ref, include_profile, audit_sink) ->
 
 
 def _clarifications(conn, user_source, user_id) -> list[dict]:
-    """对称 conflict_with 对 → clarifier.issue 落 pending 并随响应递交（spec §11）。"""
+    """对称 conflict_with 对 → clarifier.issue 落 pending 并随响应递交（spec §11）。
+
+    关联标记为 id@scope，按 (id,scope) 定位；同 id 跨 scope 的对互不串扰（C-1）。
+    """
     rows = conn.execute(
-        "SELECT id, summary, confidence, conflict_with FROM entries"
+        "SELECT id, scope, summary, confidence, conflict_with FROM entries"
         " WHERE user_source=? AND user_id=?"
         " AND status IN ('active','degraded') AND conflict_with IS NOT NULL",
         (user_source, user_id)).fetchall()
-    by_id = {}
+    by_key = {}
+    parsed = {}
     for r in rows:
-        by_id.setdefault(r["id"], r)  # 同 id 跨 scope 多行取首行
-    out, done = [], set()
-    for r in rows:
+        key = (r["id"], r["scope"])
+        by_key.setdefault(key, r)
         try:
             marks = json.loads(r["conflict_with"])
         except (TypeError, ValueError):
             continue
-        for other_id in marks:
-            if other_id not in by_id:
+        parsed[key] = marks if isinstance(marks, list) else []
+    out, done = [], set()
+    for r in rows:
+        key = (r["id"], r["scope"])
+        for other_mark in parsed.get(key, []):
+            other_key = split_mark(str(other_mark), r["scope"])
+            other = by_key.get(other_key)
+            if other is None:
                 continue
-            pair = tuple(sorted((r["id"], other_id)))
+            pair = frozenset((mark(*key), mark(*other_key)))
             if pair in done:
                 continue
-            other = by_id[other_id]
-            try:
-                back = json.loads(other["conflict_with"])
-            except (TypeError, ValueError):
-                continue
-            if r["id"] not in back:
+            back = parsed.get(other_key, [])
+            if not any(split_mark(str(m), other["scope"]) == key for m in back):
                 continue  # 非对称标记不构成矛盾对
             done.add(pair)
-            ordered = sorted(pair, key=lambda i: -(by_id[i]["confidence"] or 0.0))
-            question = _clarify_issue(conn, user_source, user_id, ordered,
-                                      {i: by_id[i]["summary"] for i in pair})
-            out.append({"conflicting_ids": ordered, "question": question})
+            ordered_keys = sorted((key, other_key),
+                                  key=lambda k: -(by_key[k]["confidence"] or 0.0))
+            marks = [mark(*k) for k in ordered_keys]
+            question = _clarify_issue(conn, user_source, user_id, marks,
+                                      {mark(*k): by_key[k]["summary"] for k in (key, other_key)})
+            out.append({"conflicting_ids": marks, "question": question})
     return out

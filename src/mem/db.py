@@ -53,7 +53,8 @@ CREATE TABLE IF NOT EXISTS pending_clarifications (
   user_source TEXT, user_id TEXT,
   conflicting_ids TEXT NOT NULL, question TEXT NOT NULL,
   issued_at TEXT NOT NULL, ttl_days INTEGER NOT NULL DEFAULT 7,
-  PRIMARY KEY (user_source, user_id, issued_at)
+  -- 主键 = (用户, 矛盾对集合)：同一用户同秒可挂多对；同对重复 issue 由 UPSERT 刷新
+  PRIMARY KEY (user_source, user_id, conflicting_ids)
 );
 CREATE TABLE IF NOT EXISTS tombstones (
   user_source TEXT, user_id TEXT, deleted_at TEXT, requested_by TEXT,

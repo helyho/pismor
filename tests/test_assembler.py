@@ -6,6 +6,7 @@ import pytest
 
 from mem.assembler import assemble
 from mem.embedder import EmbedUnavailable
+from mem.keys import vec_key
 
 NOW = "2026-11-20T00:00:00+00:00"
 
@@ -156,7 +157,7 @@ def test_degraded_prefixed(conn, seeded_degraded):
 def test_clarification_pair_detected(conn, seeded_conflict_pair):
     pack = assemble(conn, None, "w", "u1", budget=2000)
     assert pack["clarification_needed"][0]["conflicting_ids"] == \
-        ["pref_style_formal", "pref_style_casual"]
+        ["pref_style_formal@work", "pref_style_casual@work"]
     assert conn.execute("SELECT COUNT(*) c FROM pending_clarifications").fetchone()["c"] == 1
 
 
@@ -201,8 +202,9 @@ def test_lexical_match(conn, seeded):
 def test_vector_recall(conn, seeded):
     conn.execute("CREATE VIRTUAL TABLE embeddings USING vec0("
                  "entry_id TEXT PRIMARY KEY, user_source TEXT, user_id TEXT, embedding float[4])")
-    conn.execute("INSERT INTO embeddings VALUES ('preference_coffee','w','u1',?)",
-                 (json.dumps([0.1, 0.2, 0.3, 0.4]),))
+    conn.execute("INSERT INTO embeddings VALUES (?, 'w','u1', ?)",
+                 (vec_key("w", "u1", "preference", "coffee", "global"),
+                  json.dumps([0.1, 0.2, 0.3, 0.4])))
     conn.commit()
     pack = assemble(conn, EmbedderStub(), "w", "u1", budget=2000, query="咖啡")
     assert "preference_coffee" in [e["id"] for e in pack["entries"]]
@@ -254,3 +256,64 @@ def test_dimensions_filters_related_only(conn, seeded):
     assert "preference_coffee" in ids          # 白名单内的相关集条目入选
     assert "context_city" not in ids           # 白名单外的相关维度被筛掉
     assert "taboo_excel" in ids and "identity_role" in ids  # 必带集不受影响
+
+
+# ---- fix wave 新增：跨 scope 复合键 / 多矛盾对同秒 ----
+
+def test_cross_scope_same_id_both_injected(conn):
+    # C-1：同 id 跨 scope 是两条独立条目，装配不得按裸 id 去重
+    _entry(conn, "preference", "lang", "语言使用 Python 写脚本", scope="global")
+    _entry(conn, "preference", "lang", "语言项目内使用 Go 写服务", scope="project:x")
+    conn.commit()
+    pack = assemble(conn, None, "w", "u1", budget=2000, query="语言")
+    bodies = [e["text"] for e in pack["entries"] if e["id"] == "preference_lang"]
+    assert "语言使用 Python 写脚本" in bodies and "语言项目内使用 Go 写服务" in bodies
+
+
+def test_cross_scope_conflict_pair_not_collapsed(conn):
+    # 同 id 跨 scope 的矛盾对按 (id,scope) 定位，不塌缩成一条
+    _entry(conn, "preference", "lang", "语言 Python", scope="global",
+           conflict_with='["preference_lang@project:x"]')
+    _entry(conn, "preference", "lang", "语言 Go", scope="project:x",
+           conflict_with='["preference_lang@global"]')
+    conn.commit()
+    pack = assemble(conn, None, "w", "u1", budget=2000)
+    assert pack["clarification_needed"][0]["conflicting_ids"] == \
+        ["preference_lang@global", "preference_lang@project:x"]
+    assert conn.execute("SELECT COUNT(*) c FROM pending_clarifications").fetchone()["c"] == 1
+
+
+def test_multiple_pairs_same_second_all_reported(conn):
+    # I-3：同秒两个互不相关矛盾对 → 两条澄清 + 两行 pending，互不覆盖
+    _entry(conn, "preference", "style", "正式", entry_id="pref_style", scope="global",
+           conflict_with='["pref_+style@global"]')
+    _entry(conn, "preference", "+style", "随意", entry_id="pref_+style", status="degraded",
+           conflict_with='["pref_style@global"]')
+    _entry(conn, "preference", "lang", "Python", entry_id="pref_lang", scope="global",
+           conflict_with='["pref_+lang@global"]')
+    _entry(conn, "preference", "+lang", "Go", entry_id="pref_+lang", status="degraded",
+           conflict_with='["pref_lang@global"]')
+    conn.commit()
+    pack = assemble(conn, None, "w", "u1", budget=2000)
+    pairs = {frozenset(item["conflicting_ids"]) for item in pack["clarification_needed"]}
+    assert pairs == {frozenset(("pref_style@global", "pref_+style@global")),
+                     frozenset(("pref_lang@global", "pref_+lang@global"))}
+    assert conn.execute("SELECT COUNT(*) c FROM pending_clarifications").fetchone()["c"] == 2
+
+
+def test_vector_recall_isolates_cross_scope(conn):
+    # I-14：同 id 跨 scope 两个向量行，召回都能命中且不串行
+    conn.execute("CREATE VIRTUAL TABLE embeddings USING vec0("
+                 "entry_id TEXT PRIMARY KEY, user_source TEXT, user_id TEXT, embedding float[4])")
+    _entry(conn, "preference", "lang", "语言使用 Python", scope="global")
+    _entry(conn, "preference", "lang", "语言项目内使用 Go", scope="project:x")
+    conn.execute("INSERT INTO embeddings VALUES (?, 'w','u1', ?)",
+                 (vec_key("w", "u1", "preference", "lang", "global"),
+                  json.dumps([0.1, 0.2, 0.3, 0.4])))
+    conn.execute("INSERT INTO embeddings VALUES (?, 'w','u1', ?)",
+                 (vec_key("w", "u1", "preference", "lang", "project:x"),
+                  json.dumps([0.1, 0.2, 0.3, 0.4])))
+    conn.commit()
+    pack = assemble(conn, EmbedderStub(), "w", "u1", budget=2000, query="语言")
+    bodies = {e["text"] for e in pack["entries"]}
+    assert {"语言使用 Python", "语言项目内使用 Go"} <= bodies

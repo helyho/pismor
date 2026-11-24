@@ -155,3 +155,16 @@ def test_empty_user_still_writes_fileset(tmp_path, conn):
     root = export(conn, "w", "nobody", tmp_path)
     for fname in ("identity.md", "taboo.md", "shell.md", "archive.md", "pending.md", "_index.md"):
         assert (root / fname).exists()
+
+
+def test_export_clears_stale_files(tmp_path, conn):
+    # 导出前清理本用户旧文件：条目消失后旧 md 不得残留（I-11）
+    seed(conn, "preference", "tool", scope="project:alpha", body="alpha 用 pnpm", summary="pnpm")
+    root = export(conn, "w", "u1", tmp_path)
+    assert (root / "projects" / "alpha.md").exists()
+    conn.execute("DELETE FROM entries WHERE topic='tool'")
+    conn.execute("DELETE FROM sources WHERE entry_id='preference_tool@project:alpha'")
+    conn.commit()
+    root2 = export(conn, "w", "u1", tmp_path)
+    assert not (root2 / "projects" / "alpha.md").exists()
+    assert "preference_tool" not in (root2 / "shell.md").read_text(encoding="utf-8")

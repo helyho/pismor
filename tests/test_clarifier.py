@@ -3,7 +3,7 @@ import json
 
 import pytest
 
-from mem.clarifier import expire, issue, match_incoming
+from mem.clarifier import consume, expire, issue, match_incoming
 
 
 class ScriptedLLM:
@@ -53,6 +53,9 @@ def test_issue_and_match(conn, fake_llm_yes):
     out = match_incoming(conn, "w", "u", "平时聊天随意点，写东西再正式", fake_llm_yes)
     assert out["conflicting_ids"] == ["a", "b"]
     assert out["answer"] == "平时聊天随意点，写东西再正式"
+    # 命中不立即删：写入成功后才 consume（I-17）
+    assert conn.execute("SELECT COUNT(*) c FROM pending_clarifications").fetchone()["c"] == 1
+    assert consume(conn, "w", "u", out["conflicting_ids"]) == 1
     assert conn.execute("SELECT COUNT(*) c FROM pending_clarifications").fetchone()["c"] == 0
 
 
@@ -82,9 +85,7 @@ def test_issue_dedupes_by_id_set_not_order(conn):
 
 def test_issue_different_pair_inserts_new(conn):
     issue(conn, "w", "u", ["a", "b"], {"a": "要正式", "b": "要口语化"})
-    # 先把已有行挪到不同秒，避免复用本测试未覆盖的“不同对同秒 PK”路径
-    conn.execute("UPDATE pending_clarifications SET issued_at='2026-11-23T00:00:00+00:00'")
-    conn.commit()
+    # 不同矛盾对同秒挂起互不冲突（PK = 用户 + 矛盾对集合，I-3）
     q2 = issue(conn, "w", "u", ["a", "c"], {"a": "要正式", "c": "要简洁"})
     assert conn.execute("SELECT COUNT(*) c FROM pending_clarifications").fetchone()["c"] == 2
     assert "要简洁" in q2

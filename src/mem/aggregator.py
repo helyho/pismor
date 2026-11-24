@@ -102,6 +102,10 @@ def _promote_orphans(conn, taxonomy, llm, auto_promote, now, stats):
             _queue_audit(conn, rows, now, note=f"sensitive_topic: {dim}/{topic}")
             continue
         if is_new:
+            if dim == "taboo":
+                # taboo 禁止运行期扩充（spec §7）：orphan 组不得建成 taboo 新桶，仅进人工队列
+                _queue_audit(conn, rows, now, note=f"taboo_new_topic_queued: {dim}/{topic}")
+                continue
             if not auto_promote:
                 _queue_audit(conn, rows, now, note=f"new_topic_queued: {dim}/{topic}")
                 continue

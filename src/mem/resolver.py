@@ -36,6 +36,12 @@ def resolve(conn, user_source, user_id, candidates, llm):
         if existing is None:
             actions.append({"op": "ADD", "candidate": c})
             continue
+        if existing["status"] == "pending_review":
+            # 待复核行不阻塞演进（I-2）：新证据直接演进，待复核快照由写入器移入复核队列
+            actions.append({"op": "UPDATE", "candidate": c,
+                            "target": (existing["dimension"], existing["topic"],
+                                       existing["scope"])})
+            continue
         taboo_row = _same_topic_taboo(conn, user_source, user_id, c)
         verdict = llm.chat_json(RESOLVE_SYSTEM, RESOLVE_USER.format(
             old_dim=existing["dimension"], topic=c["topic"], scope=c["scope"],

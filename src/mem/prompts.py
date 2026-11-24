@@ -25,6 +25,16 @@ EXTRACT_TEXT = """你是画像抽取器。以下为用户产出的文本素材�
 已存在条目：{known_ids}
 素材：{content}"""
 
+CLARIFY_CHECK_SYSTEM = """你是澄清关联判定器。用户此前被问过一个澄清问题，现在给了一条新消息。
+判断该消息是否在对那个问题作出回答（表达了倾向、选择或确认）。
+仅当消息明确回应了该问题时 is_answer 为 true；闲聊、无关话题、只谈别的事一律 false。"""
+
+CLARIFY_CHECK_USER = """待判定的澄清问题：
+{question}
+
+用户新消息：
+{message}"""
+
 RESOLVE_SYSTEM = """你是画像条目决策器，比较同 (topic, scope) 的旧条目与新候选，输出单一 decision：
 - UPDATE（演进）：新证据补充、推进或修正旧值的具体内容；
 - CONFLICT（矛盾）：新证据与旧值同 scope 同 topic 互斥且无法用上下文解释；

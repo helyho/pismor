@@ -1,19 +1,25 @@
-"""事件管线编排：澄清回流 → 抽取 → 置信闸门 → 决策 → 写入（spec §10，intake 在 API 层先行）。
+"""事件管线编排：澄清回流 → 触发分级 → 抽取 → 置信闸门 → 决策 → 写入（spec §10，intake 在 API 层先行）。
 
 编排层职责（计划裁决）：
 - conversation 事件开头查 pending_clarifications（clarifier.match_incoming 命中 →
-  kind=clarification 候选直通决策步，本人意志优先）；text 事件不参与澄清关联，直通抽取。
-- 置信闸门 review 档在本层落 pending_review 行进复核队列（writer 不覆盖该状态）。
+  kind=clarification 候选直通决策步，本人意志优先，先于触发分级）；text 事件不参与
+  澄清关联，直通抽取。
+- 触发分级（spec §10 成本控制）：conversation 未命中变化检测 → 不调抽取 LLM、
+  不进决策；批内强化简化为"无相关候选即跳过"（相关集召回属装配职责，管线无
+  可判定信号，见 trigger.py）。
+- 置信闸门 review 档在本层落 pending_review 行进复核队列（writer 不覆盖该状态；
+  orphan 候选 conf≤0.8 恒入该桶，复核 approve 后由 API 转观察区，spec §8.2）。
 - 同 key 二次写入的 sqlite3.IntegrityError 在本层捕获：整批回滚后逐条重放，
   冲突单条降级跳过（reinforcements 逻辑已在 writer 的 NOOP 内）。
-- clarify 检查不在管线内：assembler 装配时自行检测矛盾对并调 clarifier.issue。
+- clarify 检查不在管线内：assembler 装配时自行检测矛盾对并调 clarifier.issue；
+  矛盾消解后的闭环（conflict_with 清空/pending 删除）在 writer.resolve_conflicts。
 - 任何异常只记日志不上抛：后台任务失败不得破坏 POST /events 的 202 语义。
 """
 import logging
 import sqlite3
 from datetime import datetime, timezone
 
-from mem import clarifier, extractor, gate, resolver, writer
+from mem import clarifier, extractor, gate, resolver, trigger, writer
 from mem.config import Settings
 from mem.embedder import Embedder
 from mem.llm import LLMClient
@@ -44,18 +50,27 @@ def _run(conn, event, taxonomy, llm, embedder) -> None:
     now = event.get("ts") or datetime.now(timezone.utc).isoformat(timespec="seconds")
     origin_type = event.get("event_type") or "text"
     origin_ref = event.get("origin_ref") or event.get("event_id") or ""
+    known_ids = [r["id"] for r in conn.execute(
+        "SELECT DISTINCT id FROM entries WHERE user_source=? AND user_id=?"
+        " AND status IN ('active','degraded') LIMIT 200", (us, uid)).fetchall()]
 
     clarify_cands: list[dict] = []
-    if origin_type == "conversation":  # 澄清回流仅作用于 conversation（spec §10/§11）
+    if origin_type == "conversation":
+        # 澄清回流仅作用于 conversation（spec §10/§11），先于触发分级
         text = _last_user_text(event)
         if text:
             hit = clarifier.match_incoming(conn, us, uid, text, llm)
             if hit:
                 clarify_cands = _clarify_candidates(conn, us, uid, hit)
+        if not clarify_cands:  # 澄清回答已命中则必抽取收尾矛盾对，跳过变化检测
+            do_extract, reason = trigger.should_extract(event, has_history=bool(known_ids))
+            if not do_extract:
+                # spec §10：无变化仅批内 reinforcement+1。管线无"本次对话相关条目"
+                # 信号（相关集召回属装配职责），简化为无候选即跳过，不写库。
+                logger.info("pipeline skip extraction for event %s: %s",
+                            event.get("event_id"), reason)
+                return
 
-    known_ids = [r["id"] for r in conn.execute(
-        "SELECT DISTINCT id FROM entries WHERE user_source=? AND user_id=?"
-        " AND status IN ('active','degraded') LIMIT 200", (us, uid)).fetchall()]
     candidates = extractor.extract(event, taxonomy, llm, known_ids)
     auto, review, _dropped = gate.gate(candidates)
     _write_pending(conn, us, uid, review, origin_type, origin_ref, now)
@@ -82,13 +97,17 @@ def _clarify_candidates(conn, us, uid, hit: dict) -> list[dict]:
         if row is None:
             continue
         return [{"dimension": row["dimension"], "topic": row["topic"], "scope": row["scope"],
-                 "body": answer, "summary": answer[:80], "confidence": 1.0,
+                 "body": answer, "summary": answer[:20], "confidence": 1.0,
                  "kind": "clarification", "quote": answer, "topic_new": None}]
     return []
 
 
 def _write_pending(conn, us, uid, candidates, origin_type, origin_ref, now) -> int:
-    """review 档候选落 pending_review 行（复核队列入口）；同 key 已有行则跳过。"""
+    """review 档候选落 pending_review 行（复核队列入口）；同 key 已有行则跳过。
+
+    orphan 候选（dimension='orphan'，status='orphan_topic'）经 inferred cap 后恒落
+    本桶：复核 approve 由 API 按 dimension='orphan' 转 orphan_topic 进观察区（spec §8.2）。
+    """
     n = 0
     for c in candidates:
         if not c.get("quote"):

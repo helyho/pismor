@@ -3,6 +3,7 @@ import argparse
 import logging
 import threading
 import time
+from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -12,6 +13,7 @@ from mem.aggregator import run_daily
 from mem.api import create_app
 from mem.backup import backup
 from mem.config import load_settings
+from mem.db import get_conn
 from mem.llm import LLMClient
 from mem.taxonomy import load_taxonomy
 
@@ -27,16 +29,16 @@ def main(argv=None) -> None:
 
     settings = load_settings(args.settings)
     app = create_app(settings)
-    conn = app.state.conn
-    verdict = conn.execute("PRAGMA integrity_check").fetchone()[0]
+    with closing(get_conn(settings.db_path)) as conn:  # 独立短连接做启动检查
+        verdict = conn.execute("PRAGMA integrity_check").fetchone()[0]
     if verdict != "ok":  # spec §20：库损坏时拒绝启动，走最近备份恢复
         raise SystemExit(f"integrity_check failed: {verdict}")
 
-    threading.Thread(target=_daily_loop, args=(conn, settings), daemon=True).start()
+    threading.Thread(target=_daily_loop, args=(settings,), daemon=True).start()
     uvicorn.run(app, host=args.host, port=args.port)
 
 
-def _daily_loop(conn, settings) -> None:
+def _daily_loop(settings) -> None:
     log = logging.getLogger("mem.serve")
     taxonomy = load_taxonomy(settings.taxonomy_path)
     llm = LLMClient(settings.llm)
@@ -44,9 +46,13 @@ def _daily_loop(conn, settings) -> None:
     while True:
         now = datetime.now(timezone.utc).isoformat(timespec="seconds")
         try:
-            # auto_promote=False：新主题一律进人工队列（保守默认，词表演进走复核）
-            run_daily(conn, taxonomy, llm, False, now)
-            backup(conn, backup_dir)
+            conn = get_conn(settings.db_path)  # 日批独立短连接（I-1），不与请求线程共享
+            try:
+                # auto_promote=False：新主题一律进人工队列（保守默认，词表演进走复核）
+                run_daily(conn, taxonomy, llm, False, now)
+                backup(conn, backup_dir)
+            finally:
+                conn.close()
         except Exception:
             log.exception("daily job failed")
         time.sleep(_RUN_INTERVAL)

@@ -130,17 +130,56 @@ def _update(conn, us, uid, c, target, now, origin_type, origin_ref, vectors):
     conn.execute(
         "UPDATE sources SET entry_id=? WHERE user_source=? AND user_id=? AND entry_id=?",
         (sup_id, us, uid, f"{d}_{t}@{s}"))
-    # 原行同 key 覆盖新值（bi-temporal 旧值由轨迹行承载）
+    # 原行同 key 覆盖新值（bi-temporal 旧值由轨迹行承载）；
+    # 旧行带冲突标记 → 矛盾已由新证据消解：本行 conflict_with 一并归空（spec §11 闭环）
     conn.execute(
         "UPDATE entries SET body=?,summary=?,confidence=?,status='active',degraded_reason=NULL,"
-        "superseded_by=NULL,topic_new=NULL,updated_at=?,last_reinforced_at=? "
+        "superseded_by=NULL,topic_new=NULL,conflict_with=NULL,updated_at=?,last_reinforced_at=? "
         "WHERE user_source=? AND user_id=? AND dimension=? AND topic=? AND scope=?",
         (c["body"], c["summary"], c["confidence"], now, now, us, uid, d, t, s))
+    if old["conflict_with"]:
+        resolve_conflicts(conn, us, uid, f"{d}_{t}", now)
     conn.execute(
         "INSERT INTO sources (entry_id,user_source,user_id,origin_type,origin_ref,quote,kind)"
         " VALUES (?,?,?,?,?,?,?)",
         (f"{d}_{t}@{s}", us, uid, origin_type, origin_ref, c["quote"], c.get("kind") or "explicit"))
     vectors.append((f"{d}_{t}", c["body"]))
+
+
+def resolve_conflicts(conn, us, uid, entry_id, now):
+    """矛盾收尾（spec §11 闭环，澄清/演进 UPDATE 与复核 verdict 共用）：
+    清对方行对本行的 conflict_with 标记；对方行 degraded/conflict_lost → active
+    （置信度不变，仅清降级标记、刷新 updated_at）；删除该用户引用本行的 pending_clarifications。
+    须在调用方事务内执行。
+    """
+    others = conn.execute(
+        "SELECT dimension, topic, scope, status, degraded_reason, conflict_with"
+        " FROM entries WHERE user_source=? AND user_id=? AND conflict_with LIKE ?",
+        (us, uid, f'%"{entry_id}"%')).fetchall()
+    for o in others:
+        try:
+            marks = json.loads(o["conflict_with"])
+        except (TypeError, ValueError):
+            continue
+        if entry_id not in marks:
+            continue
+        rest = [m for m in marks if m != entry_id]
+        new_conflict = json.dumps(rest) if rest else None
+        if o["status"] == "degraded" and o["degraded_reason"] == "conflict_lost":
+            # 矛盾消解：恒胜落败侧解除降级（置信度不变，spec §11"字段归空"）
+            conn.execute(
+                "UPDATE entries SET conflict_with=?, status='active', degraded_reason=NULL,"
+                " updated_at=? WHERE user_source=? AND user_id=? AND dimension=?"
+                " AND topic=? AND scope=?",
+                (new_conflict, now, us, uid, o["dimension"], o["topic"], o["scope"]))
+        else:
+            conn.execute(
+                "UPDATE entries SET conflict_with=? WHERE user_source=? AND user_id=?"
+                " AND dimension=? AND topic=? AND scope=?",
+                (new_conflict, us, uid, o["dimension"], o["topic"], o["scope"]))
+    conn.execute(
+        "DELETE FROM pending_clarifications WHERE user_source=? AND user_id=?"
+        " AND conflicting_ids LIKE ?", (us, uid, f'%"{entry_id}"%'))
 
 
 def _superseded_identity(conn, us, uid, d, t, now):

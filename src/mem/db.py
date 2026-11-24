@@ -3,9 +3,10 @@ from pathlib import Path
 import sqlite_vec
 
 
-def get_conn(path: Path) -> sqlite3.Connection:
+def get_conn(path: Path, check_same_thread: bool = True) -> sqlite3.Connection:
     path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(path)
+    # API 进程内路由线程池/BackgroundTasks 共用连接 → check_same_thread=False（api 层传入）
+    conn = sqlite3.connect(path, check_same_thread=check_same_thread)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA busy_timeout=5000")

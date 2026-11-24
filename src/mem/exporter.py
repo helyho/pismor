@@ -1,7 +1,9 @@
 """md 导出器：SQLite 真相源 → spec §8.2 文件集只读视图（小节格式 spec §9）。
 
 - 归宿规则：archived → archive.md；pending_review/orphan_topic → pending.md；
-  active/degraded 按 taxonomy.dimensions[].file 留在原维度文件（degraded 是状态不是位置）。
+  active/degraded 按 taxonomy.dimensions[].file（degraded 是状态不是位置）；
+  shell 族（preference/fact/context）的 project:{name} 作用域分流 projects/{name}.md，
+  name 过白名单防路径穿越（taboo/identity 恒入必带集文件，修复轮②裁决）。
 - 键约定（上游裁决）：sources.entry_id 是行唯一复合键 "{entries.id}@{scope}"；
   唯一例外是 UPDATE 轨迹行（topic 以 ~ 前缀）——写入器转移证据时存裸 id
   （writer._update），JOIN 键按行形态二分。
@@ -9,11 +11,17 @@
   导出器只读库（仅 SELECT），手工编辑导出文件会在下次导出被覆盖。
 """
 from pathlib import Path
+import re
 import yaml
 
 from mem.taxonomy import load_taxonomy
 
 _REPO = Path(__file__).resolve().parents[2]  # editable/repo 布局下 config/ 在包仓根
+# 修复轮② Critical：scope 由 LLM 抽取产出、上游无格式校验，projects/{name}.md 的
+# name 必须过白名单（字母数字下划线中文连字符，禁 / \ .. 空白点号），不匹配跳过该
+# 文件并记入 export-warnings.txt
+_PROJECT_NAME_RE = re.compile(r"^[\w\u4e00-\u9fa5-]+$")
+_WARNINGS_FILE = "export-warnings.txt"
 _SECTION_KEYS = ("id", "dimension", "scope", "confidence", "status",
                  "created_at", "updated_at", "sources", "reinforcements",
                  "degraded_reason", "superseded_by")
@@ -46,19 +54,27 @@ def export(conn, user_source, user_id, out_root: Path) -> Path:
         file_titles.setdefault(d.file, []).append(d.name)
 
     index_rows: list[str] = []
+    warnings: list[str] = []
     for r in rows:
         sources = src_by_entry.get((r["dimension"], r["topic"], r["scope"]), [])
         if r["status"] == "archived":
             fname = "archive.md"
         elif r["status"] in ("pending_review", "orphan_topic"):
             fname = "pending.md"
-        else:  # 未知维度兜底 shell.md，保证导出视图不丢行（库是真相源）
-            if r["scope"].startswith("project:"):  # 修复轮①：project 作用域按项目分文件
-                fname = f"projects/{r['scope'].split(':', 1)[1]}.md"
-            elif r["dimension"] in taxonomy.dimensions:
-                fname = taxonomy.dimensions[r["dimension"]].file
+        # 修复轮②裁决：仅 shell 族（file=shell.md 的 preference/fact/context）按 scope
+        # 分流 projects/{name}.md；taboo/identity 恒入必带集文件，scope 留在 YAML
+        elif r["dimension"] in taxonomy.dimensions:
+            dim_file = taxonomy.dimensions[r["dimension"]].file
+            if r["scope"].startswith("project:") and dim_file == "shell.md":
+                name = r["scope"].split(":", 1)[1]
+                if not _PROJECT_NAME_RE.match(name):
+                    warnings.append(f"{r['id']}\tinvalid project scope: {r['scope']}")
+                    continue  # 白名单外跳过该文件（防路径穿越），_index 亦不列（无归宿可指）
+                fname = f"projects/{name}.md"
             else:
-                fname = "shell.md"
+                fname = dim_file
+        else:  # 未知维度兜底 shell.md，保证导出视图不丢行（库是真相源）
+            fname = "shell.md"
         files.setdefault(fname, [])
         files[fname].append(_section(r, sources))
         files.setdefault("_index.md", [])
@@ -78,6 +94,8 @@ def export(conn, user_source, user_id, out_root: Path) -> Path:
         path = root / fname
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(content, encoding="utf-8")
+    if warnings:  # 只在有告警时产出；内容随 rows 排序天然确定
+        (root / _WARNINGS_FILE).write_text("\n".join(warnings) + "\n", encoding="utf-8")
     return root
 
 

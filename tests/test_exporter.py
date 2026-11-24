@@ -35,6 +35,8 @@ def seeded(conn):
     seed(conn, "taboo", "tone", status="degraded", degraded_reason="refuted",
          body="回复中不使用 emoji", summary="不用 emoji")
     seed(conn, "preference", "lang", body="回答用中文", summary="中文回答")
+    seed(conn, "preference", "format", scope="project:alpha", body="alpha 用表格交付",
+         summary="alpha 表格")  # 确定性测试覆盖 projects/ 分支（review Minor-3）
     seed(conn, "preference", "~lang:20261124T000000+08:00:1", status="archived",
          degraded_reason="superseded", body="旧值：回答用英文", summary="旧值")
     return conn
@@ -101,7 +103,10 @@ def test_index_rows(tmp_path, conn, seeded, seeded_orphan):
     root = export(conn, "w", "u1", tmp_path)
     lines = (root / "_index.md").read_text(encoding="utf-8").splitlines()
     rows = [ln for ln in lines if ln.startswith("| ") and "---" not in ln]
-    assert len(rows) == 6  # 表头 + 4 条 seeded + 1 条 orphan
+    assert len(rows) == 7  # 表头 + 5 条 seeded + 1 条 orphan
+    # review Minor-4：整行列值校验（id|dimension|topic|scope|status|conf|file|summary）
+    assert ("| preference_format | preference | format | project:alpha | active | 0.9"
+            " | projects/alpha.md | alpha 表格 |") in rows
     joined = "\n".join(rows)
     assert "preference_~lang:" in joined and "archive.md" in joined
 
@@ -115,6 +120,28 @@ def test_project_scope_split(tmp_path, conn, seeded):
     assert "## [preference_tool]" in proj and "alpha 项目用 pnpm" in proj
     assert "preference_tool" not in (root / "shell.md").read_text(encoding="utf-8")
     assert "| preference_tool |" in (root / "_index.md").read_text(encoding="utf-8")
+
+
+def test_taboo_project_scope_stays_in_taboo_md(tmp_path, conn):
+    """修复轮②裁决：taboo/identity 恒入必带集文件，project scope 只留 YAML。"""
+    seed(conn, "taboo", "tool", scope="project:alpha", body="alpha 项目禁用公式",
+         summary="禁公式")
+    root = export(conn, "w", "u1", tmp_path)
+    assert "## [taboo_tool]" in (root / "taboo.md").read_text(encoding="utf-8")
+    assert not (root / "projects" / "alpha.md").exists()
+
+
+def test_project_name_traversal_rejected(tmp_path, conn):
+    """修复轮② Critical：白名单外 project name 拒绝写文件，记 export-warnings.txt。"""
+    before = set(p.name for p in tmp_path.iterdir())
+    seed(conn, "preference", "tool", scope="project:../../x", body="穿越尝试", summary="穿越")
+    root = export(conn, "w", "u1", tmp_path)
+    assert set(p.name for p in tmp_path.iterdir()) - before == {"w"}  # 树外零写入
+    assert not list(root.rglob("projects/*"))
+    for f in root.rglob("*.md"):
+        assert "preference_tool" not in f.read_text(encoding="utf-8")
+    assert "preference_tool\tinvalid project scope: project:../../x" in \
+        (root / "export-warnings.txt").read_text(encoding="utf-8")
 
 
 def test_export_readonly(tmp_path, conn, seeded):

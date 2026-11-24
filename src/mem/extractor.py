@@ -77,8 +77,13 @@ def _is_sensitive(taxonomy, dimension: str, topic: str) -> bool:
 def _to_candidate(raw: dict, taxonomy) -> dict | None:
     dimension = raw.get("dimension")
     topic_new = raw.get("topic_new")
-    if not dimension:
-        # 词表外主题 → orphan 进观察区；topic_new 必填，缺则丢弃
+    topic = raw.get("topic") or ""
+    # null 或词表外（幻觉维度名）→ 一律走 orphan 路径，禁止发明类别
+    if not dimension or dimension not in taxonomy.dimensions:
+        if not topic_new:
+            # null 路径: topic_new 必填（LLM 未填即丢弃）；
+            # 幻觉维度路径: LLM 自认在词表内通常不填，由 原维度/主题 承接避免误丢
+            topic_new = f"{dimension}/{topic}" if dimension and topic else None
         if not topic_new:
             return None
         dimension, status = "orphan", "orphan_topic"
@@ -89,7 +94,6 @@ def _to_candidate(raw: dict, taxonomy) -> dict | None:
     # 安全层 1: 指令类内容不是画像
     if INSTRUCTION_RE.search(body or quote):
         return None
-    topic = raw.get("topic") or ""
     confidence = float(raw.get("confidence") or 0)
     # 安全层 2: sensitive topic → 置信上限 0.6 + 概括级校验（含精确位置/医疗细节即丢弃）
     if _is_sensitive(taxonomy, dimension, topic):

@@ -73,6 +73,18 @@ def test_new_topic_becomes_orphan(taxonomy):
     assert out[0]["topic_new"] == "咖啡烘焙偏好"
 
 
+def test_unknown_dimension_becomes_orphan(taxonomy):
+    # 安全层: LLM 幻觉词表外维度名（spec §7 禁止发明类别）→ 转 orphan 而非原值透传
+    llm = FakeLLM([{"candidates": [{"dimension": "social", "topic": "friends", "scope": "global",
+        "body": "朋友多在深圳", "summary": "朋友在深圳", "confidence": 0.9, "kind": "explicit",
+        "quote": "我很多朋友都在深圳", "topic_new": None}]}])
+    ev = {"event_type": "text", "source": "d", "user_ref": "u", "content": "我很多朋友都在深圳", "ts": "t"}
+    out = extract(ev, taxonomy, llm, known_ids=[])
+    assert len(out) == 1
+    assert out[0]["dimension"] == "orphan" and out[0]["status"] == "orphan_topic"
+    assert out[0]["topic_new"] == "social/friends"  # 词表外维度名由 原维度/主题 承接
+
+
 def test_body_truncated_to_max(taxonomy):
     llm = FakeLLM([{"candidates": [{"dimension": "preference", "topic": "style", "scope": "global",
         "body": "长" * 300, "summary": "s", "confidence": 0.9, "kind": "explicit",

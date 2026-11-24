@@ -18,17 +18,19 @@ from mem.db import get_conn
 from mem.llm import LLMClient
 from mem.taxonomy import load_taxonomy
 
-_RUN_INTERVAL = 86400.0  # 每日一轮；启动即跑首轮（保底当日快照），此后 24h 循环
+_RUN_INTERVAL_DEFAULT = 86400.0  # 默认日批间隔；settings.serve.daily_interval_seconds 可覆盖
 
 
 def daily_once(conn, settings, taxonomy, llm, now, backup_dir) -> dict:
     """单轮日批：聚合（auto_promote 读 taxonomy.meta）→ 一致性审计/隔离 → 备份。"""
     stats = run_daily(conn, taxonomy, llm,
-                      bool(taxonomy.meta.get("auto_promote", False)), now)
+                      bool(taxonomy.meta.get("auto_promote", False)), now,
+                      degrade_days=settings.aggregator.degrade_days,
+                      degrade_confidence=settings.aggregator.degrade_confidence)
     violations = run_audit(conn, taxonomy)
     stats["audit_violations"] = len(violations)
     stats["isolated"] = isolate_violations(conn, violations, now)
-    backup(conn, backup_dir)
+    backup(conn, backup_dir, keep=settings.backup.keep)
     return stats
 
 
@@ -47,6 +49,7 @@ def main(argv=None) -> None:
         raise SystemExit(f"integrity_check failed: {verdict}")
 
     threading.Thread(target=_daily_loop, args=(settings,), daemon=True).start()
+    logging.basicConfig(level=logging.INFO)  # mem.* 模块 INFO 日志落 stderr（uvicorn 不配 root logger）
     uvicorn.run(app, host=args.host, port=args.port)
 
 
@@ -65,7 +68,7 @@ def _daily_loop(settings) -> None:
                 conn.close()
         except Exception:
             log.exception("daily job failed")
-        time.sleep(_RUN_INTERVAL)
+        time.sleep(settings.serve.daily_interval_seconds)
 
 
 if __name__ == "__main__":

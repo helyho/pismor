@@ -1,13 +1,21 @@
 """四路决策器：ADD / UPDATE / CONFLICT / NOOP，另对 orphan 候选 ORPHAN 透传。
 
-分流规则（spec §10/§11）：
+分流规则（spec §10/§11，第八轮扩展）：
 - orphan 候选不调 LLM，直接 ORPHAN 透传（决策 LLM 只判 active 候选）；
-- 库中无同 (user, dimension, topic, scope) 条目 → 直接 ADD，不进 LLM；
+- 库中无同 (user, dimension, topic, scope) 条目 → 近邻语义互斥检测（跨维度/跨 topic
+  矛盾，第八轮新增）后 ADD，不进同 key 决策 LLM；
 - 其余交决策 LLM，decision 枚举 UPDATE|CONFLICT|NOOP（RESOLVE_SCHEMA 约束）；
 - taboo 恒胜特则：preference 候选与同主题 taboo 条目互斥时，无论 LLM 判什么
   都强制 CONFLICT（代码级硬约束，双保险于 prompt 特则句），taboo 侧按正常演进 UPDATE。
+
+近邻互斥检测（spec §11 第八轮：矛盾判定从"同 key"扩展到"同 scope 语义互斥"）：
+- 仅 taboo↔preference 配对（黑盒 A5 高发型：preference_style vs taboo_tone）；
+- 仅同 scope（scope 拆分优先于矛盾判定）；对端行非同 key（同 key 已走决策器）；
+- LLM 判互斥 → 走既有 CONFLICT 双存：'+' 变形行 + conflict_with 互标 {id}@{scope}，
+  装配 clarification_needed 与复核队列按标记配对（机制零新增）。
 """
-from mem.prompts import RESOLVE_SYSTEM, RESOLVE_USER
+from mem.keys import valid_scope
+from mem.prompts import NEIGHBOR_SYSTEM, NEIGHBOR_USER, RESOLVE_SYSTEM, RESOLVE_USER
 
 # decision 枚举无 ADD：无新证据的 ADD 已在 existing 判断分流，不进入 LLM
 RESOLVE_SCHEMA = {
@@ -23,6 +31,23 @@ RESOLVE_SCHEMA = {
     },
 }
 
+NEIGHBOR_SCHEMA = {
+    "name": "neighbor_conflict",
+    "schema": {
+        "type": "object",
+        "properties": {
+            "conflict": {"type": "boolean"},
+            "conflicting_with": {"type": "string"},
+            "reason": {"type": "string"},
+        },
+        "required": ["conflict", "reason"],
+    },
+}
+
+# 近邻比对维度配对（taboo↔preference 先行，控制成本与误判率）
+_NEIGHBOR_PAIRS = {"taboo": ("preference",), "preference": ("taboo",)}
+_NEIGHBOR_LIMIT = 5
+
 
 def resolve(conn, user_source, user_id, candidates, llm):
     actions = []
@@ -34,6 +59,10 @@ def resolve(conn, user_source, user_id, candidates, llm):
             "SELECT * FROM entries WHERE user_source=? AND user_id=? AND dimension=? AND topic=? AND scope=?",
             (user_source, user_id, c["dimension"], c["topic"], c["scope"])).fetchone()
         if existing is None:
+            neighbor = _neighbor_conflict(conn, user_source, user_id, c, llm)
+            if neighbor is not None:
+                actions.append({"op": "CONFLICT", "candidate": c, "target": neighbor})
+                continue
             actions.append({"op": "ADD", "candidate": c})
             continue
         if existing["status"] == "pending_review":
@@ -58,6 +87,39 @@ def resolve(conn, user_source, user_id, candidates, llm):
         else:
             actions.append({"op": "NOOP", "candidate": c, "target": target})
     return actions
+
+
+def _neighbor_conflict(conn, user_source, user_id, c, llm):
+    """跨维度/跨 topic 近邻语义互斥检测（spec §11 第八轮）。
+
+    返回 None（无近邻或不互斥 → 走 ADD）或对端行 key 元组（互斥 → 走 CONFLICT 双存）。
+    仅 taboo↔preference 同 scope 配对；对端必须是规范行（排除 ~ / + / ! 变形）。
+    """
+    dims = _NEIGHBOR_PAIRS.get(c["dimension"])
+    if not dims or not llm or not valid_scope(c.get("scope")) or not c.get("quote"):
+        return None
+    placeholders = ",".join("?" * len(dims))
+    rows = conn.execute(
+        f"SELECT dimension, topic, scope, id, body, summary FROM entries"
+        f" WHERE user_source=? AND user_id=? AND dimension IN ({placeholders})"
+        f" AND scope=? AND status='active' AND topic NOT LIKE '~%'"
+        f" AND topic NOT LIKE '+%' AND topic NOT LIKE '!%' LIMIT ?",
+        (user_source, user_id, *dims, c["scope"], _NEIGHBOR_LIMIT)).fetchall()
+    if not rows:
+        return None
+    neighbors = "\n".join(f"- [{r['id']}@{r['scope']}] {r['body']}" for r in rows)
+    verdict = llm.chat_json(NEIGHBOR_SYSTEM, NEIGHBOR_USER.format(new=c["body"],
+                                                                  neighbors=neighbors),
+                            NEIGHBOR_SCHEMA)
+    if not verdict.get("conflict"):
+        return None
+    # LLM 指认的对端 id@scope 优先；缺失/不匹配时回退首行
+    accused = str(verdict.get("conflicting_with") or "").strip()
+    for r in rows:
+        if f"{r['id']}@{r['scope']}" == accused:
+            return (r["dimension"], r["topic"], r["scope"])
+    row = rows[0]
+    return (row["dimension"], row["topic"], row["scope"])
 
 
 def _same_topic_taboo(conn, user_source, user_id, c):

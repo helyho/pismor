@@ -32,13 +32,14 @@ _MERGE_SCHEMA = {
 }
 
 
-def run_daily(conn, taxonomy, llm, auto_promote: bool, now: str) -> dict:
-    """跑全部日批扫描，返回统计计数。"""
+def run_daily(conn, taxonomy, llm, auto_promote: bool, now: str, *,
+              degrade_days: int = 90, degrade_confidence: float = 0.7) -> dict:
+    """跑全部日批扫描，返回统计计数。降级阈值可由 settings.aggregator 配置。"""
     stats = {"promoted": 0, "merged": 0, "demoted": 0, "archived": 0,
              "dropped_review": 0, "expired_clarifications": 0, "dropped_orphan": 0}
     with conn:
         _promote_orphans(conn, taxonomy, llm, auto_promote, now, stats)
-        stats["demoted"] = _demote(conn, now)
+        stats["demoted"] = _demote(conn, now, degrade_days, degrade_confidence)
         stats["archived"] = _archive(conn, now)
         stats["dropped_review"] = _drop_expired_reviews(conn, now)
         from mem.clarifier import expire
@@ -180,13 +181,13 @@ def _append_taxonomy(taxonomy, dim, topic, rows):
         yaml.safe_dump(raw, allow_unicode=True, sort_keys=False), encoding="utf-8")
 
 
-def _demote(conn, now):
-    """90 天无强化且 conf<0.7 的 active 条目降级（taboo 恒不时间衰减，spec §11）。"""
+def _demote(conn, now, degrade_days: int = 90, degrade_confidence: float = 0.7):
+    """degrade_days 天无强化且 conf<degrade_confidence 的 active 条目降级（taboo 恒不时间衰减，spec §11）。"""
     cur = conn.execute(
         "UPDATE entries SET status='degraded', degraded_reason='stale'"
-        " WHERE status='active' AND dimension!='taboo' AND confidence<0.7"
-        "   AND julianday(last_reinforced_at) < julianday(?) - 90",
-        (now,))
+        " WHERE status='active' AND dimension!='taboo' AND confidence<?"
+        "   AND julianday(last_reinforced_at) < julianday(?) - ?",
+        (degrade_confidence, now, degrade_days))
     return cur.rowcount
 
 

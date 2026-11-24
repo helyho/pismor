@@ -64,7 +64,11 @@ def create_app(settings: Settings, llm=None, embedder=None) -> FastAPI:
     @app.post("/events")
     def post_events(event: dict, background: BackgroundTasks):
         with closing(get_conn(settings.db_path)) as conn:
-            ok, ack = intake.intake_event(conn, event)  # 校验 + 幂等登记（畸形抛 ValidationError）
+            try:
+                ok, ack = intake.intake_event(
+                    conn, event, max_content_chars=settings.intake.max_content_chars)
+            except ValidationError:
+                raise  # 畸形事件：全局 handler 转 422（含 content 超限）
         if not ok:
             return JSONResponse(ack, status_code=200)  # {"deduplicated": true}
         background.add_task(_pipeline_task, settings, event, taxonomy, llm, embedder)
@@ -78,9 +82,14 @@ def create_app(settings: Settings, llm=None, embedder=None) -> FastAPI:
                 if dimensions else None)
         with closing(get_conn(settings.db_path)) as conn:
             # 降级链（主查询→必带集→空包）在 assembler 内，永不 5xx；tombstone → 空包
+            a = settings.assembler
             return assembler.assemble(conn, embedder, source, native_id, budget=budget,
                                       dimensions=dims, include_profile=include_profile,
-                                      query=query)
+                                      query=query,
+                                      taboo_budget_share=a.taboo_budget_share,
+                                      related_top_k=a.related_top_k,
+                                      half_life_days=a.half_life_days,
+                                      clarify_ttl_days=a.clarify_ttl_days)
 
     @app.get("/review/queue")
     def review_queue():

@@ -67,6 +67,12 @@ def test_issue_persists_row(conn):
     assert row["ttl_days"] == 7
 
 
+def test_issue_ttl_days_configurable(conn):
+    issue(conn, "w", "u", ["a", "b"], {"a": "要正式书面", "b": "要口语化"}, ttl_days=3)
+    row = conn.execute("SELECT ttl_days FROM pending_clarifications").fetchone()
+    assert row["ttl_days"] == 3
+
+
 def test_issue_idempotent_same_pair_same_second(conn):
     # ① 同秒重复装配：返回同一 question、不重复 INSERT（PK 为 user+issued_at 秒）
     q1 = issue(conn, "w", "u", ["a", "b"], {"a": "要正式书面", "b": "要口语化"})

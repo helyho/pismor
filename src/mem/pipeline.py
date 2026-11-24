@@ -40,19 +40,20 @@ def run_pipeline(conn, settings: Settings, event: dict, *, taxonomy=None, llm=No
         llm = llm or LLMClient(settings.llm)
         if embedder is None:
             embedder = Embedder(settings.embedding) if settings.embedding.enabled else None
-        _run(conn, event, taxonomy, llm, embedder)
+        _run(conn, settings, event, taxonomy, llm, embedder)
     except Exception:  # 后台任务兜底：失败只留日志，不冒泡到上报方
         logger.exception("pipeline failed for event %s", event.get("event_id"))
 
 
-def _run(conn, event, taxonomy, llm, embedder) -> None:
+def _run(conn, settings: Settings, event, taxonomy, llm, embedder) -> None:
     us, uid = event["source"], event["user_ref"]
     now = event.get("ts") or datetime.now(timezone.utc).isoformat(timespec="seconds")
     origin_type = event.get("event_type") or "text"
     origin_ref = event.get("origin_ref") or event.get("event_id") or canonical_hash(event)
     known_ids = [r["id"] for r in conn.execute(
         "SELECT DISTINCT id FROM entries WHERE user_source=? AND user_id=?"
-        " AND status IN ('active','degraded') LIMIT 200", (us, uid)).fetchall()]
+        " AND status IN ('active','degraded') LIMIT ?",
+        (us, uid, settings.pipeline.known_ids_limit)).fetchall()]
 
     if origin_type == "conversation":
         # 澄清回流仅作用于 conversation（spec §10/§11），先于触发分级
@@ -61,21 +62,32 @@ def _run(conn, event, taxonomy, llm, embedder) -> None:
             hit = clarifier.match_incoming(conn, us, uid, text, llm)
             if hit:
                 _apply_clarification(conn, us, uid, hit, taxonomy, llm, embedder,
-                                     origin_type, origin_ref, now)
+                                     origin_type, origin_ref, now,
+                                     max_body=settings.pipeline.max_body_chars)
                 return
-        do_extract, reason = trigger.should_extract(event, has_history=bool(known_ids))
+        do_extract, reason = trigger.should_extract(
+            event, has_history=bool(known_ids),
+            long_message=settings.pipeline.trigger_long_message)
         if not do_extract:
             # spec §10：无变化轮次按话题词面命中累加强化，不调 LLM（M-7）
-            n = _reinforce(conn, us, uid, text, now)
+            n = _reinforce(conn, us, uid, text, now,
+                           top_k=settings.pipeline.reinforce_top_k)
             logger.info("pipeline skip extraction for event %s: %s (reinforced %d)",
                         event.get("event_id"), reason, n)
             return
 
-    candidates = extractor.extract(event, taxonomy, llm, known_ids)
-    auto, review, _dropped = gate.gate(candidates)
+    candidates = extractor.extract(event, taxonomy, llm, known_ids,
+                                   max_body=settings.pipeline.max_body_chars)
+    auto, review, _dropped = gate.gate(candidates, **_gate_kwargs(settings))
     _write_pending(conn, us, uid, review, origin_type, origin_ref, now)
     actions = resolver.resolve(conn, us, uid, auto, llm)
     _apply(conn, us, uid, actions, embedder, origin_type, origin_ref, now)
+
+
+def _gate_kwargs(settings: Settings) -> dict:
+    g = settings.gate
+    return {"auto_min": g.auto_min, "review_min": g.review_min,
+            "inferred_cap": g.inferred_cap}
 
 
 def _last_user_text(event: dict) -> str:
@@ -86,16 +98,16 @@ def _last_user_text(event: dict) -> str:
     return ""
 
 
-def _reinforce(conn, us, uid, text, now) -> int:
-    """无变化轮次强化：话题词面命中（summary）top-20 条目 +1，刷新 last_reinforced_at。"""
+def _reinforce(conn, us, uid, text, now, *, top_k: int = 20) -> int:
+    """无变化轮次强化：话题词面命中（summary）top-k 条目 +1，刷新 last_reinforced_at。"""
     tokens = assembler.tokens(text)
     if not tokens:
         return 0
     likes = " OR ".join(["summary LIKE ?"] * len(tokens))
     rows = conn.execute(
         f"SELECT dimension, topic, scope FROM entries WHERE user_source=? AND user_id=?"
-        f" AND status IN ('active','degraded') AND ({likes}) LIMIT 20",
-        [us, uid] + [f"%{t}%" for t in tokens]).fetchall()
+        f" AND status IN ('active','degraded') AND ({likes}) LIMIT ?",
+        [us, uid] + [f"%{t}%" for t in tokens] + [top_k]).fetchall()
     if not rows:
         return 0
     with conn:
@@ -145,7 +157,7 @@ def _clarify_pair_rows(conn, us, uid, conflicting_ids) -> list:
 
 
 def _apply_clarification(conn, us, uid, hit, taxonomy, llm, embedder,
-                         origin_type, origin_ref, now) -> None:
+                         origin_type, origin_ref, now, *, max_body: int = 200) -> None:
     """澄清回答闭环（C-2）：抽取/规范化 → UPDATE / scope 拆分 / 单侧降级。
 
     原文祈使句不入库；body/summary 来自 LLM 抽取。写入成功后才删 pending；
@@ -153,7 +165,8 @@ def _apply_clarification(conn, us, uid, hit, taxonomy, llm, embedder,
     """
     pair_rows = _clarify_pair_rows(conn, us, uid, hit["conflicting_ids"])
     answer = hit["answer"]
-    candidates = extractor.extract_clarification(answer, taxonomy, llm, pair_rows)
+    candidates = extractor.extract_clarification(answer, taxonomy, llm, pair_rows,
+                                                 max_body=max_body)
     actions = []
     for c in candidates:
         existing = conn.execute(

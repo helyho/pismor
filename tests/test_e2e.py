@@ -148,6 +148,8 @@ def test_full_lifecycle(client_with_script, db):
         ]}),
         S("extract_candidates", {"candidates": [fact_note]}),
         S("extract_candidates", {"candidates": [taboo_cand]}),
+        # 第八轮：taboo ADD 前近邻互斥检测（库内 preference_style@global 存活 → 查一次，判不互斥）
+        S("neighbor_conflict", {"conflict": False, "reason": "emoji 禁忌与语气偏好无关"}),
         S("extract_candidates", {"candidates": [identity_cand]}),
     ]
     client, llm = client_with_script(script)

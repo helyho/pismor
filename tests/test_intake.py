@@ -36,6 +36,16 @@ def test_text_over_8192_rejected(conn):  # Review Important #1：8K 硬顶，拒
     assert conn.execute("SELECT COUNT(*) c FROM events_seen").fetchone()["c"] == 0
     assert conn.execute("SELECT COUNT(*) c FROM entries").fetchone()["c"] == 0
 
+
+def test_max_content_chars_configurable(conn):
+    ev = {"source": "docs", "user_ref": "u1", "event_id": "e12", "event_type": "text",
+          "ts": "2026-11-24T09:00:00+08:00", "content": "x" * 50}
+    with pytest.raises(ValidationError):  # 上限收紧到 10：50 字符被拒且不落库
+        intake_event(conn, dict(ev), max_content_chars=10)
+    assert conn.execute("SELECT COUNT(*) c FROM events_seen").fetchone()["c"] == 0
+    ok, _ = intake_event(conn, dict(ev), max_content_chars=100)  # 放宽到 100：放行
+    assert ok
+
 @pytest.mark.parametrize("field", ["source", "user_ref", "session_id", "ts"])
 def test_missing_required_field_rejected(conn, field):  # Review Important #1：缺必填字段拒绝且不落库
     ev = {k: v for k, v in CONV.items() if k != field} | {"event_id": "e11"}

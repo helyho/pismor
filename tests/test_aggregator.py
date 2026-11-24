@@ -179,7 +179,7 @@ def test_orphan_new_topic_promoted_and_yaml(conn, taxonomy_writable, fake_llm_ne
     raw = yaml.safe_load(taxonomy_writable.path.read_text(encoding="utf-8"))
     pref = next(d for d in raw["dimensions"] if d["key"] == "preference")
     assert "brevity" in pref["topics"]  # 词表追加
-    assert len(raw["regression_cases"]) == 7  # 自动生成回归样例已追加
+    assert len(raw["regression_cases"]) == 10  # 自动生成回归样例已追加（v2 基线 9 条）
     assert raw["regression_cases"][-1]["expect"]["dimension"] == "preference"
     assert before != taxonomy_writable.path.read_text(encoding="utf-8")
 
@@ -274,6 +274,14 @@ def test_demote_stale(conn, seeded_stale_active, taxonomy):
     stats = run_daily(conn, taxonomy, FakeLLM([]), True, now=NOW)
     assert stats["demoted"] == 1
     assert conn.execute("SELECT status FROM entries").fetchone()["status"] == "degraded"
+
+
+def test_demote_thresholds_configurable(conn, seeded_stale_active, taxonomy):
+    # 默认 90 天阈值命中（100 天无强化 conf 0.6）；放宽到 120 天/0.5 后同条不降级
+    stats = run_daily(conn, taxonomy, FakeLLM([]), True, now=NOW,
+                      degrade_days=120, degrade_confidence=0.5)
+    assert stats["demoted"] == 0
+    assert conn.execute("SELECT status FROM entries").fetchone()["status"] == "active"
 
 
 def test_taboo_not_demoted_by_time(conn, seeded_stale_taboo, taxonomy):

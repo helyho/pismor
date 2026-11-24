@@ -28,12 +28,14 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
-def issue(conn, user_source, user_id, conflicting_ids, summaries) -> str:
+def issue(conn, user_source, user_id, conflicting_ids, summaries,
+          ttl_days: int = 7) -> str:
     """按矛盾对拼 question 落 pending_clarifications，返回 question 文本。
 
     summaries 以条目关联标记（id@scope）为键；取 conflicting_ids 前两个标记对应摘要
     拼模板。幂等去重：同一用户已存在未过期、集合相同的 pending → 直接复用其 question；
     同对过期后重发走 UPSERT 刷新 issued_at（TTL 重新计时），不同对同秒各自成行。
+    ttl_days 为新建行 TTL（settings.assembler.clarify_ttl_days 配置）。
     """
     ids = list(conflicting_ids)
     key = canonical_ids(ids)
@@ -50,11 +52,11 @@ def issue(conn, user_source, user_id, conflicting_ids, summaries) -> str:
     question = QUESTION_TMPL.format(s_a=summaries[ids[0]], s_b=summaries[ids[1]])
     conn.execute(
         "INSERT INTO pending_clarifications"
-        " (user_source, user_id, conflicting_ids, question, issued_at)"
-        " VALUES (?, ?, ?, ?, ?)"
+        " (user_source, user_id, conflicting_ids, question, issued_at, ttl_days)"
+        " VALUES (?, ?, ?, ?, ?, ?)"
         " ON CONFLICT(user_source, user_id, conflicting_ids) DO UPDATE SET"
         " question=excluded.question, issued_at=excluded.issued_at",
-        (user_source, user_id, key, question, _now_iso()))
+        (user_source, user_id, key, question, _now_iso(), ttl_days))
     conn.commit()
     return question
 

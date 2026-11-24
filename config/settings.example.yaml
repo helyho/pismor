@@ -6,13 +6,62 @@ export_root: ./exports
 
 llm:
   endpoint: "https://llm.bitv-ex.com/v1"
-  model: "gpt-4o-mini"
+  model: "auto"
   api_key_env: LLM_API_KEY
+  timeout_seconds: 120            # 单次请求超时；结构化输出慢模型建议 ≥120
+  retries: 1                      # transport 异常/429/5xx 额外重试次数
+  log_preview_chars: 1000         # 响应日志预览长度
+  user_agent: ~                   # 配置后请求头注入 User-Agent（网关 UA 白名单场景）；~ = httpx 原生 UA
+  # 结构化输出（默认 OpenAI 格式）。三家对照：
+  # - OpenAI:   response_format + {"type":"json_schema","json_schema":{...,"strict":true}}
+  #             Schema 级强制（必填字段/枚举由解码层保证）；旧模型可退 {"type":"json_object"}
+  # - DeepSeek: response_format + {"type":"json_object"} —— 仅保证合法 JSON，不保证结构；
+  #             提示词须含 "json" 字样并给输出示例；max_tokens 给足（截断即坏 JSON）；
+  #             输出非 JSON 时内容被替换为空格，代码侧需处理空白返回（重试）；
+  #             Chat Completions 不支持 json_schema（Responses API 的 text.format 才有）
+  # - GLM(智谱): response_format + {"type":"json_object"} 最通用可靠；
+  #             json_schema 在 BigModel 实测可被接受但官方未承诺，勿依赖；
+  #             结构靠 System Prompt 写全 Schema + 要求"输出严格 JSON、不要 Markdown 代码块"
+  structured_output_param: "response_format"   # 参数名；置空 "" 则请求不带结构化输出参数
+  structured_output_type: "json_schema"        # "json_schema"(OpenAI) | "json_object"(DeepSeek/GLM)
 
 embedding:
   enabled: false                  # 默认关闭：词面匹配为默认装配路径
-  endpoint: "https://llm.bitv-ex.com/v1/embeddings"
-  model: "bge-m3"
+  endpoint: "http://10.80.2.245:8000/v1/embeddings"
+  model: "BAAI/bge-m3"
   api_key_env: EMBEDDING_API_KEY
   dimensions: 1024                # 须与模型输出一致；变更触发全量重嵌入
   batch_size: 32
+  timeout_seconds: 30
+
+# ---- 以下段可整体省略（缺省即默认值）----
+
+gate:
+  auto_min: 0.85                  # ≥此值且 explicit 直通入库
+  review_min: 0.6                 # ≥此值入复核队列，之下丢弃
+  inferred_cap: 0.8               # inferred 候选置信压顶
+
+pipeline:
+  known_ids_limit: 200            # 抽取时已有条目加载上限
+  reinforce_top_k: 20             # 无变化轮话题强化条数上限
+  trigger_long_message: 300       # 消息长度突变阈值（字符）
+  max_body_chars: 200             # 候选 body 截断长度
+
+aggregator:
+  degrade_days: 90                # 无强化天数超过此值参与降级
+  degrade_confidence: 0.7         # 置信低于此值参与降级
+
+assembler:
+  taboo_budget_share: 0.6         # merge_task 时 taboo 预算占比
+  related_top_k: 20               # 相关集召回条数
+  half_life_days: 30              # 强化时效半衰期
+  clarify_ttl_days: 7             # 新建澄清 pending 的 TTL 默认
+
+intake:
+  max_content_chars: 8192         # 事件 content 上限
+
+backup:
+  keep: 30                        # 快照滚动保留份数
+
+serve:
+  daily_interval_seconds: 86400   # 日批循环间隔

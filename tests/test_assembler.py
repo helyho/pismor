@@ -199,6 +199,18 @@ def test_lexical_match(conn, seeded):
     assert "preference_coffee" in [e["id"] for e in pack["entries"]]
 
 
+def test_related_top_k_configurable(conn):
+    # 6 条 preference 词面命中条目（非必带维度）：related_top_k=2 只召回 2 条，默认 20 条全收
+    for i in range(6):
+        _entry(conn, "preference", f"p{i}", f"咖啡豆编号 {i}", conf=0.6,
+               entry_id=f"preference_p{i}")
+    conn.commit()
+    pack = assemble(conn, None, "w", "u1", budget=2000, query="咖啡豆", related_top_k=2)
+    assert len(pack["entries"]) == 2
+    pack = assemble(conn, None, "w", "u1", budget=2000, query="咖啡豆")
+    assert len(pack["entries"]) == 6
+
+
 def test_vector_recall(conn, seeded):
     conn.execute("CREATE VIRTUAL TABLE embeddings USING vec0("
                  "entry_id TEXT PRIMARY KEY, user_source TEXT, user_id TEXT, embedding float[4])")

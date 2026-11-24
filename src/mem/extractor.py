@@ -7,11 +7,17 @@ orphan 候选额外带 status="orphan_topic"（dimension 占位 "orphan"）。
 - dimension 合法但 topic ∉ 该维度 topics → 非 taboo 转 orphan（topic_new 必填，topic 用
   topic_new 作观察区键）；taboo 维度词表外候选强制人工队列（force_review），不得自动建桶。
 - summary 在出口截断到 20 字（spec §5）。
+- scope 非法（白名单外自由文本）在出口回落 default_scope 并置信打 8 折，不再由写入器
+  整条丢弃——画像不因 LLM 的格式方差静默消失（黑盒发现⑤的修复）。
 """
+import logging
 import re
 
+from mem.keys import valid_scope
 from mem.prompts import (CLARIFY_EXTRACT_SYSTEM, CLARIFY_EXTRACT_USER,
                          EXTRACT_CONVERSATION, EXTRACT_TEXT, INSTRUCTION_RE, MAX_BODY)
+
+logger = logging.getLogger("mem.extractor")
 
 # sensitive topic 概括级校验：含精确位置/医疗细节特征（数字门牌、楼栋、确诊、处方）→ 整条丢弃
 _SENSITIVE_DETAIL_RE = re.compile(r"\d+号|\d+栋|确诊|处方")
@@ -21,7 +27,7 @@ _CANDIDATE_ITEM = {
     "properties": {
         "dimension": {"type": ["string", "null"]},
         "topic": {"type": "string"},
-        "scope": {"type": "string"},
+        "scope": {"type": "string", "pattern": "^(global|project:.+)$"},
         "body": {"type": "string"},
         "summary": {"type": "string"},
         "confidence": {"type": "number"},
@@ -44,7 +50,7 @@ _OUTPUT_SCHEMA = _schema("extract_candidates")
 _CLARIFY_SCHEMA = _schema("clarify_candidates")
 
 
-def extract(ev: dict, taxonomy, llm, known_ids: list[str]) -> list[dict]:
+def extract(ev: dict, taxonomy, llm, known_ids: list[str], *, max_body: int = MAX_BODY) -> list[dict]:
     """单事件抽取画像候选。conversation/text 走各自模板；逐条过滤后返回。"""
     block = _dimension_block(taxonomy)
     ids_line = ", ".join(known_ids) if known_ids else "（无）"
@@ -58,13 +64,14 @@ def extract(ev: dict, taxonomy, llm, known_ids: list[str]) -> list[dict]:
     result = llm.chat_json(system, user, _OUTPUT_SCHEMA)
     out = []
     for raw in result.get("candidates", []):
-        cand = _to_candidate(raw, taxonomy)
+        cand = _to_candidate(raw, taxonomy, max_body=max_body)
         if cand:
             out.append(cand)
     return out
 
 
-def extract_clarification(answer: str, taxonomy, llm, pair_rows) -> list[dict]:
+def extract_clarification(answer: str, taxonomy, llm, pair_rows, *,
+                          max_body: int = MAX_BODY) -> list[dict]:
     """把澄清回答规范化为画像候选（body/summary 来自抽取，不直接使用用户原句）。
 
     pair_rows 为矛盾对现存行（dimension/topic/scope/summary），仅作理解上下文。
@@ -78,7 +85,7 @@ def extract_clarification(answer: str, taxonomy, llm, pair_rows) -> list[dict]:
                            _CLARIFY_SCHEMA)
     out = []
     for raw in result.get("candidates", []):
-        cand = _to_candidate(raw, taxonomy)
+        cand = _to_candidate(raw, taxonomy, max_body=max_body)
         if not cand or cand["dimension"] == "orphan" or cand.get("status") == "orphan_topic":
             continue  # 澄清回答只收敛既有矛盾主题，不新建观察区桶
         if not cand.get("quote"):
@@ -90,8 +97,19 @@ def extract_clarification(answer: str, taxonomy, llm, pair_rows) -> list[dict]:
 
 
 def _dimension_block(taxonomy) -> str:
-    return "\n".join(f"- {d.key}({d.name}): {', '.join(d.topics)}"
-                     for d in taxonomy.dimensions.values())
+    """维度词表 + 判定要点（guidance 压缩注入）。
+
+    黑盒发现①的修复：此前只注入 topic 列表，taxonomy 的 guidance（kind/scope/
+    维度边界判定语义）完全没进 prompt，LLM 对 kind/scope/topic 只能靠猜。
+    """
+    lines = []
+    for d in taxonomy.dimensions.values():
+        guidance = re.sub(r"\s+", " ", (d.guidance or "")).strip()
+        if len(guidance) > 200:
+            guidance = guidance[:200] + "…"
+        lines.append(f"- {d.key}({d.name}): topics={', '.join(d.topics)}"
+                     + (f"；判定要点：{guidance}" if guidance else ""))
+    return "\n".join(lines)
 
 
 def _render_messages(messages: list[dict]) -> str:
@@ -105,7 +123,7 @@ def _is_sensitive(taxonomy, dimension: str, topic: str) -> bool:
     return bool(dim.topic_overrides.get(topic, {}).get("sensitive"))
 
 
-def _to_candidate(raw: dict, taxonomy) -> dict | None:
+def _to_candidate(raw: dict, taxonomy, *, max_body: int = MAX_BODY) -> dict | None:
     dimension = raw.get("dimension")
     topic_new = raw.get("topic_new")
     topic = str(raw.get("topic") or "").strip()
@@ -152,11 +170,18 @@ def _to_candidate(raw: dict, taxonomy) -> dict | None:
             return None
     dim = taxonomy.dimensions.get(dimension)
     default_scope = dim.default_scope if dim else "global"
+    scope = str(raw.get("scope") or "").strip()
+    if not valid_scope(scope):
+        # 兜底（替代下游整条丢弃）：非法 scope 回落默认作用域并降置信，日志留痕
+        logger.warning("scope %r out of whitelist; fallback to %s for %s/%s",
+                       raw.get("scope"), default_scope, dimension, topic)
+        scope = default_scope
+        confidence *= 0.8
     cand = {
         "dimension": dimension,
         "topic": topic,
-        "scope": raw.get("scope") or default_scope,
-        "body": body[:MAX_BODY],
+        "scope": scope,
+        "body": body[:max_body],
         "summary": summary[:20],  # spec §5：摘要硬顶 20 字
         "confidence": confidence,
         "kind": raw.get("kind") or "explicit",

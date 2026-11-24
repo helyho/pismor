@@ -5,8 +5,6 @@ import httpx
 
 from mem.config import EmbeddingSettings
 
-_TIMEOUT = 30.0
-
 
 class EmbedUnavailable(Exception):
     """嵌入服务未启用、连接失败或返回非 2xx 时抛出。Task 7/13 捕获后降级继续。"""
@@ -27,7 +25,7 @@ class Embedder:
     def _post_batch(self, texts: list[str]) -> list[list[float]]:
         payload = {"model": self._settings.model, "input": texts}
         try:
-            with httpx.Client(timeout=_TIMEOUT) as client:
+            with httpx.Client(timeout=self._settings.timeout_seconds) as client:
                 response = client.post(self._url, headers=self._headers(), json=payload)
         except httpx.HTTPError as exc:  # 连接失败、超时等
             raise EmbedUnavailable(f"embed request failed: {exc}") from exc

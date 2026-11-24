@@ -446,6 +446,19 @@ def test_backup_vacuum_before_cleanup(conn, tmp_path):
     assert len(list(target_dir.glob("backup-*.db"))) == 30
 
 
+def test_backup_keep_configurable(conn, tmp_path):
+    # keep=2：滚动保留收紧到 2 份（settings.backup.keep 可配）
+    target_dir = tmp_path / "bk"
+    target_dir.mkdir()
+    for i in range(1, 4):
+        (target_dir / f"backup-2025010{i}.db").write_text("stale")
+    backup(conn, target_dir, keep=2)
+    files = sorted(target_dir.glob("backup-*.db"))
+    assert len(files) == 2
+    assert files[0].name == "backup-20250103.db"  # 最旧两份被清，前一日留存
+    assert files[1] == backup(conn, target_dir, keep=2)  # 当日快照同日重跑原子覆盖
+
+
 # ---- fix wave 新增：跨 scope verdict / pending 演进 / 隔离 / 入口 / 导出 ----
 
 def test_verdict_discard_is_scope_specific(client, conn):
@@ -501,14 +514,17 @@ def test_illegal_transition_isolated_not_batch_rollback(conn, fake_settings, tax
         == "archived"
 
 
-def test_invalid_scope_candidate_dropped(conn, fake_settings, fake_llm, embedder_stub, taxonomy):
-    # I-13：作用域白名单在写入器统一校验，违规候选丢弃记 drop（不落库）
+def test_invalid_scope_candidate_fallback_kept(conn, fake_settings, fake_llm, embedder_stub, taxonomy):
+    # 第八轮修复：非法 scope 不再整条静默丢弃，出口回落 default_scope 并置信打 8 折
     from mem.pipeline import run_pipeline
     bad = dict(EXPLICIT_CAND, scope="../../etc")
     fake_llm.by_name["extract_candidates"] = [{"candidates": [bad]}]
     run_pipeline(conn, fake_settings, dict(CONV_EVENT, event_id="evt_scope"),
                  taxonomy=taxonomy, llm=fake_llm, embedder=embedder_stub)
-    assert conn.execute("SELECT COUNT(*) c FROM entries").fetchone()["c"] == 0
+    row = conn.execute("SELECT scope, confidence, status FROM entries").fetchone()
+    assert row is not None
+    assert row["scope"] == "global"  # 回落 default_scope
+    assert row["confidence"] == pytest.approx(EXPLICIT_CAND["confidence"] * 0.8)
 
 
 def test_hash_fallback_event_id_written_to_origin_ref(client, conn, fake_llm):

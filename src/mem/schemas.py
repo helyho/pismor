@@ -54,7 +54,7 @@ class ConversationEvent(_Base):
 
 class TextEvent(_Base):
     event_type: Literal["text"] = "text"
-    content: str = Field(min_length=1, max_length=8192)
+    content: str = Field(min_length=1)  # 上限 max_length 由 intake 按 settings.intake 校验
     title: str | None = None
     origin_ref: str | None = None
 

@@ -5,3 +5,10 @@ __pycache__/
 *.egg-info/
 data/
 exports/
+.DS_Store
+**/.DS_Store
+nohup.out
+*.log
+.codegraph/
+bb_test/
+config/settings.yaml

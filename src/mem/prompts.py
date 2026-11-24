@@ -49,3 +49,15 @@ RESOLVE_USER = """旧条目（维度 {old_dim}，主题 {topic}，作用域 {sco
 {new}
 
 同主题 taboo 条目：{taboo}"""
+
+ORPHAN_MERGE_SYSTEM = """你是词表归并判定器。观察区候选主题（词表外主题的一句话描述）已复现多次，需归入现有词表桶或建新桶。
+优先归并到语义相同的现有 topic；仅当确实没有相近 topic 时才建新桶（topic 用小写下划线 slug）。
+taboo 与 sensitive 挂载 topic 禁止建桶，但目标维度仍由你按语义判定。
+输出 JSON：action 取 "merge_to"（归并现有桶）或 "new_topic"（建新桶），
+dimension 为目标维度 key，topic 为目标 topic（merge_to 时即归并目标，new_topic 时为新桶名）。"""
+
+ORPHAN_MERGE_USER = """候选主题描述：{topic_new}
+候选条目摘要：{summaries}
+
+现有词表：
+{dimension_block}"""

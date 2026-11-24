@@ -115,18 +115,21 @@ def _update(conn, us, uid, c, target, now, origin_type, origin_ref, vectors):
     _check_transition(old["status"], "archived")  # 旧行归档轨迹；archived 再 UPDATE、pending/orphan 走此路均拒绝
     if old["status"] == "degraded":
         _check_transition("degraded", "active")  # 新证据演进恢复 active（spec §6）
-    # 轨迹行：旧行完整内容原样存档，topic 加 "~" 前缀避开主键
+    sup_topic, sup_id = _superseded_identity(conn, us, uid, d, t, now)
+    # 轨迹行：旧行完整内容原样存档，topic 加 "~" 前缀避开主键；
+    # 同 key 多次 UPDATE → 时间戳+序号去重（同轮同 now 也唯一）
     conn.execute(
         f"INSERT INTO entries ({_ENTRY_COLS}) "
         "SELECT user_source,user_id,dimension,?,scope,?,confidence,'archived',body,summary,"
         "created_at,?,last_reinforced_at,'superseded',?,topic_new,conflict_with,reinforcements,? "
         "FROM entries WHERE user_source=? AND user_id=? AND dimension=? AND topic=? AND scope=?",
-        (f"~{t}", f"{d}_~{t}", now, f"{d}_{t}", now, us, uid, d, t, s))
-    # 旧行证据链转移给轨迹行（spec §12：archived 条目保留全部字段与证据链）；
-    # 原 key 行刷新为新值，只保留新证据，旧证据不得混挂
+        (sup_topic, sup_id, now, f"{d}_{t}", now, us, uid, d, t, s))
+    # 旧行证据链转移给轨迹行（spec §12：archived 条目保留全部字段与证据链）。
+    # sources.entry_id 存行唯一键 "{entries.id}@{scope}"（id 不含 scope，裸 id 跨 scope 撞、
+    # 任何按 id 的圈定都会误伤他行证据）——按该键精确命中旧行证据，无歧义
     conn.execute(
         "UPDATE sources SET entry_id=? WHERE user_source=? AND user_id=? AND entry_id=?",
-        (f"{d}_~{t}", us, uid, f"{d}_{t}"))
+        (sup_id, us, uid, f"{d}_{t}@{s}"))
     # 原行同 key 覆盖新值（bi-temporal 旧值由轨迹行承载）
     conn.execute(
         "UPDATE entries SET body=?,summary=?,confidence=?,status='active',degraded_reason=NULL,"
@@ -136,8 +139,20 @@ def _update(conn, us, uid, c, target, now, origin_type, origin_ref, vectors):
     conn.execute(
         "INSERT INTO sources (entry_id,user_source,user_id,origin_type,origin_ref,quote,kind)"
         " VALUES (?,?,?,?,?,?,?)",
-        (f"{d}_{t}", us, uid, origin_type, origin_ref, c["quote"], c.get("kind") or "explicit"))
+        (f"{d}_{t}@{s}", us, uid, origin_type, origin_ref, c["quote"], c.get("kind") or "explicit"))
     vectors.append((f"{d}_{t}", c["body"]))
+
+
+def _superseded_identity(conn, us, uid, d, t, now):
+    """轨迹行 topic/id：~{topic}:{紧凑now}:{序号}，同 key 多次 UPDATE（含同轮同 now）唯一。"""
+    compact = now.replace("-", "").replace(":", "").split("+")[0]  # 2026-11-24T…+08:00 → 20261124T…
+    base = f"~{t}:{compact}:"
+    rows = conn.execute(
+        "SELECT COUNT(*) c FROM entries WHERE user_source=? AND user_id=? AND dimension=? AND topic LIKE ?",
+        (us, uid, d, f"{base}%")).fetchone()
+    seq = rows["c"] + 1
+    topic = f"{base}{seq}"
+    return topic, f"{d}_{topic}"
 
 
 def _conflict(conn, us, uid, c, target, now, origin_type, origin_ref, vectors):
@@ -221,7 +236,9 @@ def _insert_entry(conn, us, uid, c, *, status, now, origin_type, origin_ref,
     conn.execute(
         "INSERT INTO sources (entry_id,user_source,user_id,origin_type,origin_ref,quote,kind)"
         " VALUES (?,?,?,?,?,?,?)",
-        (entry_id, us, uid, origin_type, origin_ref, quote, c.get("kind") or "explicit"))
+        # entry_id 存行唯一键（append scope）：id 不含 scope，跨 scope 同 topic 行的证据可归属
+        (f"{entry_id}@{c['scope']}", us, uid, origin_type, origin_ref, quote,
+         c.get("kind") or "explicit"))
     return entry_id
 
 

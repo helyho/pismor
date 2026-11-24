@@ -96,15 +96,16 @@ def test_add_writes_entry_and_sources(conn, embedder_stub):
     assert row["last_reinforced_at"] == NOW and row["reinforcements"] == 0
     assert conn.execute("SELECT COUNT(*) c FROM sources").fetchone()["c"] == 1
     src = conn.execute("SELECT * FROM sources").fetchone()
+    # sources.entry_id 为行唯一键 {entries.id}@{scope}（id 不含 scope，跨 scope 证据可归属）
     assert (src["entry_id"], src["origin_type"], src["origin_ref"], src["kind"]) == \
-        ("preference_lang", "conversation", "s1:1", "explicit")
+        ("preference_lang@global", "conversation", "s1:1", "explicit")
 
 
 def test_update_archives_old(conn, embedder_stub, seeded_active):
     apply_actions(conn, "w", "u", [update_action("preference", "lang", "global")],
                   embedder_stub, "text", "e1", NOW)
-    # 轨迹行（topic 加 "~" 前缀）：旧行完整内容 archived，superseded_by 指向新行 id
-    sup = conn.execute("SELECT * FROM entries WHERE topic='~lang'").fetchone()
+    # 轨迹行（topic 加 "~" 前缀+时间戳序号）：旧行完整内容 archived，superseded_by 指向新行 id
+    sup = conn.execute("SELECT * FROM entries WHERE topic LIKE '~lang:%'").fetchone()
     assert sup["status"] == "archived" and sup["superseded_by"] == "preference_lang"
     assert sup["archived_at"] == NOW and sup["body"] == "旧值"
     # 原行同 key 覆盖为新值 active（bi-temporal 旧值由轨迹行承载）
@@ -117,17 +118,17 @@ def test_update_copies_sources_to_superseded_row(conn, embedder_stub, seeded_act
     # spec §12：archived 条目保留全部字段与证据链——轨迹行复制旧行全部 sources
     conn.executemany(
         "INSERT INTO sources (entry_id,user_source,user_id,origin_type,origin_ref,quote,kind)"
-        " VALUES ('preference_lang','w','u',?,?,'旧证据','explicit')",
+        " VALUES ('preference_lang@global','w','u',?,?,'旧证据','explicit')",
         [("conversation", "s1:1"), ("text", "doc:2")])
     conn.commit()
     apply_actions(conn, "w", "u", [update_action("preference", "lang", "global")],
                   embedder_stub, "text", "e1", NOW)
     sup_srcs = conn.execute(
-        "SELECT * FROM sources WHERE entry_id='preference_~lang' ORDER BY origin_ref").fetchall()
+        "SELECT * FROM sources WHERE entry_id LIKE 'preference_~lang:%' ORDER BY origin_ref").fetchall()
     assert [(s["origin_type"], s["origin_ref"], s["quote"]) for s in sup_srcs] == \
         [("text", "doc:2", "旧证据"), ("conversation", "s1:1", "旧证据")]
     cur_srcs = conn.execute(
-        "SELECT * FROM sources WHERE entry_id='preference_lang'").fetchall()
+        "SELECT * FROM sources WHERE entry_id='preference_lang@global'").fetchall()
     assert [(s["origin_type"], s["origin_ref"], s["quote"]) for s in cur_srcs] == \
         [("text", "e1", "用户原话")]  # 新 active 行携带新证据
 
@@ -254,3 +255,56 @@ def test_missing_quote_rejected(conn, embedder_stub):
     c["quote"] = None
     apply_actions(conn, "w", "u", [{"op": "ADD", "candidate": c}], embedder_stub, "text", "e1", NOW)
     assert conn.execute("SELECT COUNT(*) c FROM entries").fetchone()["c"] == 0
+
+
+def _seed_with_source(conn, scope, origin_ref, quote):
+    """seed 一行带 1 条独立证据的 active 条目（跨 scope 同 topic，id 相同）。"""
+    entry_id = "preference_lang"
+    conn.execute(
+        "INSERT INTO entries (user_source,user_id,dimension,topic,scope,id,confidence,status,"
+        "body,summary,created_at,updated_at,last_reinforced_at)"
+        " VALUES ('w','u','preference','lang',?,?,'0.9','active',?,?,'2026-01-01','2026-01-01','2026-01-01')",
+        (scope, entry_id, f"旧值@{scope}", f"旧值@{scope}"))
+    conn.execute(
+        "INSERT INTO sources (entry_id,user_source,user_id,origin_type,origin_ref,quote,kind)"
+        " VALUES (?,'w','u','text',?,?,'explicit')", (f"{entry_id}@{scope}", origin_ref, quote))
+    conn.commit()
+
+
+def test_update_moves_sources_by_full_key(conn, embedder_stub):
+    # Critical 回归：跨 scope 同 topic 共存（id 相同）时，UPDATE global 行
+    # 不得转移 project:x 行的证据——转移按行唯一键（id@scope）精确圈定
+    _seed_with_source(conn, "global", "doc:g1", "global旧证据")
+    _seed_with_source(conn, "project:x", "doc:x1", "project旧证据")
+    apply_actions(conn, "w", "u", [update_action("preference", "lang", "global")],
+                  embedder_stub, "text", "e1", NOW)
+    # project:x 行证据原样未动（键未被转移）
+    assert [(s["origin_ref"], s["quote"]) for s in conn.execute(
+        "SELECT origin_ref, quote FROM sources WHERE entry_id='preference_lang@project:x'").fetchall()] \
+        == [("doc:x1", "project旧证据")]
+    # global 轨迹行持有且仅持有 global 旧行的证据
+    sup = conn.execute("SELECT id FROM entries WHERE topic LIKE '~lang:%'").fetchone()
+    sup_srcs = conn.execute(
+        "SELECT origin_ref, quote FROM sources WHERE entry_id=? ORDER BY origin_ref",
+        (sup["id"],)).fetchall()
+    assert [(s["origin_ref"], s["quote"]) for s in sup_srcs] == [("doc:g1", "global旧证据")]
+    # global 原 key 行（新值 active）仅携带新证据
+    cur_srcs = conn.execute(
+        "SELECT origin_ref FROM sources WHERE entry_id='preference_lang@global'"
+        " AND origin_ref != 'doc:g1'").fetchall()
+    assert [(s["origin_ref"],) for s in cur_srcs] == [("e1",)]
+
+
+def test_update_twice_creates_distinct_superseded_rows(conn, embedder_stub, seeded_active):
+    # Important 回归：同 key 连续两次 UPDATE 不抛异常，两条轨迹行并存，新行为最新值
+    first = update_action("preference", "lang", "global")
+    apply_actions(conn, "w", "u", [first], embedder_stub, "text", "e1", NOW)
+    second = update_action("preference", "lang", "global")
+    second["candidate"]["body"] = "最新值"
+    apply_actions(conn, "w", "u", [second], embedder_stub, "text", "e2", NOW)
+    sups = conn.execute(
+        "SELECT topic, body FROM entries WHERE topic LIKE '~lang:%' ORDER BY topic").fetchall()
+    assert len(sups) == 2
+    assert sups[0]["body"] == "旧值" and sups[1]["body"] == "新值"  # 各版本各归其档
+    cur = conn.execute("SELECT * FROM entries WHERE topic='lang'").fetchone()
+    assert cur["status"] == "active" and cur["body"] == "最新值"

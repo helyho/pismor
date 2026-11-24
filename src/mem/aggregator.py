@@ -84,23 +84,31 @@ def _promote_orphans(conn, taxonomy, llm, auto_promote, now, stats):
         summaries = "；".join(f"{r['summary']}" for r in rows[:5])
         verdict = llm.chat_json(ORPHAN_MERGE_SYSTEM, ORPHAN_MERGE_USER.format(
             topic_new=topic_new, summaries=summaries, dimension_block=block), _MERGE_SCHEMA)
+        action = verdict.get("action") or ""
+        is_merge = action == "merge_to" or action.startswith("merge_to:")  # 兼容 merge_to:<topic> 字面格式
+        is_new = action == "new_topic"
         dim, topic = verdict.get("dimension"), verdict.get("topic")
-        if verdict.get("action", "").startswith("merge_to") and not topic:
-            topic = verdict.get("action").split(":", 1)[1]  # 兼容 merge_to:<topic> 字面格式
-        if not dim or not topic or dim not in taxonomy.dimensions:
+        if is_merge and not topic:
+            topic = action.split(":", 1)[1]
+        # 校验链（I1 修复）：action 白名单 → dimension 合法 → merge_to 目标必须在词表内
+        #（schema 是服务端软约束，本地不校验则词表外 merge_to 在 auto_promote=False 下绕过人工队列）
+        if (not is_merge and not is_new) or not dim or not topic or dim not in taxonomy.dimensions:
             _queue_audit(conn, rows, now, note=f"invalid_verdict: {verdict}")
+            continue
+        if is_merge and topic not in (taxonomy.dimensions[dim].topics or []):
+            _queue_audit(conn, rows, now, note=f"merge_target_not_in_taxonomy: {dim}/{topic}")
             continue
         if _topic_is_sensitive(taxonomy.dimensions[dim], topic):
             _queue_audit(conn, rows, now, note=f"sensitive_topic: {dim}/{topic}")
             continue
-        if verdict.get("action").startswith("new_topic"):
+        if is_new:
             if not auto_promote:
                 _queue_audit(conn, rows, now, note=f"new_topic_queued: {dim}/{topic}")
                 continue
             _append_taxonomy(taxonomy, dim, topic, rows)
         n = _rekey(conn, rows, dim, topic, now)
         stats["promoted"] += n
-        if verdict.get("action").startswith("merge_to"):
+        if is_merge:
             stats["merged"] += n
 
 

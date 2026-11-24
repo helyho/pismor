@@ -70,6 +70,18 @@ def fake_llm_sensitive():
 
 
 @pytest.fixture
+def fake_llm_merge_offvocab():
+    # merge_to 指向词表外 topic（拼写漂移/幻觉场景）
+    return FakeLLM({"action": "merge_to", "dimension": "preference", "topic": "oddtopic"})
+
+
+@pytest.fixture
+def fake_llm_invalid_action():
+    # action 白名单外的输出
+    return FakeLLM({"action": "promote_all", "dimension": "preference", "topic": "lang"})
+
+
+@pytest.fixture
 def seeded_orphans_3(conn):
     return _seed_orphans(conn)
 
@@ -231,6 +243,29 @@ def test_merge_to_sensitive_topic_queued(conn, seeded_orphans_3, taxonomy, fake_
     assert stats["promoted"] == 0  # 归并目标 region 挂 sensitive override → 禁自动转正
     row = conn.execute("SELECT status FROM entries").fetchone()
     assert row["status"] == "orphan_topic"
+    n = conn.execute("SELECT COUNT(*) c FROM review_history WHERE actor='audit'").fetchone()["c"]
+    assert n == 3
+
+
+def test_merge_to_offvocab_topic_queued(conn, seeded_orphans_3, taxonomy_writable,
+                                        fake_llm_merge_offvocab):
+    # merge_to + 词表外 topic：不转正（否则 auto_promote=False 下等效绕过人工队列建桶）
+    stats = run_daily(conn, taxonomy_writable, fake_llm_merge_offvocab, auto_promote=True, now=NOW)
+    assert stats["promoted"] == 0
+    row = conn.execute("SELECT status FROM entries").fetchone()
+    assert row["status"] == "orphan_topic"
+    n = conn.execute("SELECT COUNT(*) c FROM review_history WHERE actor='audit'").fetchone()["c"]
+    assert n == 3
+    import yaml
+    raw = yaml.safe_load(taxonomy_writable.path.read_text(encoding="utf-8"))
+    pref = next(d for d in raw["dimensions"] if d["key"] == "preference")
+    assert "oddtopic" not in pref["topics"]  # 词表不被污染
+
+
+def test_invalid_action_queued(conn, seeded_orphans_3, taxonomy, fake_llm_invalid_action):
+    # action 白名单 {merge_to, new_topic} 之外 → 整组落 audit，不转正
+    stats = run_daily(conn, taxonomy, fake_llm_invalid_action, auto_promote=True, now=NOW)
+    assert stats["promoted"] == 0
     n = conn.execute("SELECT COUNT(*) c FROM review_history WHERE actor='audit'").fetchone()["c"]
     assert n == 3
 

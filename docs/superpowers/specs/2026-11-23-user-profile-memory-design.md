@@ -6,7 +6,7 @@
 
 ## 1. 背景与目标
 
-针对用户与 LLM 的对话记录，自动构建并维护每个用户的画像（身份、偏好、禁忌、事实、情境），落地为按 user 区分的 md 文件集；对话前通过索引加载画像包注入 prompt，提升回复的个性化质量。
+针对用户与 LLM 的对话记录**及其他任意形式的文本素材**（文档、笔记、邮件、工单、评论等），自动构建并维护每个用户的画像（身份、偏好、禁忌、事实、情境），落地为按 user 区分的画像库（SQLite 真相源 + md 导出视图）；对话前通过索引加载画像包注入 prompt，提升回复的个性化质量。
 
 核心需求：user 区分；多 md 保存；冲突处理；历史内容淘汰；自动分类；画像索引；大模型通过索引加载。
 
@@ -223,7 +223,8 @@ CREATE TABLE entries (
 CREATE TABLE sources (          -- 证据链 1:N，无 quote 入库被写入器拒绝
   seq INTEGER PRIMARY KEY,      -- 自增: 同一轮可能对同一条目产生多条不同 kind 的证据
   entry_id TEXT, user_source TEXT, user_id TEXT,
-  session TEXT NOT NULL, turn INTEGER NOT NULL,
+  origin_type TEXT NOT NULL,    -- conversation | text
+  origin_ref TEXT NOT NULL,     -- 定位引用: 对话="session:turn"; 文本=event_id
   quote TEXT NOT NULL, kind TEXT NOT NULL,
   FOREIGN KEY (entry_id, user_source, user_id) REFERENCES entries(user_source, user_id, dimension, topic, scope)
 );
@@ -240,10 +241,10 @@ CREATE TABLE review_history (   -- 复核判定与澄清判定留痕
   ts TEXT NOT NULL, note TEXT,
   entry_version TEXT NOT NULL                   -- 竞态防御: 不匹配则判定作废(§14)
 );
-CREATE TABLE events_seen (      -- 幂等键持久化，webhook 重放天然去重
-  session TEXT, turn INTEGER, ts TEXT,
-  PRIMARY KEY (session, turn)
-);                              -- 前提: session_id 全局唯一由日志平台保证
+CREATE TABLE events_seen (      -- 幂等键持久化，重放天然去重
+  source TEXT, event_id TEXT, ts TEXT,
+  PRIMARY KEY (source, event_id)
+);                              -- event_id 由上报方保证唯一; 缺省时服务端以 hash(user_ref+ts+content) 兜底
 CREATE TABLE tombstones (       -- 用户删除权: 只留痕不存内容
   user_source TEXT, user_id TEXT, deleted_at TEXT, requested_by TEXT,
   PRIMARY KEY (user_source, user_id)
@@ -340,30 +341,35 @@ superseded_by: null
 
 ```mermaid
 flowchart TD
-    A[对话轮结束 webhook] --> B{幂等: session+turn 已处理?}
+    A[事件上报 POST /events<br/>event_type: conversation / text] --> B{幂等: source+event_id<br/>已处理? events_seen 表}
     B -->|是| Z[丢弃]
-    B -->|否| C{触发分级}
+    B -->|否| T0{event_type}
+    T0 -->|conversation| C{触发分级}
     C -->|explicit 声明| E
     C -->|反馈事件: 踩/改写/中断| E
     C -->|普通消息| D{规则版变化检测:<br/>声明关键词 / 长度语言突变 / 会话首查}
     D -->|无变化| F[reinforcement 批内+1<br/>不调 LLM]
-    D -->|有变化| E[抽取 LLM<br/>输入: 相关维度id列表截断 + taxonomy词表<br/>输出: 候选条目]
+    D -->|有变化| E[抽取 LLM<br/>仅 user 角色为用户域证据<br/>输入: 相关维度id列表截断 + 词表]
+    T0 -->|text| E2[抽取 LLM<br/>整段为用户域, 归属校验更严<br/>引用/转述他人内容不作画像]
     E --> G{置信度闸门}
+    E2 --> G
     G -->|>=0.85 explicit| H[决策]
     G -->|0.6~0.85 inferred| R[复核队列<br/>超期自动废弃]
     G -->|<0.6| X[丢弃]
-    H[决策 LLM 四路<br/>ADD/UPDATE/CONFLICT-FLAG/NOOP] --> I[写入器<br/>per-user 串行, 跨用户并行]
+    H[决策 LLM 四路<br/>ADD/UPDATE/CONFLICT-FLAG/NOOP] --> I[写入器<br/>唯一约束+事务, 按用户分批]
     I --> J[(SQLite 事务写入<br/>entries+sources+向量 同事务<br/>降级=status变更+archived_at)]
 ```
 
 关键机制：
 
-- **幂等键** session+turn 持久化于 `events_seen` 表（§8.1），webhook 重放天然去重，崩溃后已处理事件不重复处理；未处理事件依赖平台重试（部署前确认）。
-- **触发分级**（成本控制核心）：explicit 声明与反馈事件零阈值直通；普通消息先过规则版变化检测，无变化仅批内累加 reinforcement，不调 LLM。
+- **多形态素材规则**：conversation 事件仅 user 角色消息为用户域证据，assistant 消息仅作上下文；text 事件（文档/笔记/邮件/工单/评论等任意文本）默认整段为用户域——用户亲写的文本比对话更真实——但归属校验更严：文本内引用、转述他人的内容不作为用户画像（与 fact 维度"转述他人不入库"同构）。text 事件单条硬顶 8K 字符，超出由上报方分块。
+- **幂等键** `source+event_id` 持久化于 `events_seen` 表（§8.1），重放天然去重，崩溃后已处理事件不重复处理；event_id 由上报方提供，缺省时服务端以 hash 兜底。
+- **触发分级**（成本控制核心，仅作用于 conversation）：explicit 声明与反馈事件零阈值直通；普通消息先过规则版变化检测，无变化仅批内累加 reinforcement，不调 LLM。text 事件是显式提交的素材，直接进抽取，由置信度闸门兜底。
 - **抽取输入只带 id 列表与词表**，不带现有条目正文——比对集中在决策步，防抽取器锚定现有画像导致错误自我固化（该分工不可合并）。id 列表按维度截断、只带同 scope 相关维度；截断的漏报风险由复核队列统计兜底。
 - **四路决策**：ADD / UPDATE（同 scope 同 topic 演进，旧值归档回填 superseded_by）/ CONFLICT-FLAG（真矛盾，见 §11）/ NOOP（重复，reinforcements+1）。决策由 LLM 输出但受 schema 枚举约束。
-- **per-user 串行**：由数据库唯一约束+事务替代（文件方案的文件级防竞争不再需要）；仍保留按用户分批提交以缩小事务粒度。
+- **写入并发**：由数据库唯一约束+事务承担；按用户分批提交以缩小事务粒度。
 - **每日聚合任务（跨用户）**：orphan_topic 观察区晋升/废弃（§8.2）、pending_clarifications 过期清理（§11）、降级扫描（90 天无强化且 conf<0.7，以 last_reinforced_at 计）、degraded→archived（180 天无任何更新）、复核队列超期废弃、（taxonomy 变更时）回归样例执行。
+- **澄清回流关联仅作用于 conversation 事件**：收到 conversation 消息时先查 pending_clarifications（§11）；text 事件不参与澄清关联。
 
 ### 成本模型
 
@@ -444,7 +450,7 @@ taxonomy 回归样例随版本变更必跑（§7），反例（转述、敏感�
 
 | # | 接口 | 消费方 | 用途 |
 |---|---|---|---|
-| 1 | `POST /events/conversation` | 对话平台 | 对话轮上报（管线唯一入口），异步处理 |
+| 1 | `POST /events` | 任意文本/对话平台 | 统一事件上报（管线唯一入口），异步处理；event_type=conversation（对话轮）或 text（任意文本） |
 | 2 | `GET /profile/{source}/{native_id}` | 任意 LLM 应用 | 每轮对话前装配画像包 |
 | 3 | `GET /review/queue` / `POST /review/{entry_id}/verdict` | 人工复核 | 待复核列表与判定（approve/discard/fix），写 review_history |
 | 4 | `DELETE /profile/{source}/{native_id}` | 运营/合规 | 用户删除权：删条目行 + tombstones 表留痕 |
@@ -454,15 +460,30 @@ taxonomy 回归样例随版本变更必跑（§7），反例（转述、敏感�
 请求/响应核心 schema：
 
 ```jsonc
-// POST /events/conversation → 202 Accepted；幂等键 session+turn，重复返回 200 {"deduplicated": true}
+// POST /events → 202 Accepted；幂等键 source+event_id，重复返回 200 {"deduplicated": true}
+// event_type = "conversation"：对话轮上报
 {
-  "source": "webchat",
-  "user_ref": "u_1024",
+  "source": "webchat",            // 来源平台标识
+  "user_ref": "u_1024",           // 该平台内的用户标识
+  "event_id": "evt_01HXYZ...",    // 上报方唯一事件 id（缺省时服务端 hash 兜底）
+  "event_type": "conversation",
   "session_id": "s_20261123_001",
   "turn": 12,
   "ts": "2026-11-23T10:00:00+08:00",
   "messages": [{"role": "user", "text": "..."}, {"role": "assistant", "text": "..."}],
   "feedback": [{"kind": "dislike|regenerate|edit|interrupt", "turn": 11, "detail": "..."}]
+}
+
+// event_type = "text"：任意文本素材（文档/笔记/邮件/工单/评论等），单条 ≤8K 字符，超出分块上报
+{
+  "source": "docs",
+  "user_ref": "u_1024",
+  "event_id": "evt_01HXYZ...",
+  "event_type": "text",
+  "ts": "2026-11-24T09:00:00+08:00",
+  "content": "……",               // 任意文本；整段默认为用户域，归属校验见 §10
+  "title": "可选的上下文说明",     // 如 "用户本周的技术笔记"
+  "origin_ref": "doc_42"          // 可选; 证据链定位引用, 缺省用 event_id
 }
 
 // GET /profile/{source}/{native_id}?budget=2000&dimensions=taboo,preference&include_profile=false
@@ -475,14 +496,14 @@ taxonomy 回归样例随版本变更必跑（§7），反例（转述、敏感�
 }
 ```
 
-语义约定：上报异步化（抽取决策管线内完成，上报方零等待）；装配同步，延迟预算 P99 <50ms（SQL 查询+词面匹配；向量召回模式下含一次嵌入服务往返，预算放宽至 P99 <200ms）；`include_profile=false` 时 `entries=[]` 其余照常（A/B 对照组等价请求）；tombstone 用户装配返回空包，删除动作写入 tombstones 表（何时删、谁请求）但内容不留，画像数据按用户要求清除、原始对话仍在日志平台。
+语义约定：上报异步化（抽取决策管线内完成，上报方零等待）；幂等键 source+event_id，event_id 由上报方唯一提供、缺省服务端 hash 兜底；装配同步，延迟预算 P99 <50ms（SQL 查询+词面匹配；向量召回模式下含一次嵌入服务往返，预算放宽至 P99 <200ms）；`include_profile=false` 时 `entries=[]` 其余照常（A/B 对照组等价请求）；tombstone 用户装配返回空包，删除动作写入 tombstones 表（何时删、谁请求）但内容不留，画像数据按用户要求清除、原始对话仍在日志平台。
 
 ## 17. 消费与部署边界
 
 - 画像系统只提供装配 API 与注入模板；prompt 组装格式、澄清插话决策、A/B 切流均属消费方。
 - 冷启动（新用户画像为空）是预期行为；可选的 3 条 onboarding 声明引导属产品层，系统层不做。
 - 部署前提：日志平台保留原始对话 ≥180 天（画像灾难恢复的最终兜底，§0 原则 1）。
-- 技术栈：Python 3.12 + FastAPI（webhook 与装配 API 同进程）、LLM SDK 结构化输出、SQLite（sqlite-vec）为唯一存储依赖（§20）。
+- 技术栈：Python 3.12 + FastAPI（事件上报与装配 API 同进程）、LLM SDK 结构化输出、SQLite（sqlite-vec）为唯一存储依赖（§20）。
 
 ## 18. 瘦身决策记录（每项带回归触发条件）
 
@@ -536,4 +557,4 @@ embedding:
 
 ## 21. 评审后修复与决策变更记录
 
-设计经多轮评审收敛：第一轮 10 条不足（成本触发、锚定效应、key 归一化、词面匹配、可靠性、合规、预算语义等）全部合入；第二轮 15 条（4 P0：注入载体、写竞争、taboo 积压、回放矛盾；5 P1：闭环缺失；6 P2：取舍写明）全部合入；第三轮 YAGNI 瘦身见 §18。第四轮决策变更（2026-11-23）：clarification_needed 澄清回流恢复为初版实现（§11、§14）；orphan_topic 两段式晋升恢复为初版实现（§6、§8、§10）；新增 SQLite 索引层与外部嵌入服务配置化（§20）。第五轮决策变更（2026-11-23）：**存储翻转——SQLite 升级为唯一真相源（§20），md 降为导出视图（§8.2）**；连带修订：条目+证据+向量同事务（双写一致性消除）、`events_seen` 幂等表（§18-7 关闭）、per-user 文件锁被唯一约束替代、降级链与备份策略重写（§0 原则 4、§13）、导出接口新增（§16-5）、md 模板章节改为导出视图模板（§9）。第六轮复审（2026-11-23，针对存储翻转）：修复 entries 主键缺 scope 导致跨作用域同 topic 冲突的 schema bug；补 `last_reinforced_at`（降级判定依据）与 `pending_clarifications`（澄清回流关联+TTL）两表；声明删除权与备份滞留（≤30 天）的合规边界；sources 改自增主键；澄清"180 天无引用"为"无任何更新"；多实例演进与服务端数据库迁移联动。
+设计经多轮评审收敛：第一轮 10 条不足（成本触发、锚定效应、key 归一化、词面匹配、可靠性、合规、预算语义等）全部合入；第二轮 15 条（4 P0：注入载体、写竞争、taboo 积压、回放矛盾；5 P1：闭环缺失；6 P2：取舍写明）全部合入；第三轮 YAGNI 瘦身见 §18。第四轮决策变更（2026-11-23）：clarification_needed 澄清回流恢复为初版实现（§11、§14）；orphan_topic 两段式晋升恢复为初版实现（§6、§8、§10）；新增 SQLite 索引层与外部嵌入服务配置化（§20）。第五轮决策变更（2026-11-23）：**存储翻转——SQLite 升级为唯一真相源（§20），md 降为导出视图（§8.2）**；连带修订：条目+证据+向量同事务（双写一致性消除）、`events_seen` 幂等表（§18-7 关闭）、per-user 文件锁被唯一约束替代、降级链与备份策略重写（§0 原则 4、§13）、导出接口新增（§16-5）、md 模板章节改为导出视图模板（§9）。第六轮复审（2026-11-23，针对存储翻转）：修复 entries 主键缺 scope 导致跨作用域同 topic 冲突的 schema bug；补 `last_reinforced_at`（降级判定依据）与 `pending_clarifications`（澄清回流关联+TTL）两表；声明删除权与备份滞留（≤30 天）的合规边界；sources 改自增主键；澄清"180 天无引用"为"无任何更新"；多实例演进与服务端数据库迁移联动。第七轮扩展（2026-11-24）：**素材泛化——接收任意形式文本，不限于 LLM 会话**；统一事件入口 `POST /events`（event_type: conversation|text），幂等键改 `source+event_id`；conversation 仅 user 角色为用户域证据，text 整段为用户域但归属校验更严（引用/转述他人不作画像）；text 直接进抽取（置信度闸门兜底）、单条 ≤8K 字符；证据链定位字段泛化为 origin_type/origin_ref（§8.1）；澄清回流关联仅作用于 conversation 事件。

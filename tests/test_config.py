@@ -2,7 +2,7 @@
 import textwrap
 from pathlib import Path
 
-from mem.config import load_settings
+from pismor.core.config import load_settings
 
 _FULL_YAML = textwrap.dedent("""
     db_path: ./data/index.db

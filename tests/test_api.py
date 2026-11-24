@@ -5,12 +5,12 @@ import json
 import pytest
 from fastapi.testclient import TestClient
 
-from mem.api import create_app
-from mem.config import EmbeddingSettings, LLMSettings, Settings
-from mem.backup import backup
-from mem.db import get_conn, init_schema
-from mem.pipeline import run_pipeline
-from mem.trigger import build_explicit_re, should_extract
+from pismor.serving.api import create_app
+from pismor.core.config import EmbeddingSettings, LLMSettings, Settings
+from pismor.serving.backup import backup
+from pismor.core.db import get_conn, init_schema
+from pismor.pipeline.runner import run_pipeline
+from pismor.pipeline.trigger import build_explicit_re, should_extract
 
 REPO = Path(__file__).resolve().parent.parent
 NOW = "2026-11-24T10:00:00+08:00"
@@ -403,7 +403,7 @@ def test_orphan_candidate_review_approve_to_observation(client, conn, fake_llm, 
         "SELECT status, topic_new, degraded_reason FROM entries"
         " WHERE id='orphan_手工模型'").fetchone()
     assert row["status"] == "orphan_topic" and row["topic_new"] == "手工模型"
-    from mem.aggregator import run_daily
+    from pismor.pipeline.aggregator import run_daily
     stats = run_daily(conn, taxonomy, fake_llm, False, "2026-12-24T00:00:00+00:00")
     still = conn.execute(
         "SELECT status FROM entries WHERE id='orphan_手工模型'").fetchone()
@@ -521,12 +521,12 @@ def test_pending_review_does_not_block_evolution(client, conn, fake_llm):
 def test_illegal_transition_isolated_not_batch_rollback(conn, fake_settings, taxonomy,
                                                         embedder_stub):
     # I-2：单条非法迁移隔离留痕，其余候选照常落库
-    from mem import pipeline
+    from pismor.pipeline import runner
     _seed_entry(conn, "preference", "old", "global", "archived", "旧", "旧", 0.9, now=NOW)
     good = {"op": "ADD", "candidate": dict(EXPLICIT_CAND)}
     bad = {"op": "UPDATE", "candidate": dict(EXPLICIT_CAND, topic="old"),
            "target": ("preference", "old", "global")}
-    applied = pipeline._apply(conn, "webchat", "u1", [good, bad], embedder_stub,
+    applied = runner._apply(conn, "webchat", "u1", [good, bad], embedder_stub,
                               "text", "evt_iso", NOW)
     assert [a["op"] for a in applied] == ["ADD"]
     assert conn.execute("SELECT COUNT(*) c FROM entries WHERE topic='lang'").fetchone()["c"] == 1
@@ -539,7 +539,7 @@ def test_illegal_transition_isolated_not_batch_rollback(conn, fake_settings, tax
 
 def test_invalid_scope_candidate_fallback_kept(conn, fake_settings, fake_llm, embedder_stub, taxonomy):
     # 第八轮修复：非法 scope 不再整条静默丢弃，出口回落 default_scope 并置信打 8 折
-    from mem.pipeline import run_pipeline
+    from pismor.pipeline.runner import run_pipeline
     bad = dict(EXPLICIT_CAND, scope="../../etc")
     fake_llm.by_name["extract_candidates"] = [{"candidates": [bad]}]
     run_pipeline(conn, fake_settings, dict(CONV_EVENT, event_id="evt_scope"),
@@ -642,9 +642,9 @@ def test_settle_pair_never_degrades_taboo_side(conn):
     # 澄清收敛只处理 preference 侧；taboo 恒胜，不得被单侧降级逻辑误伤
     _seed_entry(conn, "taboo", "tool", "global", "active", "不要用 vim", "禁 vim", 0.95)
     _seed_entry(conn, "preference", "tool", "global", "active", "用 vim", "用 vim", 0.9)
-    from mem import pipeline
+    from pismor.pipeline import runner
     rows = conn.execute("SELECT * FROM entries").fetchall()
-    pipeline._settle_pair(conn, "webchat", "u1", rows,
+    runner._settle_pair(conn, "webchat", "u1", rows,
                           {("preference", "tool", "global")}, NOW)
     taboo = conn.execute("SELECT status FROM entries WHERE dimension='taboo'").fetchone()
     assert taboo["status"] == "active"

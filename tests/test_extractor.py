@@ -1,5 +1,5 @@
-from mem.extractor import extract
-from mem.gate import gate
+from pismor.pipeline.extractor import extract
+from pismor.pipeline.gate import gate
 
 
 class FakeLLM:
@@ -114,7 +114,7 @@ def test_off_vocab_topic_becomes_orphan(taxonomy):
 
 def test_taboo_off_vocab_topic_forced_to_review(taxonomy):
     # C-3：taboo 维度词表外主题只进人工队列，禁止自动建桶
-    from mem.gate import gate
+    from pismor.pipeline.gate import gate
     llm = FakeLLM([{"candidates": [{"dimension": "taboo", "topic": "invented",
         "scope": "global", "body": "不要使用某工具", "summary": "禁用某工具",
         "confidence": 0.95, "kind": "explicit", "quote": "别再让我用那个工具",

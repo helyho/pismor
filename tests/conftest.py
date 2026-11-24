@@ -1,7 +1,7 @@
 from pathlib import Path
 import pytest
-from mem.db import get_conn, init_schema
-from mem.taxonomy import load_taxonomy
+from pismor.core.db import get_conn, init_schema
+from pismor.core.taxonomy import load_taxonomy
 
 REPO = Path(__file__).resolve().parent.parent
 

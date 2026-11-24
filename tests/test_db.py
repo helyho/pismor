@@ -1,6 +1,6 @@
 import sqlite3
 
-from mem.db import get_conn, init_schema
+from pismor.core.db import get_conn, init_schema
 
 
 def test_schema_tables(conn):

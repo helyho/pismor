@@ -20,10 +20,10 @@ _REPO = Path(__file__).resolve().parents[1]
 if str(_REPO / "src") not in sys.path:
     sys.path.insert(0, str(_REPO / "src"))
 
-from mem import extractor, gate  # noqa: E402
-from mem.config import load_settings  # noqa: E402
-from mem.llm import LLMClient  # noqa: E402
-from mem.taxonomy import load_taxonomy  # noqa: E402
+from pismor.pipeline import extractor, gate  # noqa: E402
+from pismor.core.config import load_settings  # noqa: E402
+from pismor.llm.client import LLMClient  # noqa: E402
+from pismor.core.taxonomy import load_taxonomy  # noqa: E402
 
 
 class ExpectReplayLLM:

@@ -14,8 +14,8 @@
 - LLM 判互斥 → 走既有 CONFLICT 双存：'+' 变形行 + conflict_with 互标 {id}@{scope}，
   装配 clarification_needed 与复核队列按标记配对（机制零新增）。
 """
-from mem.keys import valid_scope
-from mem.prompts import NEIGHBOR_SYSTEM, NEIGHBOR_USER, RESOLVE_SYSTEM, RESOLVE_USER
+from pismor.core.keys import valid_scope
+from pismor.llm.prompts import NEIGHBOR_SYSTEM, NEIGHBOR_USER, RESOLVE_SYSTEM, RESOLVE_USER
 
 # decision 枚举无 ADD：无新证据的 ADD 已在 existing 判断分流，不进入 LLM
 RESOLVE_SCHEMA = {

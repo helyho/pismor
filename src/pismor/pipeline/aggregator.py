@@ -16,7 +16,7 @@
 """
 import yaml
 
-from mem.prompts import ORPHAN_MERGE_SYSTEM, ORPHAN_MERGE_USER
+from pismor.llm.prompts import ORPHAN_MERGE_SYSTEM, ORPHAN_MERGE_USER
 
 _MERGE_SCHEMA = {
     "name": "orphan_merge_verdict",
@@ -42,7 +42,7 @@ def run_daily(conn, taxonomy, llm, auto_promote: bool, now: str, *,
         stats["demoted"] = _demote(conn, now, degrade_days, degrade_confidence)
         stats["archived"] = _archive(conn, now)
         stats["dropped_review"] = _drop_expired_reviews(conn, now)
-        from mem.clarifier import expire
+        from pismor.pipeline.clarifier import expire
         stats["expired_clarifications"] = expire(conn, now)
     return stats
 

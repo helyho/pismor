@@ -17,9 +17,9 @@ from urllib.parse import unquote
 
 import yaml
 
-from mem.taxonomy import load_taxonomy
+from pismor.core.taxonomy import load_taxonomy
 
-_REPO = Path(__file__).resolve().parents[2]  # editable/repo 布局下 config/ 在包仓根
+_REPO = Path(__file__).resolve().parents[3]  # editable/repo 布局下 config/ 在包仓根（src/pismor/serving/ 上溯三级）
 # 修复轮② Critical：scope 由 LLM 抽取产出、上游无格式校验，projects/{name}.md 的
 # name 必须过白名单（字母数字下划线中文连字符，禁 / \ .. 空白点号），不匹配跳过该
 # 文件并记入 export-warnings.txt

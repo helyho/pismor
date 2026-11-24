@@ -3,7 +3,7 @@ import sqlite3
 from typing import Annotated
 
 from pydantic import Field, TypeAdapter, ValidationError
-from mem.schemas import EventIn, resolve_event_id
+from pismor.core.schemas import EventIn, resolve_event_id
 
 adapter = TypeAdapter(EventIn)
 

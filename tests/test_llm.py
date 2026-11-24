@@ -5,9 +5,9 @@ import httpx
 import pytest
 import respx
 
-from mem.gate import gate
-from mem.llm import LLMClient
-from mem.config import LLMSettings
+from pismor.pipeline.gate import gate
+from pismor.llm.client import LLMClient
+from pismor.core.config import LLMSettings
 
 
 @respx.mock

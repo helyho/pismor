@@ -7,6 +7,6 @@ def test_load_taxonomy(taxonomy):
 
 def test_missing_file_raises(tmp_path):
     import pytest
-    from mem.taxonomy import load_taxonomy
+    from pismor.core.taxonomy import load_taxonomy
     with pytest.raises(FileNotFoundError):
         load_taxonomy(tmp_path / "nope.yaml")

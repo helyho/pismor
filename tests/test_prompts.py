@@ -12,10 +12,10 @@ from types import SimpleNamespace
 
 import pytest
 
-from mem import extractor, resolver
-from mem.keys import valid_scope
-from mem.prompts import EXTRACT_CONVERSATION, EXTRACT_TEXT
-from mem.writer import _insert_entry
+from pismor.pipeline import extractor, resolver
+from pismor.core.keys import valid_scope
+from pismor.llm.prompts import EXTRACT_CONVERSATION, EXTRACT_TEXT
+from pismor.pipeline.writer import _insert_entry
 
 
 class CaptureLLM:

@@ -4,9 +4,9 @@ import sqlite3
 
 import pytest
 
-from mem.assembler import assemble
-from mem.embedder import EmbedUnavailable
-from mem.keys import vec_key
+from pismor.serving.assembler import assemble
+from pismor.llm.embedder import EmbedUnavailable
+from pismor.core.keys import vec_key
 
 NOW = "2026-11-20T00:00:00+00:00"
 

@@ -6,7 +6,7 @@ import time
 
 import httpx
 
-from mem.config import LLMSettings
+from pismor.core.config import LLMSettings
 
 logger = logging.getLogger("mem.llm")
 

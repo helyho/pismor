@@ -3,7 +3,7 @@ import json
 
 import pytest
 
-from mem.clarifier import consume, expire, issue, match_incoming
+from pismor.pipeline.clarifier import consume, expire, issue, match_incoming
 
 
 class ScriptedLLM:

@@ -1,7 +1,7 @@
 import pytest
 from pydantic import ValidationError
 
-from mem.intake import intake_event
+from pismor.pipeline.intake import intake_event
 
 CONV = {"source": "webchat", "user_ref": "u1", "event_id": "e1", "event_type": "conversation",
         "session_id": "s1", "turn": 1, "ts": "2026-11-24T10:00:00+08:00",

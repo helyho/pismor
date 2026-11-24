@@ -3,9 +3,9 @@ import importlib.util
 import shutil
 from pathlib import Path
 
-from mem.config import EmbeddingSettings, LLMSettings, Settings
-from mem.db import get_conn, init_schema
-from mem.taxonomy import load_taxonomy
+from pismor.core.config import EmbeddingSettings, LLMSettings, Settings
+from pismor.core.db import get_conn, init_schema
+from pismor.core.taxonomy import load_taxonomy
 
 REPO = Path(__file__).resolve().parent.parent
 NOW = "2026-12-24T10:00:00+08:00"

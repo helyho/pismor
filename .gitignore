@@ -10,5 +10,6 @@ exports/
 nohup.out
 *.log
 .codegraph/
-bb_test/
+integration/
 config/settings.yaml
+integration/settings.yaml

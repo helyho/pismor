@@ -13,8 +13,8 @@ orphan 候选额外带 status="orphan_topic"（dimension 占位 "orphan"）。
 import logging
 import re
 
-from mem.keys import valid_scope
-from mem.prompts import (CLARIFY_EXTRACT_SYSTEM, CLARIFY_EXTRACT_USER,
+from pismor.core.keys import valid_scope
+from pismor.llm.prompts import (CLARIFY_EXTRACT_SYSTEM, CLARIFY_EXTRACT_USER,
                          EXTRACT_CONVERSATION, EXTRACT_TEXT, INSTRUCTION_RE, MAX_BODY)
 
 logger = logging.getLogger("mem.extractor")

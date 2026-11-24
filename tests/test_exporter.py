@@ -2,7 +2,7 @@
 pending/archive 归宿、轨迹行证据键（裸 id 例外）、只读。"""
 import pytest
 
-from mem.exporter import export
+from pismor.serving.exporter import export
 
 NOW = "2026-11-24T00:00:00+08:00"
 

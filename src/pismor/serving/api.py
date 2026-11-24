@@ -17,13 +17,14 @@ from fastapi import BackgroundTasks, FastAPI, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ValidationError
 
-from mem import assembler, exporter, intake, writer
-from mem.config import Settings
-from mem.db import get_conn, init_schema
-from mem.embedder import Embedder
-from mem.llm import LLMClient
-from mem.pipeline import run_pipeline
-from mem.taxonomy import load_taxonomy
+from pismor.pipeline import intake, writer
+from pismor.serving import assembler, exporter
+from pismor.core.config import Settings
+from pismor.core.db import get_conn, init_schema
+from pismor.llm.embedder import Embedder
+from pismor.llm.client import LLMClient
+from pismor.pipeline.runner import run_pipeline
+from pismor.core.taxonomy import load_taxonomy
 
 logger = logging.getLogger("mem.api")
 

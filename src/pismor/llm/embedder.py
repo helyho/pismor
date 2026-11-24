@@ -3,7 +3,7 @@ import os
 
 import httpx
 
-from mem.config import EmbeddingSettings
+from pismor.core.config import EmbeddingSettings
 
 
 class EmbedUnavailable(Exception):

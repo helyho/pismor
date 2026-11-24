@@ -4,8 +4,8 @@ import httpx
 import pytest
 import respx
 
-from mem.embedder import EmbedUnavailable, Embedder
-from mem.config import EmbeddingSettings
+from pismor.llm.embedder import EmbedUnavailable, Embedder
+from pismor.core.config import EmbeddingSettings
 
 
 @respx.mock

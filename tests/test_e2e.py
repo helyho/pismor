@@ -12,9 +12,9 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
-from mem.api import create_app
-from mem.config import EmbeddingSettings, LLMSettings, Settings
-from mem.db import get_conn, init_schema
+from pismor.serving.api import create_app
+from pismor.core.config import EmbeddingSettings, LLMSettings, Settings
+from pismor.core.db import get_conn, init_schema
 
 REPO = Path(__file__).resolve().parent.parent
 NOW = "2026-11-24T10:00:00+08:00"

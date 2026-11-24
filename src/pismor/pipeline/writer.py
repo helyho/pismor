@@ -19,8 +19,8 @@ import json
 import logging
 import sqlite3
 
-from mem.embedder import EmbedUnavailable
-from mem.keys import mark, split_mark, valid_scope, vec_key
+from pismor.llm.embedder import EmbedUnavailable
+from pismor.core.keys import mark, split_mark, valid_scope, vec_key
 
 logger = logging.getLogger("mem.writer")
 

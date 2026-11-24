@@ -8,8 +8,8 @@ from pathlib import Path
 
 import pytest
 
-from mem.aggregator import run_daily
-from mem.taxonomy import load_taxonomy
+from pismor.pipeline.aggregator import run_daily
+from pismor.core.taxonomy import load_taxonomy
 
 REPO = Path(__file__).resolve().parent.parent
 NOW = "2026-12-24T10:00:00+08:00"

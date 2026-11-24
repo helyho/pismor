@@ -1,7 +1,7 @@
 """四路决策器测试：ADD/UPDATE/CONFLICT/NOOP 判定 + ORPHAN 透传 + taboo 恒胜复合场景。"""
 import pytest
 
-from mem.resolver import resolve
+from pismor.pipeline.resolver import resolve
 
 
 def cand(dimension, topic, scope, body="新候选正文", **kw):

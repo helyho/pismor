@@ -9,14 +9,14 @@ from pathlib import Path
 
 import uvicorn
 
-from mem.aggregator import run_daily
-from mem.api import create_app
-from mem.audit import isolate_violations, run_audit
-from mem.backup import backup
-from mem.config import load_settings
-from mem.db import get_conn
-from mem.llm import LLMClient
-from mem.taxonomy import load_taxonomy
+from pismor.pipeline.aggregator import run_daily
+from pismor.serving.api import create_app
+from pismor.serving.audit import isolate_violations, run_audit
+from pismor.serving.backup import backup
+from pismor.core.config import load_settings
+from pismor.core.db import get_conn
+from pismor.llm.client import LLMClient
+from pismor.core.taxonomy import load_taxonomy
 
 _RUN_INTERVAL_DEFAULT = 86400.0  # 默认日批间隔；settings.serve.daily_interval_seconds 可覆盖
 

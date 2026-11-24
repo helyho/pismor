@@ -3,9 +3,9 @@ import json
 
 import pytest
 
-from mem.embedder import EmbedUnavailable
-from mem.keys import mark, vec_key
-from mem.writer import IllegalTransition, apply_actions
+from pismor.llm.embedder import EmbedUnavailable
+from pismor.core.keys import mark, vec_key
+from pismor.pipeline.writer import IllegalTransition, apply_actions
 
 NOW = "2026-11-24T00:00:00+08:00"
 
@@ -337,8 +337,8 @@ def _seed_row(conn, *, dim="preference", topic="lang", scope="global", status="a
 
 def test_resolve_conflicts_exact_mark_scope_and_status(conn):
     # M-2/M-3：只清精确 (id,scope) 的存活行标记；archived 轨迹行与近似 id 行不得被改写
-    from mem.keys import mark
-    from mem.writer import resolve_conflicts
+    from pismor.core.keys import mark
+    from pismor.pipeline.writer import resolve_conflicts
     _seed_row(conn, topic="styleX", scope="global",
               conflict_with=json.dumps([mark("preference_styleX", "global")]))
     _seed_row(conn, topic="styleold", scope="global", status="archived",
@@ -356,8 +356,8 @@ def test_resolve_conflicts_exact_mark_scope_and_status(conn):
 
 def test_cross_scope_conflict_marks_do_not_cross(conn):
     # 同 id 跨 scope：global 的冲突收尾不得清 project:x 的标记
-    from mem.keys import mark
-    from mem.writer import resolve_conflicts
+    from pismor.core.keys import mark
+    from pismor.pipeline.writer import resolve_conflicts
     _seed_row(conn, topic="lang", scope="global",
               conflict_with=json.dumps([mark("preference_style", "project:x")]))
     _seed_row(conn, topic="lang", scope="project:x",
@@ -370,7 +370,7 @@ def test_cross_scope_conflict_marks_do_not_cross(conn):
 
 def test_normal_update_does_not_revive_opponent(conn):
     # M-1：普通演进 UPDATE 只清 conflict_with，不复活冲突对方
-    from mem.keys import mark
+    from pismor.core.keys import mark
     _seed_row(conn, topic="lang", scope="global",
               conflict_with=json.dumps([mark("preference_+lang", "global")]))
     _seed_row(conn, topic="+lang", scope="global", status="degraded",

@@ -15,7 +15,7 @@ run_audit 只读；隔离动作由 isolate_violations 显式执行（spec §6 �
 import json
 import re
 
-from mem.prompts import INSTRUCTION_RE
+from pismor.llm.prompts import INSTRUCTION_RE
 
 _ALIVE = ("active", "degraded")  # 存活状态（恒胜/并存判定的范围）
 _NEGATION_RE = re.compile(r"不|别|禁|勿|拒绝|无需|避免|没有")

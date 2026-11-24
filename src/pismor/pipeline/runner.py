@@ -17,13 +17,14 @@ import logging
 import sqlite3
 from datetime import datetime, timezone
 
-from mem import assembler, clarifier, extractor, gate, resolver, trigger, writer
-from mem.config import Settings
-from mem.embedder import Embedder
-from mem.keys import mark, split_mark, valid_scope
-from mem.llm import LLMClient
-from mem.schemas import canonical_hash
-from mem.taxonomy import load_taxonomy
+from pismor.pipeline import clarifier, extractor, gate, resolver, trigger, writer
+from pismor.serving import assembler
+from pismor.core.config import Settings
+from pismor.llm.embedder import Embedder
+from pismor.core.keys import mark, split_mark, valid_scope
+from pismor.llm.client import LLMClient
+from pismor.core.schemas import canonical_hash
+from pismor.core.taxonomy import load_taxonomy
 
 logger = logging.getLogger("mem.pipeline")
 

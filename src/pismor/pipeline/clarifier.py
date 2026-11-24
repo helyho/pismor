@@ -9,8 +9,8 @@ julianday 差值计算，issued_at 存 UTC ISO。
 import json
 from datetime import datetime, timezone
 
-from mem.keys import canonical_ids
-from mem.prompts import CLARIFY_CHECK_SYSTEM, CLARIFY_CHECK_USER
+from pismor.core.keys import canonical_ids
+from pismor.llm.prompts import CLARIFY_CHECK_SYSTEM, CLARIFY_CHECK_USER
 
 QUESTION_TMPL = '你之前提过"{s_a}"，也提过"{s_b}"——日常对话里以哪种为准？'
 

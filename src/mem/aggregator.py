@@ -5,8 +5,9 @@
   （orphan_topic/active/degraded/pending_review）都不命中；'+' 冲突行落 degraded/active，同理不命中。
 - 时间统一以注入 now 参数与 SQLite julianday 混算：julianday 对带时区后缀（+08:00）与
   纯日期的 ISO 字符串均归一到 UTC，混算安全——tests/test_aggregator.py 边界用例钉死。
-- orphan 聚合按裁决字面：GROUP BY topic_new；COUNT>=3 且 MIN(created_at)>=now-30d → 归并判定；
-  COUNT<3 且 MIN<now-30d → 物理删除（taboo 组除外，只进人工队列）。
+- orphan 聚合（30 天窗口统一口径，修复轮 1 裁决）：GROUP BY topic_new；窗口内（created_at
+  >= now-30d）行数 >=3 → 归并判定；窗口内零行 → 整组物理删除（taboo 组除外，只进人工队列）；
+  窗口内 1~2 行 → 保留等复现。
 - 归并判定 LLM 输出 {action: merge_to|new_topic, dimension, topic}；merge_to 直接 re-key 转
   active（dimension/topic 按 LLM 指定、清 topic_new、id 与 sources.entry_id 同步跟随）；
   new_topic 且 auto_promote → 追加 taxonomy.yaml topics + 自动生成回归样例（PyYAML 整体重
@@ -46,24 +47,16 @@ def run_daily(conn, taxonomy, llm, auto_promote: bool, now: str) -> dict:
 
 
 def _fetch_groups(conn, now):
-    """观察区分组：晋升判定组（达门槛且窗口内）与废弃组（未达门槛且超期）。"""
-    promote, drop = [], []
+    """观察区分组（30 天窗口统一口径）：窗口内行数>=3 → 晋升判定；窗口内零行 → 整组废弃；
+    窗口内 1~2 行 → 保留等复现（消除"COUNT>=3 且 MIN 超窗"的滞留不变集）。"""
     rows = conn.execute(
-        "SELECT topic_new, COUNT(*) AS cnt, MIN(created_at) AS min_created"
+        "SELECT topic_new,"
+        " SUM(CASE WHEN julianday(created_at) >= julianday(?) - 30 THEN 1 ELSE 0 END) AS recent"
         " FROM entries WHERE status='orphan_topic' AND topic_new IS NOT NULL"
-        " GROUP BY topic_new").fetchall()
-    for r in rows:
-        in_window = conn.execute(
-            "SELECT 1 WHERE julianday(?) - julianday(?) <= 30", (now, r["min_created"])).fetchone()
-        (promote if in_window else drop).append(r["topic_new"])
-    return [g for g in promote if _group_size(conn, g) >= 3], \
-           [g for g in drop if _group_size(conn, g) < 3]
-
-
-def _group_size(conn, topic_new):
-    return conn.execute(
-        "SELECT COUNT(*) c FROM entries WHERE status='orphan_topic' AND topic_new=?",
-        (topic_new,)).fetchone()["c"]
+        " GROUP BY topic_new", (now,)).fetchall()
+    promote = [r["topic_new"] for r in rows if r["recent"] >= 3]
+    drop = [r["topic_new"] for r in rows if r["recent"] == 0]
+    return promote, drop
 
 
 def _group_rows(conn, topic_new):

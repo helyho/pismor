@@ -48,9 +48,9 @@ def _entry(conn, *, us="w", uid="u1", dim="preference", topic="orphan", scope="g
 
 
 def _seed_orphans(conn, topic_new="回复要简短", n=3, dim="preference",
-                  created="2026-12-10T09:00:00+08:00"):
+                  created="2026-12-10T09:00:00+08:00", uid_base=1):
     for i in range(n):
-        _entry(conn, uid=f"u{i + 1}", dim=dim, topic_new=topic_new, created=created)
+        _entry(conn, uid=f"u{uid_base + i}", dim=dim, topic_new=topic_new, created=created)
     return conn
 
 
@@ -195,6 +195,24 @@ def test_orphan_fresh_below_threshold_kept(conn, seeded_orphans_fresh_2, taxonom
     stats = run_daily(conn, taxonomy, fake_llm_merge, auto_promote=True, now=NOW)
     assert stats["promoted"] == 0 and stats["dropped_orphan"] == 0  # 观察中
     assert conn.execute("SELECT COUNT(*) c FROM entries WHERE status='orphan_topic'").fetchone()["c"] == 2
+
+
+def test_orphan_old_group_dropped(conn, taxonomy, fake_llm_merge):
+    # 3 行全部超 30 天：窗口内零行 → 整组废弃（不再滞留观察区）
+    _seed_orphans(conn, n=3, created="2026-10-01T09:00:00+08:00")
+    stats = run_daily(conn, taxonomy, fake_llm_merge, auto_promote=True, now=NOW)
+    assert stats["promoted"] == 0 and stats["dropped_orphan"] == 3
+    assert conn.execute("SELECT COUNT(*) c FROM entries").fetchone()["c"] == 0
+
+
+def test_orphan_stale_majority_group_kept(conn, taxonomy, fake_llm_merge):
+    # 3 行中仅 1 行在窗口内：窗口口径计数 1 < 3 且未归零 → 保留等复现
+    _seed_orphans(conn, n=2, created="2026-10-01T09:00:00+08:00")
+    _seed_orphans(conn, n=1, uid_base=9)
+    stats = run_daily(conn, taxonomy, fake_llm_merge, auto_promote=True, now=NOW)
+    assert stats["promoted"] == 0 and stats["dropped_orphan"] == 0
+    c = conn.execute("SELECT COUNT(*) c FROM entries WHERE status='orphan_topic'").fetchone()["c"]
+    assert c == 3
 
 
 def test_taboo_orphan_never_auto_promote(conn, seeded_taboo_orphan, taxonomy, fake_llm_merge):

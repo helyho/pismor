@@ -11,6 +11,8 @@ class Dimension:
     default_scope: str
     topics: list[str]
     guidance: str
+    sensitive: bool | str = False
+    topic_overrides: dict = None
 
 @dataclass(frozen=True)
 class Taxonomy:
@@ -28,6 +30,7 @@ def load_taxonomy(path: Path) -> Taxonomy:
         dims[d["key"]] = Dimension(
             key=d["key"], name=d["name"], file=d["file"], priority=d["priority"],
             default_scope=d["default_scope"], topics=d["topics"], guidance=d["guidance"],
+            sensitive=d.get("sensitive", False), topic_overrides=d.get("topic_overrides"),
         )
     return Taxonomy(meta=raw.get("meta", {}), dimensions=dims,
                     invariants=raw.get("invariants", []), regression_cases=raw.get("regression_cases", []))

@@ -113,6 +113,25 @@ def test_update_archives_old(conn, embedder_stub, seeded_active):
     assert cur["last_reinforced_at"] == NOW and cur["superseded_by"] is None
 
 
+def test_update_copies_sources_to_superseded_row(conn, embedder_stub, seeded_active):
+    # spec §12：archived 条目保留全部字段与证据链——轨迹行复制旧行全部 sources
+    conn.executemany(
+        "INSERT INTO sources (entry_id,user_source,user_id,origin_type,origin_ref,quote,kind)"
+        " VALUES ('preference_lang','w','u',?,?,'旧证据','explicit')",
+        [("conversation", "s1:1"), ("text", "doc:2")])
+    conn.commit()
+    apply_actions(conn, "w", "u", [update_action("preference", "lang", "global")],
+                  embedder_stub, "text", "e1", NOW)
+    sup_srcs = conn.execute(
+        "SELECT * FROM sources WHERE entry_id='preference_~lang' ORDER BY origin_ref").fetchall()
+    assert [(s["origin_type"], s["origin_ref"], s["quote"]) for s in sup_srcs] == \
+        [("text", "doc:2", "旧证据"), ("conversation", "s1:1", "旧证据")]
+    cur_srcs = conn.execute(
+        "SELECT * FROM sources WHERE entry_id='preference_lang'").fetchall()
+    assert [(s["origin_type"], s["origin_ref"], s["quote"]) for s in cur_srcs] == \
+        [("text", "e1", "用户原话")]  # 新 active 行携带新证据
+
+
 def test_conflict_symmetric(conn, embedder_stub, seeded_active):
     apply_actions(conn, "w", "u", [conflict_action("preference", "lang", "global")],
                   embedder_stub, "text", "e1", NOW)

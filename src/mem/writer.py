@@ -122,6 +122,11 @@ def _update(conn, us, uid, c, target, now, origin_type, origin_ref, vectors):
         "created_at,?,last_reinforced_at,'superseded',?,topic_new,conflict_with,reinforcements,? "
         "FROM entries WHERE user_source=? AND user_id=? AND dimension=? AND topic=? AND scope=?",
         (f"~{t}", f"{d}_~{t}", now, f"{d}_{t}", now, us, uid, d, t, s))
+    # 旧行证据链转移给轨迹行（spec §12：archived 条目保留全部字段与证据链）；
+    # 原 key 行刷新为新值，只保留新证据，旧证据不得混挂
+    conn.execute(
+        "UPDATE sources SET entry_id=? WHERE user_source=? AND user_id=? AND entry_id=?",
+        (f"{d}_~{t}", us, uid, f"{d}_{t}"))
     # 原行同 key 覆盖新值（bi-temporal 旧值由轨迹行承载）
     conn.execute(
         "UPDATE entries SET body=?,summary=?,confidence=?,status='active',degraded_reason=NULL,"

@@ -212,6 +212,7 @@ CREATE TABLE entries (
   confidence REAL NOT NULL,
   status TEXT NOT NULL,          -- pending_review|orphan_topic|active|degraded|archived
   body TEXT NOT NULL,            -- 一句话正文 ≤200 字符
+  summary TEXT NOT NULL,         -- 摘要 ≤20 字符（装配词面匹配与导出索引用，抽取器一并产出）
   created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
   last_reinforced_at TEXT NOT NULL,  -- 降级判定依据: "N天无强化"以此计, 区别于 updated_at(任何变更都刷新)
   degraded_reason TEXT, superseded_by TEXT, topic_new TEXT,

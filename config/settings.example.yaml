@@ -46,6 +46,27 @@ pipeline:
   reinforce_top_k: 20             # 无变化轮话题强化条数上限
   trigger_long_message: 300       # 消息长度突变阈值（字符）
   max_body_chars: 200             # 候选 body 截断长度
+  # explicit 触发词表：命中任一关键词的消息零阈值直通抽取（中英文）。
+  # 缺省即下方默认词表；可整体替换（如仅中文场景），或追加业务自定义词。
+  trigger_explicit_keywords:
+    - "记住"                      # 记住我喜欢深色主题
+    - "以后"                      # 以后都用 Python
+    - "别再"                      # 别再给我推广告
+    - "不要"                      # 不要在回复里加 emoji
+    - "默认"                      # 默认用浅色主题
+    - "总是"                      # 总是把表格转成脚本
+    - "永远"                      # 永远不要用那个工具
+    - "remember"                  # remember that I prefer dark mode
+    - "remember that"
+    - "from now on"               # from now on use Python 3.12
+    - "always"                    # always answer in English
+    - "never"                     # never use tabs for indentation
+    - "stop"                      # stop generating Excel formulas
+    - "don't"                     # don't add emoji in replies
+    - "do not"                    # do not use that tool
+    - "prefer"                    # I prefer concise answers
+    - "keep in mind"              # keep in mind I'm in UTC+8
+    - "going forward"             # going forward, use formal tone
 
 aggregator:
   degrade_days: 90                # 无强化天数超过此值参与降级

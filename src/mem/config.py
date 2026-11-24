@@ -1,5 +1,6 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from pathlib import Path
+import typing
 import yaml
 
 @dataclass(frozen=True)
@@ -36,6 +37,12 @@ class PipelineSettings:
     reinforce_top_k: int = 20       # 无变化轮话题强化条数上限
     trigger_long_message: int = 300 # 消息长度突变阈值（字符）
     max_body_chars: int = 200       # 候选 body 截断长度
+    # explicit 触发词表：默认覆盖中英文声明关键词；yaml 可整体替换或追加自定义词
+    trigger_explicit_keywords: tuple[str, ...] = (
+        "记住", "以后", "别再", "不要", "默认", "总是", "永远",
+        "remember", "remember that", "from now on", "always", "never",
+        "stop", "don't", "do not", "prefer", "keep in mind", "going forward",
+    )
 
 @dataclass(frozen=True)
 class AggregatorSettings:
@@ -78,8 +85,15 @@ class Settings:
 
 
 def _section(raw: dict, name: str, cls):
-    """yaml 段缺省时用 dataclass 全默认值；段内字段缺省时用各自默认（向后兼容旧配置）。"""
-    return cls(**(raw.get(name) or {}))
+    """yaml 段缺省时用 dataclass 全默认值；段内字段缺省时用各自默认（向后兼容旧配置）。
+
+    yaml 列表自动转 tuple 注解字段的 tuple，保证与默认值类型一致（如词表）。"""
+    kwargs = dict(raw.get(name) or {})
+    for f in fields(cls):
+        v = kwargs.get(f.name)
+        if isinstance(v, list) and typing.get_origin(f.type) is tuple:
+            kwargs[f.name] = tuple(v)
+    return cls(**kwargs)
 
 
 def load_settings(path: Path) -> Settings:

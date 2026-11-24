@@ -10,7 +10,7 @@ from mem.config import EmbeddingSettings, LLMSettings, Settings
 from mem.backup import backup
 from mem.db import get_conn, init_schema
 from mem.pipeline import run_pipeline
-from mem.trigger import should_extract
+from mem.trigger import build_explicit_re, should_extract
 
 REPO = Path(__file__).resolve().parent.parent
 NOW = "2026-11-24T10:00:00+08:00"
@@ -290,6 +290,29 @@ def test_trigger_grading_rules():
                           True) == (True, "feedback")
     assert should_extract({"messages": [{"role": "user", "text": "长" * 301}]},
                           True) == (True, "long_message")
+
+
+def test_trigger_explicit_keywords_english_default():
+    # 默认词表含英文声明关键词；普通英文句子不误触发
+    en = [{"role": "user", "text": "Remember that I prefer dark mode"}]
+    assert should_extract({"messages": en}, True) == (True, "explicit")
+    assert should_extract({"messages": [{"role": "user", "text": "From now on use Python"}]},
+                          True) == (True, "explicit")
+    # 词边界保护：含 "stop" 子串的普通词不命中
+    assert should_extract({"messages": [{"role": "user", "text": "the stopwatch works"}]},
+                          True) == (False, "no_change")
+
+
+def test_trigger_explicit_keywords_custom_vocab():
+    # 自定义词表生效：仅命中配置词；词表为空则 explicit 规则关闭
+    custom = should_extract(
+        {"messages": [{"role": "user", "text": "请固定用简体中文回复"}]}, True,
+        explicit_re=build_explicit_re(["固定", "固定用"]))
+    assert custom == (True, "explicit")
+    empty = should_extract(
+        {"messages": [{"role": "user", "text": "别再给我推广告"}]}, True,
+        explicit_re=build_explicit_re([]))
+    assert empty == (False, "no_change")
 
 
 def _seed_conflict_pair(conn):

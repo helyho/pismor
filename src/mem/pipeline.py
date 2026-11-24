@@ -67,7 +67,9 @@ def _run(conn, settings: Settings, event, taxonomy, llm, embedder) -> None:
                 return
         do_extract, reason = trigger.should_extract(
             event, has_history=bool(known_ids),
-            long_message=settings.pipeline.trigger_long_message)
+            long_message=settings.pipeline.trigger_long_message,
+            explicit_re=trigger.build_explicit_re(
+                settings.pipeline.trigger_explicit_keywords))
         if not do_extract:
             # spec §10：无变化轮次按话题词面命中累加强化，不调 LLM（M-7）
             n = _reinforce(conn, us, uid, text, now,

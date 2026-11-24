@@ -32,6 +32,7 @@ _FULL_YAML = textwrap.dedent("""
       reinforce_top_k: 10
       trigger_long_message: 500
       max_body_chars: 150
+      trigger_explicit_keywords: ["记住", "remember", "prefer"]
     aggregator:
       degrade_days: 30
       degrade_confidence: 0.8
@@ -73,6 +74,7 @@ def test_load_settings_reads_all_sections(tmp_path: Path):
     assert (s.gate.auto_min, s.gate.review_min, s.gate.inferred_cap) == (0.9, 0.5, 0.75)
     assert (s.pipeline.known_ids_limit, s.pipeline.reinforce_top_k) == (100, 10)
     assert (s.pipeline.trigger_long_message, s.pipeline.max_body_chars) == (500, 150)
+    assert s.pipeline.trigger_explicit_keywords == ("记住", "remember", "prefer")
     assert (s.aggregator.degrade_days, s.aggregator.degrade_confidence) == (30, 0.8)
     assert (s.assembler.taboo_budget_share, s.assembler.related_top_k) == (0.5, 5)
     assert (s.assembler.half_life_days, s.assembler.clarify_ttl_days) == (7, 3)
@@ -86,6 +88,8 @@ def test_load_settings_defaults_without_new_sections(tmp_path: Path):
     s = load_settings(tmp_path / "settings.yaml")
     assert s.llm.timeout_seconds == 120 and s.llm.retries == 1
     assert s.gate.auto_min == 0.85 and s.pipeline.known_ids_limit == 200
+    assert "记住" in s.pipeline.trigger_explicit_keywords  # 默认词表含中文
+    assert "remember" in s.pipeline.trigger_explicit_keywords  # 默认词表含英文
     assert s.aggregator.degrade_days == 90 and s.assembler.related_top_k == 20
     assert s.intake.max_content_chars == 8192 and s.backup.keep == 30
     assert s.serve.daily_interval_seconds == 86400.0

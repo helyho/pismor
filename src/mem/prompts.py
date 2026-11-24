@@ -24,3 +24,18 @@ EXTRACT_TEXT = """你是画像抽取器。以下为用户产出的文本素材�
 维度词表：{dimension_block}
 已存在条目：{known_ids}
 素材：{content}"""
+
+RESOLVE_SYSTEM = """你是画像条目决策器，比较同 (topic, scope) 的旧条目与新候选，输出单一 decision：
+- UPDATE（演进）：新证据补充、推进或修正旧值的具体内容；
+- CONFLICT（矛盾）：新证据与旧值同 scope 同 topic 互斥且无法用上下文解释；
+- NOOP（重复）：新候选未带来旧条目之外的信息。
+taboo 与 preference 同主题互斥时 taboo 恒胜：taboo 侧必须 UPDATE，与 taboo 相撞的 preference 侧必须 CONFLICT。
+decision 只能取 UPDATE|CONFLICT|NOOP；新增条目（库中无同 key 条目）不进入本判定，已在调用前分流。"""
+
+RESOLVE_USER = """旧条目（维度 {old_dim}，主题 {topic}，作用域 {scope}）：
+{old}
+
+新候选（维度 {new_dim}）：
+{new}
+
+同主题 taboo 条目：{taboo}"""

@@ -74,7 +74,8 @@ def test_section_layout(tmp_path, conn, seeded):
     yaml_part = block.split("---\n", 2)[1]
     keys = [ln.split(":")[0] for ln in yaml_part.splitlines() if ln and not ln.startswith((" ", "-"))]
     assert keys == ["id", "dimension", "scope", "confidence", "status", "created_at",
-                    "updated_at", "sources", "degraded_reason", "superseded_by"]
+                    "updated_at", "sources", "reinforcements", "degraded_reason",
+                    "superseded_by"]
     assert "quote: 用户原话" in yaml_part and "kind: explicit" in yaml_part
     assert yaml_part.rstrip().endswith("superseded_by: null")
     assert text.rstrip().endswith("表格类结果不用 Excel 公式")
@@ -103,6 +104,17 @@ def test_index_rows(tmp_path, conn, seeded, seeded_orphan):
     assert len(rows) == 6  # 表头 + 4 条 seeded + 1 条 orphan
     joined = "\n".join(rows)
     assert "preference_~lang:" in joined and "archive.md" in joined
+
+
+def test_project_scope_split(tmp_path, conn, seeded):
+    """修复轮①：scope=project:{name} 分流 projects/{name}.md，不混入 shell.md。"""
+    seed(conn, "preference", "tool", scope="project:alpha", body="alpha 项目用 pnpm",
+         summary="alpha 用 pnpm")
+    root = export(conn, "w", "u1", tmp_path)
+    proj = (root / "projects" / "alpha.md").read_text(encoding="utf-8")
+    assert "## [preference_tool]" in proj and "alpha 项目用 pnpm" in proj
+    assert "preference_tool" not in (root / "shell.md").read_text(encoding="utf-8")
+    assert "| preference_tool |" in (root / "_index.md").read_text(encoding="utf-8")
 
 
 def test_export_readonly(tmp_path, conn, seeded):

@@ -15,7 +15,8 @@ from mem.taxonomy import load_taxonomy
 
 _REPO = Path(__file__).resolve().parents[2]  # editable/repo 布局下 config/ 在包仓根
 _SECTION_KEYS = ("id", "dimension", "scope", "confidence", "status",
-                 "created_at", "updated_at", "sources", "degraded_reason", "superseded_by")
+                 "created_at", "updated_at", "sources", "reinforcements",
+                 "degraded_reason", "superseded_by")
 
 
 def export(conn, user_source, user_id, out_root: Path) -> Path:
@@ -52,8 +53,12 @@ def export(conn, user_source, user_id, out_root: Path) -> Path:
         elif r["status"] in ("pending_review", "orphan_topic"):
             fname = "pending.md"
         else:  # 未知维度兜底 shell.md，保证导出视图不丢行（库是真相源）
-            fname = (taxonomy.dimensions[r["dimension"]].file
-                     if r["dimension"] in taxonomy.dimensions else "shell.md")
+            if r["scope"].startswith("project:"):  # 修复轮①：project 作用域按项目分文件
+                fname = f"projects/{r['scope'].split(':', 1)[1]}.md"
+            elif r["dimension"] in taxonomy.dimensions:
+                fname = taxonomy.dimensions[r["dimension"]].file
+            else:
+                fname = "shell.md"
         files.setdefault(fname, [])
         files[fname].append(_section(r, sources))
         files.setdefault("_index.md", [])
@@ -70,7 +75,9 @@ def export(conn, user_source, user_id, out_root: Path) -> Path:
             title = " / ".join(file_titles.get(fname, [fallback]))
             content = (_header(fname, title, user_source, user_id)
                        + "\n".join(sections) + ("\n" if sections else ""))
-        (root / fname).write_text(content, encoding="utf-8")
+        path = root / fname
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
     return root
 
 

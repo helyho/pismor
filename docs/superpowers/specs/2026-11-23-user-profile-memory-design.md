@@ -227,7 +227,7 @@ CREATE TABLE sources (          -- 证据链 1:N，无 quote 入库被写入器�
   origin_type TEXT NOT NULL,    -- conversation | text
   origin_ref TEXT NOT NULL,     -- 定位引用: 对话="session:turn"; 文本=event_id
   quote TEXT NOT NULL, kind TEXT NOT NULL,
-  FOREIGN KEY (entry_id, user_source, user_id) REFERENCES entries(user_source, user_id, dimension, topic, scope)
+  -- 引用完整性由写入器在同一事务内保证（对 5 列复合主键的 FK 在 SQLite 不可行，撤销于第六轮复审后）
 );
 CREATE TABLE pending_clarifications (  -- 已发出的澄清问题, 供回流关联(§11)
   user_source TEXT, user_id TEXT,

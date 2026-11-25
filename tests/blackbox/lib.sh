@@ -6,10 +6,11 @@
 BLACKBOX_DB="./data/index.db"
 
 # http METHOD PATH [JSON_BODY] → 设置全局 $STATUS / $BODY
+# --max-time 兜底：服务卡死时不让整个套件无限挂起
 http() {
   local method="$1" path="$2" body="${3-}" tmp
   tmp=$(mktemp)
-  local args=(-s -X "$method" -o "$tmp" -w '%{http_code}' "http://127.0.0.1:${PORT}${path}")
+  local args=(-s --max-time 150 --connect-timeout 5 -X "$method" -o "$tmp" -w '%{http_code}' "http://127.0.0.1:${PORT}${path}")
   [[ -n "$body" ]] && args+=(-H 'Content-Type: application/json' -d "$body")
   STATUS=$(curl "${args[@]}")
   BODY=$(cat "$tmp")
@@ -75,24 +76,27 @@ bb_event() {
 
 # promote_active <user> <dimension>：条目停在 pending_review 时走 verdict approve
 # 使其生效（产品正常路径：待复核条目不进包）。已是 active/degraded 直接返回 0。
+# user_id 不是唯一键（PK 含 user_source），故查询都带 user_source；scope 一并锁定
 promote_active() {
-  local uid="$1" dim="$2" st eid ver scope
-  st=$(db "SELECT status FROM entries WHERE user_id='${uid}' AND dimension='${dim}' ORDER BY rowid DESC LIMIT 1")
+  local uid="$1" dim="$2" st eid= ver= scope=
+  st=$(db "SELECT status FROM entries WHERE user_source='bb' AND user_id='${uid}' AND dimension='${dim}' ORDER BY rowid DESC LIMIT 1")
   [[ "$st" == "active" || "$st" == "degraded" ]] && return 0
-  eid=$(db "SELECT id FROM entries WHERE user_id='${uid}' AND dimension='${dim}' ORDER BY rowid DESC LIMIT 1")
-  [[ -n "$eid" ]] || { printf '    promote_active: 未找到 %s/%s 条目\n' "$uid" "$dim"; return 1; }
-  ver=$(db "SELECT updated_at FROM entries WHERE user_source='bb' AND user_id='${uid}' AND id='${eid}' ORDER BY rowid DESC LIMIT 1")
-  scope=$(db "SELECT scope FROM entries WHERE user_source='bb' AND user_id='${uid}' AND id='${eid}' ORDER BY rowid DESC LIMIT 1")
+  IFS='|' read -r eid scope ver <<<"$(db "SELECT id || '|' || scope || '|' || updated_at FROM entries WHERE user_source='bb' AND user_id='${uid}' AND dimension='${dim}' ORDER BY rowid DESC LIMIT 1")"
+  [[ -n "$eid" && -n "$scope" && -n "$ver" ]] || { printf '    promote_active: 未找到 %s/%s 条目\n' "$uid" "$dim"; return 1; }
   http POST "/review/bb/${uid}/${scope}/${eid}/verdict" \
     "$(jq -n --arg verdict approve --arg v "$ver" '{verdict:$verdict, entry_version:$v}')"
   expect_status 200 || return 1
-  wait_db "SELECT 1 FROM entries WHERE user_id='${uid}' AND dimension='${dim}' AND status IN ('active','degraded')" 20
+  expect_json '.noop' 'false' || return 1
+  wait_db "SELECT 1 FROM entries WHERE user_source='bb' AND user_id='${uid}' AND id='${eid}' AND scope='${scope}' AND status IN ('active','degraded')" 30
 }
 
 case_pass() { return 0; }
+
+# case_fail：立即终止本用例（run_case 在子 shell 捕获非 0 退出码）。
+# 必须 exit 而非 return——用例函数末尾的 case_pass 会把 return 码吞成 0。
 case_fail() { # case_fail <说明>
   printf '    %s\n' "$*"
-  return 1
+  exit 1
 }
 
 # run_case <id> <名称> [--retry] -- <fn>

@@ -13,13 +13,14 @@ t8() {
   case_pass
 }
 # T9 taboo 入包（LLM）：taxonomy 回归样例，taboo 排包首位
+# 响应条目只有 {id,text,confidence,status}，维度经 id 前缀（dimension_topic）识别
 t9() {
   need_llm || return 2
   local ev; ev=$(next_event_id t9e)
   http POST /events "$(bb_event t9u "$ev" "别再给我生成 Excel 公式了, 用 Python")"
   expect_status 202 || return 1
   wait_db "SELECT 1 FROM entries e WHERE e.user_id='t9u' AND e.dimension='taboo'" 90 \
-    || { case_fail "90s 内 taboo 条目未入库"; return 1; }
+    || { case_fail "90s 内 taboo 条目未入库"; }
   promote_active t9u taboo || return 1
   http GET /profile/bb/t9u
   expect_status 200 || return 1
@@ -34,7 +35,7 @@ t10() {
   http POST /events "$(bb_event t10u "$ev" "我是一名后端工程师")"
   expect_status 202 || return 1
   wait_db "SELECT 1 FROM entries e WHERE e.user_id='t10u' AND e.dimension='identity'" 90 \
-    || { case_fail "90s 内 identity 条目未入库"; return 1; }
+    || { case_fail "90s 内 identity 条目未入库"; }
   promote_active t10u identity || return 1
   http GET /profile/bb/t10u
   expect_status 200 || return 1
@@ -48,7 +49,7 @@ t11() {
   http POST /events "$(bb_event t11u "$ev" "记住, 我自己的小脚本默认都用 Python 写")"
   expect_status 202 || return 1
   wait_db "SELECT 1 FROM entries e WHERE e.user_id='t11u' AND e.dimension='preference'" 90 \
-    || { case_fail "90s 内条目未入库"; return 1; }
+    || { case_fail "90s 内条目未入库"; }
   # 无 query 的包只含必带集(taboo+identity)；preference 经 query 召回验证在包
   http GET "/profile/bb/t11u?query=python"
   expect_status 200 || return 1
@@ -76,8 +77,9 @@ t12() {
   http GET "/profile/bb/t12u?query=python"
   expect_status 200 || return 1
   expect_json '.entries | length > 0' 'true' || return 1
-  expect_json '[.entries[] | select((tojson | test("python|lang"; "i")))] | length > 0' 'true' \
-    || case_fail "query=python 未召回落 Python 相关条目"
+  # 命中条目正文（.text）而非 id——id 形如 preference_lang 会自命中"lang"造成同义反复
+  expect_json '[.entries[] | select(.text | test("python"; "i"))] | length > 0' 'true' \
+    || { case_fail "query=python 未召回正文含 Python 的条目"; }
   case_pass
 }
 run_domain_assemble() {

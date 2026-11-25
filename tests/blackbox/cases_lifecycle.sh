@@ -9,50 +9,65 @@ t13() {
   e2=$(next_event_id t13b)
   http POST /events "$(bb_event t13u "$e1" "以后都用 Python 3.12 写脚本")"
   expect_status 202 || return 1
-  wait_db "SELECT 1 FROM entries e WHERE e.user_id='t13u'" 90 || { case_fail "第一条 90s 未入库"; }
+  wait_db "SELECT 1 FROM entries e WHERE e.user_id='t13u'" 120 \
+    || { case_fail "第一条 120s 未入库"; }
   http POST /events "$(bb_event t13u "$e2" "以后别用 Python 了, 改用 Rust")"
   expect_status 202 || return 1
-  wait_db "SELECT 1 FROM events_seen WHERE event_id='$e2'" 30 || { case_fail "第二条未被接受"; }
-  sleep 45 # 第二条管线宽限：LLM 处理 + 矛盾消解均属后台任务
-  local n
-  n=$(db "SELECT count(*) FROM entries e WHERE e.user_id='t13u' AND e.topic='lang' AND e.status='active'")
-  if [[ "$n" -gt 1 ]]; then
-    case_fail "lang 主题 active 条目 ${n} 条，矛盾未收敛"
+  # 第二条的管线完成信号用 sources 行（extract 落库），而不是 events_seen（同步写、不代表处理完）
+  if ! wait_db "SELECT 1 FROM sources WHERE user_source='bb' AND user_id='t13u' AND origin_ref='blackbox:$e2'" 120; then
+    sleep 20 # 第二条可能被判重复/免提问：给收敛留时间后仍按性质断言
   fi
+  # 轮询收敛（最多 60s）：active lang 条目至多 1 条
+  local waited=0 n=99
+  while ((waited < 60)); do
+    n=$(db "SELECT count(*) FROM entries WHERE user_source='bb' AND user_id='t13u' AND topic='lang' AND status='active'")
+    [[ "$n" -le 1 ]] && break
+    sleep 2
+    waited=$((waited + 2))
+  done
+  [[ "$n" -le 1 ]] || { case_fail "lang 主题 active 条目 ${n} 条，矛盾未收敛"; }
   http GET /profile/bb/t13u
   expect_status 200 || return 1
   case_pass
 }
 # T14 verdict 流转（LLM 建数据，流转本身确定）：approve→旧版本 noop→discard 行消失
+# user 每次 attempt 唯一（retry 重跑不污染 review_history 计数）
 t14() {
   need_llm || return 2
-  local ev; ev=$(next_event_id t14e)
-  http POST /events "$(bb_event t14u "$ev" "记住, 我自己的小脚本默认都用 Python 写")"
+  local uid="t14u${RANDOM}" ev; ev=$(next_event_id t14e)
+  http POST /events "$(bb_event "$uid" "$ev" "记住, 我自己的小脚本默认都用 Python 写")"
   expect_status 202 || return 1
-  wait_db "SELECT 1 FROM entries e WHERE e.user_id='t14u' AND e.dimension='preference' AND e.topic='lang'" 90 \
-    || { case_fail "90s 内条目未入库"; return 1; }
+  wait_db "SELECT 1 FROM entries e WHERE e.user_source='bb' AND e.user_id='${uid}' AND e.dimension='preference' AND e.topic='lang'" 120 \
+    || { case_fail "120s 内条目未入库"; }
   local entry_id ver ver2 scope
-  entry_id=$(db "SELECT id FROM entries WHERE user_source='bb' AND user_id='t14u' AND topic='lang' ORDER BY rowid DESC LIMIT 1")
-  [[ -n "$entry_id" ]] || { case_fail "未取到 entry_id"; return 1; }
-  ver=$(db "SELECT updated_at FROM entries WHERE user_source='bb' AND user_id='t14u' AND id='${entry_id}' ORDER BY rowid DESC LIMIT 1")
-  scope=$(db "SELECT scope FROM entries WHERE user_source='bb' AND user_id='t14u' AND id='${entry_id}' ORDER BY rowid DESC LIMIT 1")
-  local vpath="/review/bb/t14u/${scope}/${entry_id}/verdict"
-  # approve：review_history +1，非 noop
+  entry_id=$(db "SELECT id FROM entries WHERE user_source='bb' AND user_id='${uid}' AND topic='lang' ORDER BY rowid DESC LIMIT 1")
+  [[ -n "$entry_id" ]] || { case_fail "未取到 entry_id"; }
+  scope=$(db "SELECT scope FROM entries WHERE user_source='bb' AND user_id='${uid}' AND id='${entry_id}' ORDER BY rowid DESC LIMIT 1")
+  ver=$(db "SELECT updated_at FROM entries WHERE user_source='bb' AND user_id='${uid}' AND id='${entry_id}' AND scope='${scope}' ORDER BY rowid DESC LIMIT 1")
+  [[ -n "$scope" && -n "$ver" ]] || { case_fail "未取到 scope/updated_at"; }
+  local vpath="/review/bb/${uid}/${scope}/${entry_id}/verdict"
+  # updated_at 是秒级：approve 前跨一秒，保证版本推进，"旧版本重发"才有 noop 语义
+  sleep 1
   http POST "$vpath" "$(jq -n --arg verdict approve --arg v "$ver" '{verdict:$verdict, entry_version:$v}')"
   expect_status 200 || return 1
   expect_json '.noop' 'false' || return 1
-  expect_db "SELECT count(*) FROM review_history WHERE user_source='bb' AND user_id='t14u' AND entry_id='${entry_id}'" "1" || return 1
+  expect_db "SELECT count(*) FROM review_history WHERE user_source='bb' AND user_id='${uid}' AND entry_id='${entry_id}'" "1" || return 1
   # 旧版本重发 → noop（版本失配保护）
   http POST "$vpath" "$(jq -n --arg verdict discard --arg v "$ver" '{verdict:$verdict, entry_version:$v}')"
   expect_status 200 || return 1
   expect_json_true '.noop' || return 1
-  # 新版本 discard → 该条目不再生效
-  ver2=$(db "SELECT updated_at FROM entries WHERE user_source='bb' AND user_id='t14u' AND id='${entry_id}' ORDER BY rowid DESC LIMIT 1")
-  [[ -n "$ver2" ]] || { case_fail "discard 前 entry 已消失"; return 1; }
+  # 新版本 discard → 该条目消失
+  ver2=$(db "SELECT updated_at FROM entries WHERE user_source='bb' AND user_id='${uid}' AND id='${entry_id}' AND scope='${scope}' ORDER BY rowid DESC LIMIT 1")
+  [[ -n "$ver2" ]] || { case_fail "discard 前 entry 已消失"; }
+  if [[ "$ver2" == "$ver" ]]; then
+    sleep 1
+    ver2=$(db "SELECT updated_at FROM entries WHERE user_source='bb' AND user_id='${uid}' AND id='${entry_id}' AND scope='${scope}' ORDER BY rowid DESC LIMIT 1")
+  fi
+  [[ "$ver2" != "$ver" ]] || { case_fail "approve 后 updated_at 未推进（版本轮转失效）"; }
   http POST "$vpath" "$(jq -n --arg verdict discard --arg v "$ver2" '{verdict:$verdict, entry_version:$v}')"
   expect_status 200 || return 1
   expect_json '.noop' 'false' || return 1
-  expect_db "SELECT count(*) FROM entries WHERE user_source='bb' AND user_id='t14u' AND id='${entry_id}'" "0" || return 1
+  expect_db "SELECT count(*) FROM entries WHERE user_source='bb' AND user_id='${uid}' AND id='${entry_id}'" "0" || return 1
   case_pass
 }
 # T15 复核队列结构：200、items 为数组、非空时键齐全

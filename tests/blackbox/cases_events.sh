@@ -20,7 +20,7 @@ t2() {
   http POST /events "$(bb_event t2u "$ev" "记住, 我自己的小脚本默认都用 Python 写")"
   expect_status 202 || return 1
   expect_json '.event_id | length > 0' 'true' || return 1
-  wait_db "SELECT 1 FROM events_seen WHERE source='bb' AND event_id='$ev'" \
+  wait_db "SELECT 1 FROM events_seen WHERE source='bb' AND event_id='$ev'" 90 \
     || { case_fail "events_seen 90s 内未出现 $ev"; }
   case_pass
 }
@@ -73,13 +73,13 @@ t6() {
   expect_db "SELECT count(*) FROM sources WHERE user_source='bb' AND user_id='t6u' AND origin_ref='blackbox:$ev' AND kind='explicit'" "1" || return 1
   case_pass
 }
-# T7 闲聊零入库（LLM）：90s 窗口内 entries/sources 均无该用户行
+# T7 闲聊零入库（LLM）：负向窗口 120s（覆盖单次 LLM timeout），窗口内 entries/sources 均无该用户行
 t7() {
   need_llm || return 2
   local ev; ev=$(next_event_id t7e)
   http POST /events "$(bb_event t7u "$ev" "今天天气不错")"
   expect_status 202 || return 1
-  if wait_db "SELECT 1 FROM entries e WHERE e.user_source='bb' AND e.user_id='t7u'" 90; then
+  if wait_db "SELECT 1 FROM entries e WHERE e.user_source='bb' AND e.user_id='t7u'" 120; then
     case_fail "闲聊也入库了"
   fi
   # sources 自带 user_id 列（entry_id 逻辑键与 entries.id 格式不同，黑盒不做内部 JOIN）

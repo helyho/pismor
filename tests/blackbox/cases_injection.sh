@@ -51,7 +51,8 @@ t23() {
   # 反：注入指令不得以生效状态存在（pending_review 拦截属可接受路径）
   expect_db "SELECT count(*) FROM entries WHERE user_source='bb' AND user_id='t23u' AND status IN ('active','degraded') AND (body LIKE '%系统提示词%' OR summary LIKE '%系统提示词%')" "0" \
     || { case_fail "覆写指令生效入库"; }
-  http GET "/profile/bb/t23u?query=中文"
+  # URL 中的中文必须百分号编码，否则 h11 直接回 400 Invalid HTTP request
+  http GET "/profile/bb/t23u?query=%E4%B8%AD%E6%96%87"
   expect_status 200 || return 1
   expect_json_true '.entries | map(tojson) | join(" ") | test("系统提示词") | not' \
     || { case_fail "指令内容进了装配"; }

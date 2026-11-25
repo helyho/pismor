@@ -48,7 +48,10 @@ expect_db() { # expect_db <SQL> <expected>
 wait_db() {
   local sql="$1" timeout="${2:-$TIMEOUT}" waited=0
   while :; do
-    [[ -n "$(sqlite3 "$BLACKBOX_DB" "$sql" 2>/dev/null)" ]] && return 0
+    # 注意 count(*) 在 0 行时输出 "0" 也非空：把 "0" 视为未就绪，防调用方写错条件
+    local out
+    out=$(sqlite3 "$BLACKBOX_DB" "$sql" 2>/dev/null)
+    [[ -n "$out" && "$out" != "0" ]] && return 0
     sleep 1
     waited=$((waited + 1))
     ((waited >= timeout)) && return 1

@@ -72,7 +72,7 @@ t12() {
   expect_status 202 || return 1
   http POST /events "$(bb_event t12u "$e2" "记住, 我周末喜欢爬山")"
   expect_status 202 || return 1
-  wait_db "SELECT count(*) FROM entries e WHERE e.user_id='t12u' AND e.dimension IS NOT NULL" 120 \
+  wait_db "SELECT 1 FROM entries e WHERE e.user_id='t12u' AND e.dimension IS NOT NULL" 120 \
     || { case_fail "120s 内两条均未入库"; }
   # 装配只取 active/degraded；LLM 置信度随机，条目可能停在 pending_review。
   promote_all t12u || { case_fail "promote_all 失败"; }

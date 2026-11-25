@@ -24,7 +24,6 @@ RESOLVE_SCHEMA = {
         "type": "object",
         "properties": {
             "decision": {"type": "string", "enum": ["UPDATE", "CONFLICT", "NOOP"]},
-            "target": {"type": "array", "items": {"type": "string"}},
             "reason": {"type": "string"},
         },
         "required": ["decision", "reason"],

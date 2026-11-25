@@ -56,7 +56,7 @@ def extract(ev: dict, taxonomy, llm, known_ids: list[str], *, max_body: int = MA
     ids_line = ", ".join(known_ids) if known_ids else "（无）"
     if ev.get("event_type") == "text":
         content = ev.get("content", "")
-        system = EXTRACT_TEXT.format(dimension_block=block, known_ids=ids_line, content=content)
+        system = EXTRACT_TEXT.format(dimension_block=block, known_ids=ids_line)
         user = content
     else:
         system = EXTRACT_CONVERSATION.format(dimension_block=block, known_ids=ids_line)
@@ -107,7 +107,11 @@ def _dimension_block(taxonomy) -> str:
         guidance = re.sub(r"\s+", " ", (d.guidance or "")).strip()
         if len(guidance) > 200:
             guidance = guidance[:200] + "…"
+        sensitive = sorted(t for t, o in (getattr(d, "topic_overrides", None) or {}).items()
+                           if o and o.get("sensitive"))
         lines.append(f"- {d.key}({d.name}): topics={', '.join(d.topics)}"
+                     + (f"；sensitive topics: {', '.join(sensitive)}（禁精确细节，仅概括）"
+                        if sensitive else "")
                      + (f"；判定要点：{guidance}" if guidance else ""))
     return "\n".join(lines)
 

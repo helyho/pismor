@@ -136,6 +136,16 @@ def test_instruction_body_flagged(seeded_instruction_body, taxonomy):
     assert rules(out) == {"instruction_pattern"}
 
 
+def test_instruction_pattern_spares_normal_text(conn, taxonomy):
+    # B：正则收窄后，真实用户表述不得再被误报为指令类条目
+    seed_entry(conn, dimension="preference", topic="tool",
+               body="我经常运行 docker 命令")
+    seed_entry(conn, dimension="preference", topic="style",
+               body="我习惯用 rm -rf 清理构建目录")
+    out = run_audit(conn, taxonomy)
+    assert "instruction_pattern" not in rules(out)
+
+
 def test_instruction_body_in_superseded_row_flagged(conn, taxonomy):
     # 指令扫描含 ~ 轨迹行（全表 body，无状态豁免）
     seed_entry(conn, topic="~lang:20261124T00:00:1", status="archived", archived_at=NOW,

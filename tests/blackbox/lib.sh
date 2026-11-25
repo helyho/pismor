@@ -90,6 +90,23 @@ promote_active() {
   wait_db "SELECT 1 FROM entries WHERE user_source='bb' AND user_id='${uid}' AND id='${eid}' AND scope='${scope}' AND status IN ('active','degraded')" 30
 }
 
+# promote_all <uid>：把该用户所有非生效条目逐条 approve。
+# 装配只取 status IN (active,degraded)，而 LLM 置信度会随机落在 pending_review；
+# 用例断言"能被召回"时用它消除随机性（不掩盖问题，只是把前置条件固定）。
+promote_all() {
+  local uid="$1" eid scope ver
+  while IFS='|' read -r eid scope ver; do
+    [[ -n "$eid" ]] || continue
+    http POST "/review/bb/${uid}/${scope}/${eid}/verdict" \
+      "$(jq -n --arg verdict approve --arg v "$ver" '{verdict:$verdict, entry_version:$v}')"
+    if [[ "$STATUS" != 200 ]]; then
+      printf '    promote_all: %s 复核返回 %s\n' "$eid" "$STATUS"
+      return 1
+    fi
+  done < <(db "SELECT id || '|' || scope || '|' || updated_at FROM entries WHERE user_source='bb' AND user_id='${uid}' AND status NOT IN ('active','degraded')")
+  return 0
+}
+
 case_pass() { return 0; }
 
 # case_fail：立即终止本用例（run_case 在子 shell 捕获非 0 退出码）。

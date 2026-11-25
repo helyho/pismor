@@ -74,6 +74,8 @@ t12() {
   expect_status 202 || return 1
   wait_db "SELECT count(*) FROM entries e WHERE e.user_id='t12u' AND e.dimension IS NOT NULL" 120 \
     || { case_fail "120s 内两条均未入库"; }
+  # 装配只取 active/degraded；LLM 置信度随机，条目可能停在 pending_review。
+  promote_all t12u || { case_fail "promote_all 失败"; }
   http GET "/profile/bb/t12u?query=python"
   expect_status 200 || return 1
   expect_json '.entries | length > 0' 'true' || return 1

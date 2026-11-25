@@ -61,6 +61,13 @@ need_llm() {
   return 2
 }
 
+# next_event_id <base>：进程内唯一 event_id（retry 重跑拿新 id，不撞产品幂等去重）
+_EVENT_ID_SEQ=0
+next_event_id() {
+  _EVENT_ID_SEQ=$((_EVENT_ID_SEQ + 1))
+  printf '%s-%s-%d' "$1" "$$" "$_EVENT_ID_SEQ"
+}
+
 # bb_event <user> <event_id> <content>：构造合法事件体（jq 负责转义）
 bb_event() {
   jq -n --arg u "$1" --arg e "$2" --arg c "$3" --arg t "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \

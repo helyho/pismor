@@ -72,10 +72,18 @@ t12() {
   expect_status 202 || return 1
   http POST /events "$(bb_event t12u "$e2" "记住, 我周末喜欢爬山")"
   expect_status 202 || return 1
-  wait_db "SELECT 1 FROM entries e WHERE e.user_id='t12u' AND e.dimension IS NOT NULL" 120 \
-    || { case_fail "120s 内两条均未入库"; }
+  # 等 Python 事件真正落库：sources 行由 origin_ref 唯一确定，不依赖 LLM 归类。
+  # 若只等"任意条目入库"，爬山事件先落库时会早退，promote 发生在 Python 条目写入前，
+  # 该条目随后以 pending_review 入库、装配取不到 → 历史间歇 FAIL 的根因。
+  wait_db "SELECT 1 FROM sources WHERE user_source='bb' AND user_id='t12u' AND origin_ref='blackbox:$e1'" 120 \
+    || { case_fail "120s 内 Python 事件未落库"; }
   # 装配只取 active/degraded；LLM 置信度随机，条目可能停在 pending_review。
-  promote_all t12u || { case_fail "promote_all 失败"; }
+  local i
+  for i in 1 2 3; do
+    promote_all t12u || { case_fail "promote_all 失败"; }
+    wait_db "SELECT 1 FROM entries e WHERE e.user_source='bb' AND e.user_id='t12u' AND e.status='active'" 15 \
+      && break
+  done
   http GET "/profile/bb/t12u?query=python"
   expect_status 200 || return 1
   expect_json '.entries | length > 0' 'true' || return 1

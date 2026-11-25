@@ -51,6 +51,16 @@ def test_batching_by_batch_size():
 
 
 @respx.mock
+def test_endpoint_with_trailing_embeddings_not_doubled():
+    # 配置允许直接写完整 URL（example 即如此）；不得再追加一段 /embeddings
+    route = respx.post("https://emb.test/v1/embeddings").respond(
+        json={"data": [{"embedding": [0.5]}]})
+    emb = Embedder(EmbeddingSettings(True, "https://emb.test/v1/embeddings", "m", "K", 1, 8))
+    assert emb.embed(["x"]) == [[0.5]]
+    assert route.call_count == 1
+
+
+@respx.mock
 def test_request_payload_and_missing_key():
     route = respx.post("https://emb.test/v1/embeddings").respond(
         json={"data": [{"embedding": [1.0]}]})

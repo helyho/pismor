@@ -13,7 +13,9 @@ class EmbedUnavailable(Exception):
 class Embedder:
     def __init__(self, settings: EmbeddingSettings):
         self._settings = settings
-        self._url = settings.endpoint.rstrip("/") + "/embeddings"
+        base = settings.endpoint.rstrip("/")
+        # endpoint 允许写 base（…/v1）或完整路径（…/v1/embeddings），两种都接受
+        self._url = base if base.endswith("/embeddings") else base + "/embeddings"
 
     def _headers(self) -> dict:
         headers = {"Content-Type": "application/json"}

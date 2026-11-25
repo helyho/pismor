@@ -4,7 +4,7 @@
 - 测试形态：bash + curl + jq + sqlite3，真实进程、真实 HTTP、真实 SQLite
 - 配置：`config/settings.example.yaml` 原样传入，无副本、无注入
 - 测试套件：`tests/blackbox/`（`run.sh` + `lib.sh` + 6 个用例域）
-- 提交范围：`0b4c7a1..67b7f15`（21 个提交，32 文件，+1583/−76；其中 `cddb7c0` 为并行完成的 FTS/BM25 检索升级，本套件在其之上验收）
+- 提交范围：`0b4c7a1..785214c`（25 个提交，46 文件，+1830/−236；其中 `cddb7c0` 为并行完成的 FTS/BM25 检索升级，本套件在其之上验收）
 - 报告日期：2026-11-25
 
 ## 1. 执行摘要
@@ -15,10 +15,10 @@
 | 真实 LLM 模式（向量召回开启） | **26/26 PASS，skipped 0，exit 0** |
 | 无密钥模式 | 9 PASS / 17 SKIP，exit 0 |
 | 可重复性 | 连续两次全量结果一致，`git status` 干净 |
-| 已修复缺陷 | 4 个（配置 1、产品代码 3：schema 注入、embedding 端点、召回阈值） |
-| 遗留风险 | 2 项产品行为需产品侧决策（删除权层级、`entries.id` 键格式） |
+| 已修复缺陷 | 6 个（配置 1、产品代码 3：schema 注入、embedding 端点、召回阈值；设计债 2：行键统一、删除后 intake 拦截） |
+| 遗留风险 | 无（原 2 项产品行为已按裁决修复） |
 
-结论：服务在“真实 LLM + example 配置”组合下的接入、装配、复核、导出、删除、注入防御、并发与容错链路全部可用；测试过程中发现的两处阻塞缺陷（画像**从未落库**）已定位并修复，修复后画像条目真实入库并可被装配召回。
+结论：服务在“真实 LLM + example 配置”组合下的接入、装配、复核、导出、删除、注入防御、并发与容错链路全部可用；测试过程中发现的两处阻塞缺陷（画像**从未落库**）已定位并修复，修复后画像条目真实入库并可被装配召回。两项原先需决策的产品行为（`entries.id` 键格式、删除权层级）经确认后已一并修复：行键统一为 `dimension_topic@scope`，删除用户在 intake 层即拦截。
 
 ## 2. 测试方法与边界
 
@@ -56,7 +56,7 @@ bash tests/blackbox/run.sh --only assemble,export --keep-data --port 18300
 | T3 | 幂等去重 | 同 `event_id` 二次 200/`deduplicated`，表中仅 1 行 | 否 | PASS |
 | T4 | 畸形事件 422 | 缺字段/非法类型 → 422 且不落库 | 否 | PASS |
 | T5 | content 超限 422 | 9000 字符 → 422 且不落库 | 否 | PASS |
-| T6 | explicit 直通入库 | `preference/lang/global` + `status=active` + `sources.kind=explicit` + `origin_ref` 可回溯 | 是 | PASS |
+| T6 | explicit 直通入库 | `preference/lang/global` + `status=active` + `sources.kind=explicit` + `origin_ref` 可回溯；`entries.id` 与 `sources.entry_id` 可直接 JOIN | 是 | PASS |
 | T7 | 闲聊零入库 | 无关内容 90s 后 `entries`/`sources` 无行 | 是 | PASS |
 
 ### 域 2 装配（`cases_assemble.sh`）
@@ -85,7 +85,7 @@ bash tests/blackbox/run.sh --only assemble,export --keep-data --port 18300
 | T17 | 导出生成 | `.root` 非空，目录存在且含 `.md`，内容含入库主题词 | 是 | PASS |
 | T18 | 导出确定性 | 连续两次导出文件内容逐字节一致 | 是 | PASS |
 | T19 | 删除权全链 | `tombstones` 落行（`requested_by='api'`）；`entries/sources/review_history/pending_clarifications` 该用户清空；导出目录删除；`/profile` 空包 | 是 | PASS |
-| T20 | tombstone 持续 | 删除后新事件不复活装配（`/profile` 仍空包） | 是 | PASS |
+| T20 | tombstone 持续 | 删除后再上报：intake 直接拦截，`entries`/`sources` 无新行，`/profile` 仍空包 | 是 | PASS |
 
 ### 域 5 注入防御（`cases_injection.sh`）
 
@@ -107,12 +107,12 @@ bash tests/blackbox/run.sh --only assemble,export --keep-data --port 18300
 
 | 运行 | 命令 | 结果 |
 |---|---|---|
-| final2_key | `LLM_API_KEY=... bash tests/blackbox/run.sh`（向量召回开启） | `passed 26/26 (skipped 0)`，exit 0 |
-| final2_nokey | `env -u LLM_API_KEY bash tests/blackbox/run.sh` | `passed 9/9 (skipped 17)`，exit 0 |
+| run_rowkey | `LLM_API_KEY=... bash tests/blackbox/run.sh`（行键统一 + 向量召回开启） | `passed 26/26 (skipped 0)`，exit 0 |
+| run_rowkey_nokey | `env -u LLM_API_KEY bash tests/blackbox/run.sh` | `passed 9/9 (skipped 17)`，exit 0 |
 | 幂等性 | 连续两次同模式全量 | 逐用例结果一致 |
 | 稳定性 | 域 2 单独连跑 3 次（T12 竞态修复后） | 5/5 PASS ×3 |
 | 向量召回 E2E | 单条 Python 画像，3 个相关 / 3 个无关 query | 相关（Python、编程语言）1 条；无关（天气预报、种番茄、股票）0 条 |
-| 单元层回归 | `.venv/bin/python -m pytest` | 279/279 通过 |
+| 单元层回归 | `.venv/bin/python -m pytest` | 282/282 通过 |
 
 ## 5. 发现与修复
 
@@ -137,13 +137,17 @@ bash tests/blackbox/run.sh --only assemble,export --keep-data --port 18300
 1. **端点重复拼接**：`Embedder` 无条件在 base 后拼 `/embeddings`，而 example 配置的 endpoint 已含 `/v1/embeddings`，请求落到 `/v1/embeddings/embeddings` 404，`EmbedUnavailable` 静默降级，`embeddings` 表恒空、语义 query 召回恒空。修复：幂等拼接（已以 `/embeddings` 结尾则不再追加，`886c10b`），并补单元测试防止回归。
 2. **召回无相似度下限**：`_vector_recall` 只按距离取 top-k，任意 query 都会返回条目（实测 Python 条目对“天气预报”cos=0.41、“股票行情”cos=0.39 仍被召回）。修复：新增 `embedding.min_similarity: 0.5`（`EmbeddingSettings` 字段 + example 配置），由 `_cos_to_l2` 换算成 L2 距离进 SQL 过滤（`ff304ae`）；低于阈值或向量不可用时回退词面 BM25。
 
-### 5.4 `entries.id` 与 `sources.entry_id` 键格式不一致（设计债，未修）
+### 5.4 `entries.id` 与 `sources.entry_id` 键格式不一致（设计债，已修）
 
-`entries.id` 形如 `preference_lang`，`sources.entry_id` 形如 `preference_lang@global`，两者**永不相等**，无法直接 JOIN。功能不受影响（各自可独立查询），但对外 API 使用者在做证据链追溯时会踩坑。测试已改为各表独立断言。
+原 `entries.id` 形如 `preference_lang`，`sources.entry_id` 形如 `preference_lang@global`，两者**永不相等**，无法直接 JOIN；审计、导出、复核等路径各自拼接格式，`exporter` 甚至用 `CASE` 弥合。
 
-### 5.5 删除权只在装配/导出层生效（产品行为，需决策）
+处置：新增 `core.keys.entry_key(dimension, topic, scope)`，`entries.id` 统一为行键 `dimension_topic@scope`，`sources.entry_id` 同值；`conflict_with`/澄清标记天然同形；`embeddings` 五元组键不变；旧库由 `init_schema` 幂等 `UPDATE` 迁移。JOIN 简化为 `s.entry_id = e.id`（`exporter`/`audit`/`assembler`/`review` 全部对齐），T6 增加 JOIN 一致性断言。过程中顺带修出 `runner._settle_pair` 的 `SELECT` 缺 `id` 列导致的静默事务回滚。
 
-`tombstones` 仅在 `assembler.py` 装配时检查。删除后 ingest/runner **不拦截**新事件：同一用户再次上报，`entries` 仍会写入新行，只是 `/profile` 与导出恒为空包。若“删除”应意味着数据不可再生成，需在 intake 层增加 tombstone 检查——属产品语义决策，测试按现行为断言（T20）。
+### 5.5 删除权只在装配/导出层生效（产品行为，已修）
+
+原 `tombstones` 仅在 `assembler.py` 装配时检查。删除后 ingest/runner **不拦截**新事件：同一用户再次上报，`entries` 仍会写入新行，只是 `/profile` 与导出恒为空包。
+
+处置：`runner._run` 入口先查 tombstone，命中即记录日志并返回，不再调用 LLM、不写任何表。T20 因此从“装配空包”加严为“intake 拦截：`entries`/`sources` 计数为 0 且 `/profile` 空包”；单测新增 `test_events_from_deleted_user_not_persisted`（202 但零落库、LLM 零调用）。
 
 ### 5.6 其它观测
 

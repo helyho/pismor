@@ -16,6 +16,7 @@
 """
 import yaml
 
+from pismor.core.keys import entry_key
 from pismor.llm.prompts import ORPHAN_MERGE_SYSTEM, ORPHAN_MERGE_USER
 
 _MERGE_SCHEMA = {
@@ -126,7 +127,7 @@ def _rekey(conn, rows, dim, topic, now):
     """整组 re-key 转正：dimension/topic 按 LLM 指定，id 与证据键同步跟随；目标键被占的行进人工队列。"""
     promoted = 0
     for r in rows:
-        new_id = f"{dim}_{topic}"
+        new_id = entry_key(dim, topic, r["scope"])
         exists = conn.execute(
             "SELECT 1 FROM entries WHERE user_source=? AND user_id=? AND dimension=?"
             " AND topic=? AND scope=?",
@@ -142,8 +143,7 @@ def _rekey(conn, rows, dim, topic, now):
              r["topic"], r["scope"]))
         conn.execute(
             "UPDATE sources SET entry_id=? WHERE user_source=? AND user_id=? AND entry_id=?",
-            (f"{new_id}@{r['scope']}", r["user_source"], r["user_id"],
-             f"{r['id']}@{r['scope']}"))
+            (new_id, r["user_source"], r["user_id"], r["id"]))
         promoted += 1
     return promoted
 
@@ -160,7 +160,7 @@ def _physically_drop(conn, rows):
     for r in rows:
         conn.execute(
             "DELETE FROM sources WHERE user_source=? AND user_id=? AND entry_id=?",
-            (r["user_source"], r["user_id"], f"{r['id']}@{r['scope']}"))
+            (r["user_source"], r["user_id"], r["id"]))
         conn.execute(
             "DELETE FROM entries WHERE user_source=? AND user_id=? AND dimension=?"
             " AND topic=? AND scope=?",

@@ -99,7 +99,7 @@ def wait_for_pipeline():
 
 def _seed_entry(conn, dim, topic, scope, status, body, summary, conf,
                 now=NOW, conflict_with=None, degraded_reason=None):
-    entry_id = f"{dim}_{topic}"
+    entry_id = f"{dim}_{topic}@{scope}"
     conn.execute(
         "INSERT INTO entries (user_source,user_id,dimension,topic,scope,id,confidence,status,"
         " body,summary,created_at,updated_at,last_reinforced_at,degraded_reason,conflict_with)"
@@ -109,7 +109,7 @@ def _seed_entry(conn, dim, topic, scope, status, body, summary, conf,
     conn.execute(
         "INSERT INTO sources (entry_id,user_source,user_id,origin_type,origin_ref,quote,kind)"
         " VALUES (?,?,?,?,?,?,?)",
-        (f"{entry_id}@{scope}", "webchat", "u1", "conversation", "seed", f"quote-{topic}",
+        (entry_id, "webchat", "u1", "conversation", "seed", f"quote-{topic}",
          "explicit"))
     conn.commit()
     return entry_id
@@ -144,7 +144,7 @@ def test_profile_after_pipeline(client, fake_llm, wait_for_pipeline):
     r = client.get("/profile/webchat/u1?budget=2000")
     assert r.status_code == 200 and "entries" in r.json()
     r = client.get("/profile/webchat/u1?budget=2000&query=Python")
-    assert any(e["id"] == "preference_lang" for e in r.json()["entries"])
+    assert any(e["id"] == "preference_lang@global" for e in r.json()["entries"])
 
 
 def test_review_verdict_flow(client, conn):
@@ -320,14 +320,14 @@ def _seed_conflict_pair(conn):
     conn.execute(
         "INSERT INTO entries (user_source,user_id,dimension,topic,scope,id,confidence,status,"
         " body,summary,created_at,updated_at,last_reinforced_at,degraded_reason,conflict_with)"
-        " VALUES ('webchat','u1','preference','style','global','preference_style',0.9,'active',"
-        " '偏好正式','正式',?, ?, ?, NULL, ?)", (NOW, NOW, NOW, '["preference_+style"]'))
+        " VALUES ('webchat','u1','preference','style','global','preference_style@global',0.9,'active',"
+        " '偏好正式','正式',?, ?, ?, NULL, ?)", (NOW, NOW, NOW, '["preference_+style@global"]'))
     conn.execute(
         "INSERT INTO entries (user_source,user_id,dimension,topic,scope,id,confidence,status,"
         " body,summary,created_at,updated_at,last_reinforced_at,degraded_reason,conflict_with)"
-        " VALUES ('webchat','u1','preference','+style','global','preference_+style',0.72,"
+        " VALUES ('webchat','u1','preference','+style','global','preference_+style@global',0.72,"
         " 'degraded','偏好随意','随意',?, ?, ?, 'conflict_lost', ?)",
-        (NOW, NOW, NOW, '["preference_style"]'))
+        (NOW, NOW, NOW, '["preference_style@global"]'))
     conn.execute(
         "INSERT INTO pending_clarifications (user_source, user_id, conflicting_ids, question,"
         " issued_at) VALUES ('webchat','u1','[\"preference_style@global\",\"preference_+style@global\"]','以哪种为准？',?)", (NOW,))
@@ -364,9 +364,9 @@ def test_verdict_advances_version_and_clears_conflict(client, conn):
     # I-2：verdict 刷 updated_at（同版本二次判定 noop）+ '+' 行收尾移出复核队列
     _seed_conflict_pair(conn)
     queue = client.get("/review/queue").json()["items"]
-    assert any(i["entry_id"] == "preference_+style" for i in queue)
-    version = next(i["entry_version"] for i in queue if i["entry_id"] == "preference_+style")
-    r = client.post("/review/webchat/u1/global/preference_+style/verdict",
+    assert any(i["entry_id"] == "preference_+style@global" for i in queue)
+    version = next(i["entry_version"] for i in queue if i["entry_id"] == "preference_+style@global")
+    r = client.post("/review/webchat/u1/global/preference_+style@global/verdict",
                     json={"verdict": "approve", "entry_version": version})
     assert r.status_code == 200 and r.json()["noop"] is False
     plus = conn.execute(
@@ -377,7 +377,7 @@ def test_verdict_advances_version_and_clears_conflict(client, conn):
         "SELECT status FROM entries WHERE topic='style'").fetchone()[0] == "active"
     remaining = client.get("/review/queue").json()["items"]
     assert not any(i["entry_id"] == "preference_+style" for i in remaining)
-    r2 = client.post("/review/webchat/u1/global/preference_+style/verdict",
+    r2 = client.post("/review/webchat/u1/global/preference_+style@global/verdict",
                      json={"verdict": "discard", "entry_version": version})
     assert r2.status_code == 200 and r2.json()["noop"] is True  # 同版本二次判定作废
     assert conn.execute("SELECT COUNT(*) FROM review_history").fetchone()[0] == 1
@@ -394,19 +394,19 @@ def test_orphan_candidate_review_approve_to_observation(client, conn, fake_llm, 
     fake_llm.by_name["extract_candidates"] = [{"candidates": [orphan_cand]}]
     client.post("/events", json=dict(CONV_EVENT, event_id="evt_o1"))
     queue = client.get("/review/queue").json()["items"]
-    assert any(i["entry_id"] == "orphan_手工模型" and i["status"] == "pending_review"
+    assert any(i["entry_id"] == "orphan_手工模型@global" and i["status"] == "pending_review"
                for i in queue)
-    version = next(i["entry_version"] for i in queue if i["entry_id"] == "orphan_手工模型")
-    client.post("/review/webchat/u1/global/orphan_手工模型/verdict",
+    version = next(i["entry_version"] for i in queue if i["entry_id"] == "orphan_手工模型@global")
+    client.post("/review/webchat/u1/global/orphan_手工模型@global/verdict",
                 json={"verdict": "approve", "entry_version": version})
     row = conn.execute(
         "SELECT status, topic_new, degraded_reason FROM entries"
-        " WHERE id='orphan_手工模型'").fetchone()
+        " WHERE id='orphan_手工模型@global'").fetchone()
     assert row["status"] == "orphan_topic" and row["topic_new"] == "手工模型"
     from pismor.pipeline.aggregator import run_daily
     stats = run_daily(conn, taxonomy, fake_llm, False, "2026-12-24T00:00:00+00:00")
     still = conn.execute(
-        "SELECT status FROM entries WHERE id='orphan_手工模型'").fetchone()
+        "SELECT status FROM entries WHERE id='orphan_手工模型@global'").fetchone()
     assert still["status"] == "orphan_topic"  # 窗口内仅 1 行 → 保留等复现，晋升链可用
     assert stats["dropped_orphan"] == 0
 
@@ -489,13 +489,12 @@ def test_verdict_discard_is_scope_specific(client, conn):
     _seed_entry(conn, "preference", "lang", "global", "active", "全局 Python", "全局", 0.9)
     _seed_entry(conn, "preference", "lang", "project:x", "pending_review", "项目 Go", "项目", 0.7)
     queue = client.get("/review/queue").json()["items"]
-    item = next(i for i in queue if i["entry_id"] == "preference_lang"
-                and i["scope"] == "project:x")
-    r = client.post("/review/webchat/u1/project:x/preference_lang/verdict",
+    item = next(i for i in queue if i["entry_id"] == "preference_lang@project:x")
+    r = client.post("/review/webchat/u1/project:x/preference_lang@project:x/verdict",
                     json={"verdict": "discard", "entry_version": item["entry_version"]})
     assert r.status_code == 200 and r.json() == {"noop": False, "updated": 1}
     scopes = {row["scope"] for row in conn.execute(
-        "SELECT scope FROM entries WHERE id='preference_lang'").fetchall()}
+        "SELECT scope FROM entries WHERE id LIKE 'preference_lang@%'").fetchall()}
     assert scopes == {"global"}  # project:x 被删，global 保留
     assert conn.execute("SELECT COUNT(*) c FROM sources WHERE entry_id='preference_lang@project:x'"
                         ).fetchone()["c"] == 0
@@ -515,7 +514,7 @@ def test_pending_review_does_not_block_evolution(client, conn, fake_llm):
     assert main["status"] == "active" and main["body"] == "明确偏好简洁"
     assert pending["topic"].startswith("!")
     queue = client.get("/review/queue").json()["items"]
-    assert any(i["entry_id"] == "preference_!style" for i in queue)
+    assert any(i["entry_id"] == "preference_!style@global" for i in queue)
 
 
 def test_illegal_transition_isolated_not_batch_rollback(conn, fake_settings, taxonomy,
@@ -627,8 +626,8 @@ def test_pending_snapshot_approve_does_not_override_evolution(client, conn, fake
     client.post("/events", json=dict(CONV_EVENT, event_id="evt_snap",
                                      messages=[{"role": "user", "text": "记住以后简洁"}]))
     item = next(i for i in client.get("/review/queue").json()["items"]
-                if i["scope"] == "global" and i["entry_id"] == "preference_!style")
-    r = client.post("/review/webchat/u1/global/preference_!style/verdict",
+                if i["scope"] == "global" and i["entry_id"] == "preference_!style@global")
+    r = client.post("/review/webchat/u1/global/preference_!style@global/verdict",
                     json={"verdict": "approve", "entry_version": item["entry_version"]})
     assert r.status_code == 200 and r.json()["noop"] is False
     snap = conn.execute(
@@ -654,10 +653,25 @@ def test_verdict_fix_updates_body_atomically(client, conn):
     entry_id = _seed_entry(conn, "preference", "style", "global", "pending_review",
                            "猜测正式", "猜测", 0.7)
     version = client.get("/review/queue").json()["items"][0]["entry_version"]
-    r = client.post("/review/webchat/u1/global/preference_style/verdict",
+    r = client.post("/review/webchat/u1/global/preference_style@global/verdict",
                     json={"verdict": "fix", "entry_version": version,
                           "body": "修正后的陈述", "summary": "修正"})
     assert r.status_code == 200 and r.json()["noop"] is False
     row = conn.execute("SELECT status, body, summary FROM entries WHERE id=?",
                        (entry_id,)).fetchone()
     assert (row["status"], row["body"], row["summary"]) == ("active", "修正后的陈述", "修正")
+
+
+def test_events_from_deleted_user_not_persisted(client, conn, fake_llm):
+    """intake 层 tombstone：删除后新事件不再写 entries/sources，也不再调用 LLM。"""
+    fake_llm.by_name["extract_candidates"] = [{"candidates": [dict(EXPLICIT_CAND)]}]
+    client.post("/events", json=CONV_EVENT)
+    assert conn.execute("SELECT COUNT(*) c FROM entries").fetchone()["c"] == 1
+    assert client.request("DELETE", "/profile/webchat/u1").json() == {"deleted": True}
+
+    calls_before = len(fake_llm.calls)
+    r = client.post("/events", json={**CONV_EVENT, "event_id": "evt_after_delete"})
+    assert r.status_code == 202
+    assert conn.execute("SELECT COUNT(*) c FROM entries").fetchone()["c"] == 0
+    assert conn.execute("SELECT COUNT(*) c FROM sources").fetchone()["c"] == 0
+    assert len(fake_llm.calls) == calls_before

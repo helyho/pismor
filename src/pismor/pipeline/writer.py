@@ -7,7 +7,8 @@
 - CONFLICT 同 key 双存受主键唯一约束：新行 topic 加 "+" 前缀变形落库；
   对方是 taboo 时 taboo 恒胜（spec §11）：taboo 行只补 conflict_with（§13 装配
   "taboo 出全句、对方曾观察"依赖双向标记），不降置信不降状态；preference 侧直接 degraded。
-- 跨行关联标记一律 "id@scope"（keys.mark）；旧裸 id 按所在行 scope 兼容解析。
+- 行键统一为 keys.entry_key（{dim}_{topic}@{scope}）：entries.id = sources.entry_id；
+  旧裸 id 由 init_schema 迁移，跨行关联标记同形。
 - pending_review 不阻塞演进：同 key 新证据先把待复核行移入 "!" 快照（仍在复核队列），
   再写入规范 active 行（spec §10/§14，I-2）。
 - 引用完整性由本写入器事务保证：entries 与 sources 同事务写入。
@@ -20,7 +21,7 @@ import logging
 import sqlite3
 
 from pismor.llm.embedder import EmbedUnavailable
-from pismor.core.keys import mark, split_mark, valid_scope, vec_key
+from pismor.core.keys import entry_key, split_mark, valid_scope, vec_key
 
 logger = logging.getLogger("mem.writer")
 
@@ -101,7 +102,7 @@ def _add(conn, us, uid, c, now, origin_type, origin_ref, vectors):
     if taboo:
         # taboo 恒胜：preference 新行直接 degraded(conflict_lost)，taboo 行只补标记
         status, reason, confidence = "degraded", "conflict_lost", c["confidence"] * 0.8
-        conflict_ids = [mark(taboo["id"], taboo["scope"])]
+        conflict_ids = [taboo["id"]]
     else:
         status, reason, confidence = "active", None, c["confidence"]
         conflict_ids = None
@@ -111,7 +112,7 @@ def _add(conn, us, uid, c, now, origin_type, origin_ref, vectors):
     if entry_id:
         vectors.append((vec_key(us, uid, c["dimension"], c["topic"], c["scope"]), c["body"]))
         if taboo:
-            _append_conflict_mark(conn, taboo, mark(entry_id, c["scope"]))
+            _append_conflict_mark(conn, taboo, entry_id)
 
 
 def _update(conn, us, uid, c, target, now, origin_type, origin_ref, vectors):
@@ -134,7 +135,7 @@ def _update(conn, us, uid, c, target, now, origin_type, origin_ref, vectors):
     _check_transition(old["status"], "archived")  # 旧行归档轨迹；archived 再 UPDATE 拒绝
     if old["status"] == "degraded":
         _check_transition("degraded", "active")  # 新证据演进恢复 active（spec §6）
-    sup_topic, sup_id = _superseded_identity(conn, us, uid, d, t, now)
+    sup_topic, sup_id = _superseded_identity(conn, us, uid, d, t, s, now)
     # 轨迹行：旧行完整内容原样存档，topic 加 "~" 前缀避开主键；
     # 同 key 多次 UPDATE → 时间戳+序号去重（同轮同 now 也唯一）
     conn.execute(
@@ -142,12 +143,12 @@ def _update(conn, us, uid, c, target, now, origin_type, origin_ref, vectors):
         "SELECT user_source,user_id,dimension,?,scope,?,confidence,'archived',body,summary,"
         "created_at,?,last_reinforced_at,'superseded',?,topic_new,conflict_with,reinforcements,? "
         "FROM entries WHERE user_source=? AND user_id=? AND dimension=? AND topic=? AND scope=?",
-        (sup_topic, sup_id, now, f"{d}_{t}", now, us, uid, d, t, s))
+        (sup_topic, sup_id, now, entry_key(d, t, s), now, us, uid, d, t, s))
     # 旧行证据链转移给轨迹行（spec §12：archived 条目保留全部字段与证据链）。
     # sources.entry_id 存行唯一键 "{entries.id}@{scope}"（id 不含 scope，裸 id 跨 scope 撞）
     conn.execute(
         "UPDATE sources SET entry_id=? WHERE user_source=? AND user_id=? AND entry_id=?",
-        (sup_id, us, uid, f"{d}_{t}@{s}"))
+        (sup_id, us, uid, entry_key(d, t, s)))
     # 原行同 key 覆盖新值；旧行带冲突标记 → 本行 conflict_with 归空（spec §11 闭环）
     conn.execute(
         "UPDATE entries SET body=?,summary=?,confidence=?,status='active',degraded_reason=NULL,"
@@ -158,12 +159,13 @@ def _update(conn, us, uid, c, target, now, origin_type, origin_ref, vectors):
         # M-1：普通演进只清标记，不复活矛盾对方；仅澄清（kind=clarification）可复活。
         # 澄清路径的 pending 删除延后到管线写入成功后（I-17）。
         is_clarification = c.get("kind") == "clarification"
-        resolve_conflicts(conn, us, uid, f"{d}_{t}", s, now,
+        resolve_conflicts(conn, us, uid, entry_key(d, t, s), s, now,
                           revive=is_clarification, clear_pending=not is_clarification)
     conn.execute(
         "INSERT INTO sources (entry_id,user_source,user_id,origin_type,origin_ref,quote,kind)"
         " VALUES (?,?,?,?,?,?,?)",
-        (f"{d}_{t}@{s}", us, uid, origin_type, origin_ref, c["quote"], c.get("kind") or "explicit"))
+        (entry_key(d, t, s), us, uid, origin_type, origin_ref, c["quote"],
+         c.get("kind") or "explicit"))
     vectors.append((vec_key(us, uid, d, t, s), c["body"]))
 
 
@@ -178,14 +180,14 @@ def _release_pending(conn, us, uid, old, now):
             (us, uid, old["dimension"], topic, old["scope"])).fetchone():
         seq += 1
         topic = f"{base}:{seq}"
-    new_id = f"{old['dimension']}_{topic}"
+    new_id = entry_key(old["dimension"], topic, old["scope"])
     conn.execute(
         "UPDATE entries SET topic=?, id=?, updated_at=? WHERE user_source=? AND user_id=?"
         " AND dimension=? AND topic=? AND scope=?",
         (topic, new_id, now, us, uid, old["dimension"], old["topic"], old["scope"]))
     conn.execute(
         "UPDATE sources SET entry_id=? WHERE user_source=? AND user_id=? AND entry_id=?",
-        (f"{new_id}@{old['scope']}", us, uid, f"{old['id']}@{old['scope']}"))
+        (new_id, us, uid, old["id"]))
 
 
 def _load_marks(value, default_scope):
@@ -210,6 +212,7 @@ def resolve_conflicts(conn, us, uid, entry_id, scope, now, *, revive=False, clea
         " FROM entries WHERE user_source=? AND user_id=?"
         " AND status IN ('active','degraded') AND conflict_with IS NOT NULL",
         (us, uid)).fetchall()
+    bare = split_mark(entry_id)[0] if "@" in entry_id else entry_id
     for o in rows:
         marks = _load_marks(o["conflict_with"], o["scope"])
         if marks is None:
@@ -217,8 +220,9 @@ def resolve_conflicts(conn, us, uid, entry_id, scope, now, *, revive=False, clea
         keep = []
         hit = False
         for m in marks:
-            mid, mscope = split_mark(str(m), o["scope"])
-            if mid == entry_id and mscope == scope:
+            ms = str(m)
+            # 行键精确匹配；兼容历史裸 id 标记（旧库未迁移的 conflict_with）
+            if ms == entry_id or ms == f"{bare}@{scope}" or ("@" not in ms and ms == bare):
                 hit = True
             else:
                 keep.append(m)
@@ -255,7 +259,7 @@ def _clear_pending_for(conn, us, uid, entry_id, scope):
                 (us, uid, row["conflicting_ids"]))
 
 
-def _superseded_identity(conn, us, uid, d, t, now):
+def _superseded_identity(conn, us, uid, d, t, scope, now):
     """轨迹行 topic/id：~{topic}:{紧凑now}:{序号}，同 key 多次 UPDATE（含同轮同 now）唯一。"""
     compact = now.replace("-", "").replace(":", "").split("+")[0]  # 2026-11-24T…+08:00 → 20261124T…
     base = f"~{t}:{compact}:"
@@ -264,7 +268,7 @@ def _superseded_identity(conn, us, uid, d, t, now):
         (us, uid, d, f"{base}%")).fetchone()
     seq = rows["c"] + 1
     topic = f"{base}{seq}"
-    return topic, f"{d}_{topic}"
+    return topic, entry_key(d, topic, scope)
 
 
 def _conflict(conn, us, uid, c, target, now, origin_type, origin_ref, vectors):
@@ -277,9 +281,9 @@ def _conflict(conn, us, uid, c, target, now, origin_type, origin_ref, vectors):
         raise IllegalTransition(f"CONFLICT target not found: {target}")
     taboo = _find_taboo(conn, us, uid, c)
     # 同 key 主键唯一 → 矛盾双存行 topic 加 "+" 前缀变形落库（复核/澄清任务按标记关联）
-    conflict_ids = [mark(old["id"], old["scope"])]
+    conflict_ids = [old["id"]]
     if taboo:
-        conflict_ids.append(mark(taboo["id"], taboo["scope"]))
+        conflict_ids.append(taboo["id"])
     is_taboo_side = c["dimension"] == "taboo"
     if is_taboo_side or taboo:
         # taboo 恒胜：taboo 侧新行不降；与 taboo 互斥的 preference 新行直接 degraded
@@ -293,7 +297,7 @@ def _conflict(conn, us, uid, c, target, now, origin_type, origin_ref, vectors):
                              origin_ref=origin_ref, confidence=confidence,
                              degraded_reason=reason, conflict_with=conflict_ids)
     vectors.append((vec_key(us, uid, c["dimension"], f"+{c['topic']}", c["scope"]), c["body"]))
-    new_mark = mark(entry_id, c["scope"])
+    new_mark = entry_id
     if old["dimension"] == "taboo":
         # 旧行是 taboo：只互标 conflict_with，不降置信不降状态
         conn.execute(
@@ -350,7 +354,8 @@ def _insert_entry(conn, us, uid, c, *, status, now, origin_type, origin_ref,
         return None  # 硬约束（spec §5）：无 quote 的条目拒绝入库
     if confidence is None:
         confidence = c["confidence"]
-    entry_id = f"{c['dimension']}_{c['topic']}"  # id 规则 {dimension}_{topic}（spec §5）
+    # 行键：entries.id 与 sources.entry_id 同值，可直接 JOIN（spec §5/§12）
+    entry_id = entry_key(c["dimension"], c["topic"], c["scope"])
     conn.execute(
         f"INSERT INTO entries ({_ENTRY_COLS}) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (us, uid, c["dimension"], c["topic"], c["scope"], entry_id,
@@ -360,8 +365,7 @@ def _insert_entry(conn, us, uid, c, *, status, now, origin_type, origin_ref,
     conn.execute(
         "INSERT INTO sources (entry_id,user_source,user_id,origin_type,origin_ref,quote,kind)"
         " VALUES (?,?,?,?,?,?,?)",
-        # entry_id 存行唯一键（append scope）：id 不含 scope，跨 scope 同 topic 行的证据可归属
-        (f"{entry_id}@{c['scope']}", us, uid, origin_type, origin_ref, quote,
+        (entry_id, us, uid, origin_type, origin_ref, quote,
          c.get("kind") or "explicit"))
     return entry_id
 

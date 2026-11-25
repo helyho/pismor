@@ -33,7 +33,7 @@ def _entry(conn, *, us="w", uid="u1", dim="preference", topic="orphan", scope="g
            body="偏好简短回复", summary="简短回复"):
     updated = updated or created
     reinforced = reinforced or created
-    entry_id = f"{dim}_{topic}"
+    entry_id = f"{dim}_{topic}@{scope}"
     conn.execute(
         "INSERT INTO entries (user_source,user_id,dimension,topic,scope,id,confidence,status,"
         "body,summary,created_at,updated_at,last_reinforced_at,topic_new,reinforcements)"
@@ -43,7 +43,7 @@ def _entry(conn, *, us="w", uid="u1", dim="preference", topic="orphan", scope="g
     conn.execute(
         "INSERT INTO sources (entry_id,user_source,user_id,origin_type,origin_ref,quote,kind)"
         " VALUES (?,?,?,?,?,?,?)",
-        (f"{entry_id}@{scope}", us, uid, "conversation", "s1:1", "回答短一点", "explicit"))
+        (entry_id, us, uid, "conversation", "s1:1", "回答短一点", "explicit"))
     return entry_id
 
 
@@ -162,7 +162,7 @@ def test_orphan_promoted_after_threshold(conn, seeded_orphans_3, taxonomy, fake_
     assert conn.execute("SELECT status FROM entries WHERE status='orphan_topic'").fetchone() is None
     row = conn.execute("SELECT status, topic, dimension, id, topic_new FROM entries").fetchone()
     assert row["status"] == "active" and row["topic"] == "lang" and row["topic_new"] is None
-    assert row["dimension"] == "preference" and row["id"] == "preference_lang"
+    assert row["dimension"] == "preference" and row["id"] == "preference_lang@global"
     # 证据链 entry_id 跟随 re-key
     src = conn.execute("SELECT entry_id FROM sources").fetchone()
     assert src["entry_id"] == "preference_lang@global"

@@ -44,7 +44,7 @@ def _seed(conn, *, us="w", uid="u1", dim="preference", topic="lang", status="act
         "INSERT INTO entries (user_source,user_id,dimension,topic,scope,id,confidence,status,"
         "body,summary,created_at,updated_at,last_reinforced_at,topic_new)"
         " VALUES (?,?,?,?,'global',?,0.9,?,?,?,?,?,?,?)",
-        (us, uid, dim, topic, f"{dim}_{topic}", status, body, body[:20], created, created,
+        (us, uid, dim, topic, f"{dim}_{topic}@global", status, body, body[:20], created, created,
          created, topic_new))
     if not topic.startswith("~"):
         conn.execute(

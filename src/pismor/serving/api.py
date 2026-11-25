@@ -21,6 +21,7 @@ from pismor.pipeline import intake, writer
 from pismor.serving import assembler, exporter
 from pismor.core import tokenizer
 from pismor.core.config import Settings
+from pismor.core.keys import entry_key, split_mark
 from pismor.core.db import get_conn, init_schema
 from pismor.llm.embedder import Embedder
 from pismor.llm.client import LLMClient
@@ -138,7 +139,7 @@ def create_app(settings: Settings, llm=None, embedder=None) -> FastAPI:
                         return {"noop": True}
                     conn.execute(
                         "DELETE FROM sources WHERE user_source=? AND user_id=? AND entry_id=?",
-                        (user_source, user_id, f"{row['id']}@{scope}"))
+                        (user_source, user_id, row["id"]))
                 else:
                     # orphan 候选 approve → 观察区（spec §8.2 晋升链入口），其余 → active
                     new_status = ("orphan_topic" if row["dimension"] == "orphan"
@@ -172,7 +173,8 @@ def create_app(settings: Settings, llm=None, embedder=None) -> FastAPI:
                                  payload.note or "superseded_by_evolution",
                                  payload.entry_version))
                             return {"noop": False, "updated": 1}
-                        new_topic, new_id = canonical, f"{row['dimension']}_{canonical}"
+                        new_topic, new_id = canonical, entry_key(
+                            row["dimension"], canonical, scope)
                     cur = conn.execute(
                         "UPDATE entries SET status=?, topic=?, id=?,"
                         " body=COALESCE(?, body), summary=COALESCE(?, summary),"
@@ -188,11 +190,11 @@ def create_app(settings: Settings, llm=None, embedder=None) -> FastAPI:
                         conn.execute(
                             "UPDATE sources SET entry_id=? WHERE user_source=? AND user_id=?"
                             " AND entry_id=?",
-                            (f"{new_id}@{scope}", user_source, user_id,
-                             f"{row['id']}@{scope}"))
+                            (new_id, user_source, user_id, row["id"]))
                     # 矛盾收尾（C-1）：按 (id,scope) 清对方行标记、conflict_lost 恢复 active
-                    writer.resolve_conflicts(conn, user_source, user_id, entry_id, scope, now,
-                                            revive=True, clear_pending=True)
+                    writer.resolve_conflicts(conn, user_source, user_id,
+                                             entry_id, scope, now,
+                                             revive=True, clear_pending=True)
                 conn.execute(
                     "INSERT INTO review_history (entry_id, user_source, user_id, verdict,"
                     " actor, ts, note, entry_version) VALUES (?, ?, ?, ?, 'reviewer', ?, ?, ?)",

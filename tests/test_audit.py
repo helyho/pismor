@@ -20,7 +20,7 @@ def seed_entry(conn, us="w", uid="u", dimension="preference", topic="lang", scop
     """
     conn.execute(
         f"INSERT INTO entries ({_ENTRY_COLS}) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-        (us, uid, dimension, topic, scope, f"{dimension}_{topic}", confidence, status,
+        (us, uid, dimension, topic, scope, f"{dimension}_{topic}@{scope}", confidence, status,
          body, body[:20], NOW, NOW, NOW, degraded_reason, topic_new, conflict_with, 0,
          archived_at))
     if topic.startswith("~"):

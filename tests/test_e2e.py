@@ -100,7 +100,7 @@ def _entry(db, dim, topic, *, us="webchat", uid="u1", scope=None):
 
 def _seed(db, dim, topic, body, *, status="active", conf=0.9, scope="global",
           us="webchat", uid="u1", degraded_reason=None, conflict_with=None):
-    entry_id = f"{dim}_{topic}"
+    entry_id = f"{dim}_{topic}@{scope}"
     db.execute(
         "INSERT INTO entries (user_source,user_id,dimension,topic,scope,id,confidence,status,"
         " body,summary,created_at,updated_at,last_reinforced_at,reinforcements,"
@@ -111,7 +111,7 @@ def _seed(db, dim, topic, body, *, status="active", conf=0.9, scope="global",
     db.execute(
         "INSERT INTO sources (entry_id,user_source,user_id,origin_type,origin_ref,quote,kind)"
         " VALUES (?,?,?,?,?,?,?)",
-        (f"{entry_id}@{scope}", us, uid, "conversation", "seed", f"quote-{topic}", "explicit"))
+        (entry_id, us, uid, "conversation", "seed", f"quote-{topic}", "explicit"))
     db.commit()
     return entry_id
 
@@ -313,7 +313,7 @@ def test_budget_truncation(client_with_script, db):
     pack = client.get("/profile/webchat/u1?budget=300").json()
     assert pack["budget_used"] == 264 <= 300
     assert len(pack["entries"]) == 4  # 第 5 条 330 > 300 被截断
-    assert [e["id"] for e in pack["entries"][:3]] == ["taboo_t0", "taboo_t1", "taboo_t2"]
+    assert [e["id"] for e in pack["entries"][:3]] == ["taboo_t0@global", "taboo_t1@global", "taboo_t2@global"]
     assert sum(max(1, len(e["text"]) // 3) for e in pack["entries"]) == pack["budget_used"]
 
 
@@ -325,7 +325,7 @@ def test_degraded_prefix(client_with_script, db):
 
     pack = client.get("/profile/webchat/u1?budget=2000&query=浅烘咖啡").json()
     degraded = [e for e in pack["entries"] if e["status"] == "degraded"]
-    assert {"identity_role", "preference_coffee"} <= {e["id"] for e in degraded}
+    assert {"identity_role@global", "preference_coffee@global"} <= {e["id"] for e in degraded}
     assert all(e["text"].startswith("曾观察：") for e in degraded)
 
 

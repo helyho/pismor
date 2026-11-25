@@ -13,11 +13,10 @@ _ENTRY_COLS = ("user_source,user_id,dimension,topic,scope,id,confidence,status,b
 
 def seed(conn, dimension, topic, scope="global", status="active", confidence=0.9,
          body="一句话画像", summary=None, degraded_reason=None, sources=True):
-    """直接造行（同 test_audit 模式）：轨迹行（~ 前缀 topic）证据键为裸 id，
-    其余行走 "{id}@{scope}" 复合键——导出端 JOIN 的两种分支都要覆盖。"""
+    """直接造行（同 test_audit 模式）：证据键统一为行键 "{id}@{scope}"。"""
     conn.execute(
         f"INSERT INTO entries ({_ENTRY_COLS}) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-        ("w", "u1", dimension, topic, scope, f"{dimension}_{topic}", confidence, status,
+        ("w", "u1", dimension, topic, scope, f"{dimension}_{topic}@{scope}", confidence, status,
          body, summary if summary is not None else body[:10], NOW, NOW, NOW,
          degraded_reason, None, None, 0, NOW if status == "archived" else None))
     if not sources:
@@ -25,7 +24,7 @@ def seed(conn, dimension, topic, scope="global", status="active", confidence=0.9
     conn.execute(
         "INSERT INTO sources (entry_id,user_source,user_id,origin_type,origin_ref,quote,kind)"
         " VALUES (?,?,?,?,?,?,?)",
-        (f"{dimension}_{topic}" if topic.startswith("~") else f"{dimension}_{topic}@{scope}",
+        (f"{dimension}_{topic}@{scope}",
          "w", "u1", "conversation", "s1:1", "用户原话", "explicit"))
 
 
@@ -71,8 +70,8 @@ def test_pending_in_export(tmp_path, conn, seeded_orphan):
 def test_section_layout(tmp_path, conn, seeded):
     """§9 小节：标题行 → --- 围栏 YAML（裁决键序）→ 一句正文。"""
     text = (export(conn, "w", "u1", tmp_path) / "taboo.md").read_text(encoding="utf-8")
-    block = text.split("## [taboo_tool]", 1)[1]
-    assert block.startswith(" 表格不用公式\n\n---\nid: taboo_tool\n")
+    block = text.split("## [taboo_tool@global]", 1)[1]
+    assert block.startswith(" 表格不用公式\n\n---\nid: taboo_tool@global\n")
     yaml_part = block.split("---\n", 2)[1]
     keys = [ln.split(":")[0] for ln in yaml_part.splitlines() if ln and not ln.startswith((" ", "-"))]
     assert keys == ["id", "dimension", "scope", "confidence", "status", "created_at",
@@ -95,7 +94,7 @@ def test_archive_and_trace_sources(tmp_path, conn, seeded):
 
 def test_degraded_stays_in_dimension_file(tmp_path, conn, seeded):
     """degraded 是状态不是位置：留在原维度文件（spec §9 约定）。"""
-    assert "## [taboo_tone]" in (export(conn, "w", "u1", tmp_path) / "taboo.md").read_text(encoding="utf-8")
+    assert "## [taboo_tone@global]" in (export(conn, "w", "u1", tmp_path) / "taboo.md").read_text(encoding="utf-8")
 
 
 def test_index_rows(tmp_path, conn, seeded, seeded_orphan):
@@ -105,7 +104,7 @@ def test_index_rows(tmp_path, conn, seeded, seeded_orphan):
     rows = [ln for ln in lines if ln.startswith("| ") and "---" not in ln]
     assert len(rows) == 7  # 表头 + 5 条 seeded + 1 条 orphan
     # review Minor-4：整行列值校验（id|dimension|topic|scope|status|conf|file|summary）
-    assert ("| preference_format | preference | format | project:alpha | active | 0.9"
+    assert ("| preference_format@project:alpha | preference | format | project:alpha | active | 0.9"
             " | projects/alpha.md | alpha 表格 |") in rows
     joined = "\n".join(rows)
     assert "preference_~lang:" in joined and "archive.md" in joined
@@ -117,9 +116,9 @@ def test_project_scope_split(tmp_path, conn, seeded):
          summary="alpha 用 pnpm")
     root = export(conn, "w", "u1", tmp_path)
     proj = (root / "projects" / "alpha.md").read_text(encoding="utf-8")
-    assert "## [preference_tool]" in proj and "alpha 项目用 pnpm" in proj
-    assert "preference_tool" not in (root / "shell.md").read_text(encoding="utf-8")
-    assert "| preference_tool |" in (root / "_index.md").read_text(encoding="utf-8")
+    assert "## [preference_tool@project:alpha]" in proj and "alpha 项目用 pnpm" in proj
+    assert "preference_tool@" not in (root / "shell.md").read_text(encoding="utf-8")
+    assert "| preference_tool@project:alpha |" in (root / "_index.md").read_text(encoding="utf-8")
 
 
 def test_taboo_project_scope_stays_in_taboo_md(tmp_path, conn):
@@ -127,7 +126,7 @@ def test_taboo_project_scope_stays_in_taboo_md(tmp_path, conn):
     seed(conn, "taboo", "tool", scope="project:alpha", body="alpha 项目禁用公式",
          summary="禁公式")
     root = export(conn, "w", "u1", tmp_path)
-    assert "## [taboo_tool]" in (root / "taboo.md").read_text(encoding="utf-8")
+    assert "## [taboo_tool@project:alpha]" in (root / "taboo.md").read_text(encoding="utf-8")
     assert not (root / "projects" / "alpha.md").exists()
 
 
@@ -139,8 +138,8 @@ def test_project_name_traversal_rejected(tmp_path, conn):
     assert set(p.name for p in tmp_path.iterdir()) - before == {"w"}  # 树外零写入
     assert not list(root.rglob("projects/*"))
     for f in root.rglob("*.md"):
-        assert "preference_tool" not in f.read_text(encoding="utf-8")
-    assert "preference_tool\tinvalid project scope: project:../../x" in \
+        assert "preference_tool@" not in f.read_text(encoding="utf-8")
+    assert "preference_tool@project:../../x\tinvalid project scope: project:../../x" in \
         (root / "export-warnings.txt").read_text(encoding="utf-8")
 
 
@@ -167,4 +166,4 @@ def test_export_clears_stale_files(tmp_path, conn):
     conn.commit()
     root2 = export(conn, "w", "u1", tmp_path)
     assert not (root2 / "projects" / "alpha.md").exists()
-    assert "preference_tool" not in (root2 / "shell.md").read_text(encoding="utf-8")
+    assert "preference_tool@" not in (root2 / "shell.md").read_text(encoding="utf-8")

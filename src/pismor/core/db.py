@@ -92,6 +92,11 @@ END;
 
 def init_schema(conn: sqlite3.Connection, vec_dimensions: int | None) -> None:
     conn.executescript(SCHEMA)
+    # 行键迁移（旧库升级）：id 曾为裸 {dimension}_{topic}，与 sources.entry_id 的
+    # "{id}@{scope}" 两套格式并存；统一为行键后 entries.id 可直接与 sources JOIN。
+    conn.execute(
+        "UPDATE entries SET id = dimension || '_' || topic || '@' || scope"
+        " WHERE id <> dimension || '_' || topic || '@' || scope")
     # mem_fts 分词器一致性：配置与建索引时不符 → 全量重建（切换 jieba/bigram 生效）
     name = _tokenizer.current()
     row = conn.execute("SELECT value FROM fts_meta WHERE key='tokenizer'").fetchone()

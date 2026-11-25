@@ -106,7 +106,7 @@ def _neighbor_conflict(conn, user_source, user_id, c, llm):
         (user_source, user_id, *dims, c["scope"], _NEIGHBOR_LIMIT)).fetchall()
     if not rows:
         return None
-    neighbors = "\n".join(f"- [{r['id']}@{r['scope']}] {r['body']}" for r in rows)
+    neighbors = "\n".join(f"- [{r['id']}] {r['body']}" for r in rows)
     verdict = llm.chat_json(NEIGHBOR_SYSTEM, NEIGHBOR_USER.format(new=c["body"],
                                                                   neighbors=neighbors),
                             NEIGHBOR_SCHEMA)
@@ -115,7 +115,7 @@ def _neighbor_conflict(conn, user_source, user_id, c, llm):
     # LLM 指认的对端 id@scope 优先；缺失/不匹配时回退首行
     accused = str(verdict.get("conflicting_with") or "").strip()
     for r in rows:
-        if f"{r['id']}@{r['scope']}" == accused:
+        if accused in (r["id"], f"{r['id']}@{r['scope']}"):
             return (r["dimension"], r["topic"], r["scope"])
     row = rows[0]
     return (row["dimension"], row["topic"], row["scope"])

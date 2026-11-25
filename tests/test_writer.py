@@ -93,7 +93,7 @@ def seeded_archived(conn):
 def test_add_writes_entry_and_sources(conn, embedder_stub):
     apply_actions(conn, "w", "u", [add_action()], embedder_stub, "conversation", "s1:1", NOW)
     row = conn.execute("SELECT * FROM entries").fetchone()
-    assert row["status"] == "active" and row["id"] == "preference_lang"
+    assert row["status"] == "active" and row["id"] == "preference_lang@global"
     assert row["last_reinforced_at"] == NOW and row["reinforcements"] == 0
     assert conn.execute("SELECT COUNT(*) c FROM sources").fetchone()["c"] == 1
     src = conn.execute("SELECT * FROM sources").fetchone()
@@ -107,7 +107,7 @@ def test_update_archives_old(conn, embedder_stub, seeded_active):
                   embedder_stub, "text", "e1", NOW)
     # 轨迹行（topic 加 "~" 前缀+时间戳序号）：旧行完整内容 archived，superseded_by 指向新行 id
     sup = conn.execute("SELECT * FROM entries WHERE topic LIKE '~lang:%'").fetchone()
-    assert sup["status"] == "archived" and sup["superseded_by"] == "preference_lang"
+    assert sup["status"] == "archived" and sup["superseded_by"] == "preference_lang@global"
     assert sup["archived_at"] == NOW and sup["body"] == "旧值"
     # 原行同 key 覆盖为新值 active（bi-temporal 旧值由轨迹行承载）
     cur = conn.execute("SELECT * FROM entries WHERE topic='lang'").fetchone()
@@ -140,8 +140,8 @@ def test_conflict_symmetric(conn, embedder_stub, seeded_active):
     old = conn.execute("SELECT * FROM entries WHERE topic='lang'").fetchone()
     new = conn.execute("SELECT * FROM entries WHERE topic='+lang'").fetchone()
     # Review Focus #4：对称互标（标记带 scope，C-1）
-    assert mark(new["id"], "global") in json.loads(old["conflict_with"])
-    assert mark(old["id"], "global") in json.loads(new["conflict_with"])
+    assert new["id"] in json.loads(old["conflict_with"])
+    assert old["id"] in json.loads(new["conflict_with"])
     assert old["confidence"] < 0.85 and new["confidence"] < 0.85
     assert old["status"] == "degraded" and old["degraded_reason"] == "conflict_lost"
     assert new["status"] == "degraded" and new["degraded_reason"] == "conflict_lost"
@@ -222,8 +222,8 @@ def test_batch_taboo_wins_over_preference(conn, embedder_stub):
     pref = conn.execute("SELECT * FROM entries WHERE dimension='preference'").fetchone()
     taboo = conn.execute("SELECT * FROM entries WHERE dimension='taboo'").fetchone()
     assert pref["status"] == "degraded" and pref["degraded_reason"] == "conflict_lost"
-    assert mark(taboo["id"], "global") in json.loads(pref["conflict_with"])
-    assert mark(pref["id"], "global") in json.loads(taboo["conflict_with"])
+    assert taboo["id"] in json.loads(pref["conflict_with"])
+    assert pref["id"] in json.loads(taboo["conflict_with"])
     assert taboo["status"] == "active" and taboo["confidence"] == 0.9  # taboo 不降置信不降状态
 
 
@@ -238,10 +238,10 @@ def test_conflict_with_taboo_taboo_unmoved(conn, embedder_stub):
     pref_new = conn.execute("SELECT * FROM entries WHERE topic='+lang'").fetchone()
     assert pref_new["status"] == "degraded" and pref_new["degraded_reason"] == "conflict_lost"
     new_marks = json.loads(pref_new["conflict_with"])
-    assert mark(taboo["id"], "global") in new_marks
-    assert mark(pref_old["id"], "global") in new_marks
-    assert mark(pref_new["id"], "global") in json.loads(taboo["conflict_with"])
-    assert mark(pref_new["id"], "global") in json.loads(pref_old["conflict_with"])
+    assert taboo["id"] in new_marks
+    assert pref_old["id"] in new_marks
+    assert pref_new["id"] in json.loads(taboo["conflict_with"])
+    assert pref_new["id"] in json.loads(pref_old["conflict_with"])
     assert taboo["status"] == "active" and taboo["confidence"] == 0.9  # taboo 恒胜：不降
     assert pref_old["status"] == "degraded" and pref_old["confidence"] < 0.85
 
@@ -264,7 +264,7 @@ def test_missing_quote_rejected(conn, embedder_stub):
 
 def _seed_with_source(conn, scope, origin_ref, quote):
     """seed 一行带 1 条独立证据的 active 条目（跨 scope 同 topic，id 相同）。"""
-    entry_id = "preference_lang"
+    entry_id = f"preference_lang@{scope}"
     conn.execute(
         "INSERT INTO entries (user_source,user_id,dimension,topic,scope,id,confidence,status,"
         "body,summary,created_at,updated_at,last_reinforced_at)"
@@ -272,7 +272,7 @@ def _seed_with_source(conn, scope, origin_ref, quote):
         (scope, entry_id, f"旧值@{scope}", f"旧值@{scope}"))
     conn.execute(
         "INSERT INTO sources (entry_id,user_source,user_id,origin_type,origin_ref,quote,kind)"
-        " VALUES (?,'w','u','text',?,?,'explicit')", (f"{entry_id}@{scope}", origin_ref, quote))
+        " VALUES (?,'w','u','text',?,?,'explicit')", (entry_id, origin_ref, quote))
     conn.commit()
 
 
@@ -320,7 +320,7 @@ def test_update_twice_creates_distinct_superseded_rows(conn, embedder_stub, seed
 def _seed_row(conn, *, dim="preference", topic="lang", scope="global", status="active",
               body="旧值", conflict_with=None, updated=NOW, archived_at=None,
               degrad="conflict_lost"):
-    entry_id = f"{dim}_{topic}"
+    entry_id = f"{dim}_{topic}@{scope}"
     conn.execute(
         "INSERT INTO entries (user_source,user_id,dimension,topic,scope,id,confidence,status,"
         "body,summary,created_at,updated_at,last_reinforced_at,degraded_reason,conflict_with,"
@@ -330,7 +330,7 @@ def _seed_row(conn, *, dim="preference", topic="lang", scope="global", status="a
     conn.execute(
         "INSERT INTO sources (entry_id,user_source,user_id,origin_type,origin_ref,quote,kind)"
         " VALUES (?,'w','u','text','seed','原话','explicit')",
-        (f"{entry_id}@{scope}",))
+        (entry_id,))
     conn.commit()
     return entry_id
 
@@ -448,3 +448,17 @@ def test_vector_rows_keyed_by_five_tuple_and_sqlite_error_degrades(conn):
                   "text", "e2", NOW)
     assert conn.execute("SELECT COUNT(*) c FROM entries WHERE topic='tone2'").fetchone()["c"] == 1
     assert conn.execute("SELECT COUNT(*) c FROM embeddings").fetchone()["c"] == 2  # 失败未写入
+
+
+def test_entry_id_is_row_key_matching_sources(conn, embedder_stub):
+    """entries.id 与 sources.entry_id 同为行键 {dim}_{topic}@{scope}，可直接 JOIN。"""
+    apply_actions(conn, "w", "u", [add_action()], embedder_stub, "conversation", "s1:1", NOW)
+    row = conn.execute("SELECT id, scope FROM entries").fetchone()
+    assert row["id"] == "preference_lang@global"
+    src = conn.execute("SELECT entry_id FROM sources").fetchone()
+    assert src["entry_id"] == row["id"]
+    hit = conn.execute(
+        "SELECT 1 FROM entries e JOIN sources s"
+        " ON s.user_source=e.user_source AND s.user_id=e.user_id AND s.entry_id=e.id"
+        " WHERE e.id=?", (row["id"],)).fetchone()
+    assert hit is not None

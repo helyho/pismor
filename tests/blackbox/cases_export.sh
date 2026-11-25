@@ -87,8 +87,10 @@ t20() {
   expect_status 202 || return 1
   wait_db "SELECT 1 FROM events_seen WHERE event_id='$e2'" 30 || { case_fail "删后事件未被接受"; }
   sleep 45 # 后台管线处理时延
-  # 产品语义：tombstone 在装配层屏蔽（assembler 查 tombstones → 空包），
-  # 后台仍可能重写 entries 行；因此断言"删除后画像不得装配"而非 entries=0
+  # 产品语义：tombstone 在 intake 拦截——已删除用户的新事件不调 LLM、不写库；
+  # 装配同样恒空包
+  expect_db "SELECT count(*) FROM entries WHERE user_source='bb' AND user_id='t20u'" "0" || return 1
+  expect_db "SELECT count(*) FROM sources WHERE user_source='bb' AND user_id='t20u'" "0" || return 1
   http GET /profile/bb/t20u
   expect_status 200 || return 1
   expect_json '.entries' '[]' || return 1

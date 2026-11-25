@@ -50,7 +50,10 @@ def _entry(conn, dim, topic, body, *, entry_id=None, status="active", conf=0.9,
         "INSERT INTO entries (user_source,user_id,dimension,topic,scope,id,confidence,status,"
         "body,summary,created_at,updated_at,last_reinforced_at,reinforcements,conflict_with)"
         " VALUES ('w',?,?,?,?,?,?,?,?,?,?,?,?,0,?)",
-        (uid, dim, topic, scope, entry_id or f"{dim}_{topic}", conf, status,
+        (uid, dim, topic, scope,
+         entry_id if entry_id and "@" in entry_id else
+         (f"{entry_id}@{scope}" if entry_id else f"{dim}_{topic}@{scope}"),
+         conf, status,
          body, body[:20], updated, updated, updated, conflict_with))
 
 
@@ -124,7 +127,7 @@ def broken_db(conn):
 def test_must_have_set_always_included(conn, seeded):
     pack = assemble(conn, None, "w", "u1", budget=200)
     assert pack["entries"][0]["id"].startswith("taboo_")
-    assert {e["id"] for e in pack["entries"]} >= {"taboo_excel", "identity_role"}
+    assert {e["id"] for e in pack["entries"]} >= {"taboo_excel@global", "identity_role@global"}
 
 
 def test_budget_truncates_by_score(conn, seeded_many):
@@ -132,7 +135,7 @@ def test_budget_truncates_by_score(conn, seeded_many):
     total = sum(len(e["text"]) for e in pack["entries"])
     assert total <= 300 * 4  # 粗略 token≈4 字符换算; 断言超预算条目被截
     assert len(pack["entries"]) < 6
-    assert [e["id"] for e in pack["entries"][:3]] == ["taboo_t0", "taboo_t1", "taboo_t2"]
+    assert [e["id"] for e in pack["entries"][:3]] == ["taboo_t0@global", "taboo_t1@global", "taboo_t2@global"]
     assert pack["budget_used"] == 264  # 5 条 × len("字"*200)//3 = 5 × 66
 
 
@@ -163,7 +166,7 @@ def test_clarification_pair_detected(conn, seeded_conflict_pair):
 
 def test_asymmetric_conflict_not_reported(conn, seeded_conflict_pair):
     # 单向标记（对方未回标）不是矛盾对，不进澄清
-    conn.execute("UPDATE entries SET conflict_with=NULL WHERE id='pref_style_formal'")
+    conn.execute("UPDATE entries SET conflict_with=NULL WHERE id='pref_style_formal@work'")
     conn.commit()
     pack = assemble(conn, None, "w", "u1", budget=2000)
     assert pack["clarification_needed"] == []
@@ -196,7 +199,7 @@ def test_full_corruption_returns_empty_pack(conn, seeded):
 
 def test_lexical_match(conn, seeded):
     pack = assemble(conn, None, "w", "u1", budget=2000, query="最近只喝浅烘咖啡豆吗")
-    assert "preference_coffee" in [e["id"] for e in pack["entries"]]
+    assert "preference_coffee@global" in [e["id"] for e in pack["entries"]]
 
 
 def test_related_top_k_configurable(conn):
@@ -219,7 +222,7 @@ def test_vector_recall(conn, seeded):
                   json.dumps([0.1, 0.2, 0.3, 0.4])))
     conn.commit()
     pack = assemble(conn, EmbedderStub(), "w", "u1", budget=2000, query="咖啡")
-    assert "preference_coffee" in [e["id"] for e in pack["entries"]]
+    assert "preference_coffee@global" in [e["id"] for e in pack["entries"]]
 
 
 def test_vector_recall_drops_dissimilar(conn, seeded):
@@ -232,7 +235,7 @@ def test_vector_recall_drops_dissimilar(conn, seeded):
                   json.dumps([-0.1, -0.2, -0.3, -0.4])))
     conn.commit()
     pack = assemble(conn, EmbedderStub(), "w", "u1", budget=2000, query="深度学习")
-    assert "preference_coffee" not in [e["id"] for e in pack["entries"]]
+    assert "preference_coffee@global" not in [e["id"] for e in pack["entries"]]
 
 
 def test_vector_recall_threshold_configurable(conn, seeded):
@@ -245,18 +248,18 @@ def test_vector_recall_threshold_configurable(conn, seeded):
     conn.commit()
     pack = assemble(conn, EmbedderStub(), "w", "u1", budget=2000, query="深度学习",
                     min_similarity=-1.0)
-    assert "preference_coffee" in [e["id"] for e in pack["entries"]]
+    assert "preference_coffee@global" in [e["id"] for e in pack["entries"]]
 
 
 def test_embed_down_falls_back_to_lexical(conn, seeded):
     pack = assemble(conn, EmbedderDown(), "w", "u1", budget=2000, query="浅烘咖啡")
-    assert "preference_coffee" in [e["id"] for e in pack["entries"]]
+    assert "preference_coffee@global" in [e["id"] for e in pack["entries"]]
 
 
 def test_embed_keyerror_falls_back_to_lexical(conn, seeded):
     # Task 4 遗留：网关 200 + 坏体 KeyError 同样回退词面
     pack = assemble(conn, EmbedderKeyError(), "w", "u1", budget=2000, query="浅烘咖啡")
-    assert "preference_coffee" in [e["id"] for e in pack["entries"]]
+    assert "preference_coffee@global" in [e["id"] for e in pack["entries"]]
 
 
 def test_rendered_wrapper(conn, seeded):
@@ -275,14 +278,14 @@ def test_include_profile_false_keeps_rest(conn, seeded):
 def test_dimensions_filter(conn, seeded):
     # 无 query 时相关集为空，entries 即必带集全量（白名单不削减）
     pack = assemble(conn, None, "w", "u1", budget=2000, dimensions=["taboo"])
-    assert {e["id"] for e in pack["entries"]} == {"taboo_excel", "identity_role"}
+    assert {e["id"] for e in pack["entries"]} == {"taboo_excel@global", "identity_role@global"}
 
 
 def test_dimensions_keeps_must_have_set(conn, seeded):
     # 必带集恒在：白名单 ["preference"] 不得静默过滤 taboo+identity
     pack = assemble(conn, None, "w", "u1", budget=2000, dimensions=["preference"])
     ids = [e["id"] for e in pack["entries"]]
-    assert "taboo_excel" in ids and "identity_role" in ids
+    assert "taboo_excel@global" in ids and "identity_role@global" in ids
 
 
 def test_dimensions_filters_related_only(conn, seeded):
@@ -291,9 +294,9 @@ def test_dimensions_filters_related_only(conn, seeded):
     conn.commit()
     pack = assemble(conn, None, "w", "u1", budget=2000, query="海淀区咖啡", dimensions=["preference"])
     ids = [e["id"] for e in pack["entries"]]
-    assert "preference_coffee" in ids          # 白名单内的相关集条目入选
+    assert "preference_coffee@global" in ids          # 白名单内的相关集条目入选
     assert "context_city" not in ids           # 白名单外的相关维度被筛掉
-    assert "taboo_excel" in ids and "identity_role" in ids  # 必带集不受影响
+    assert "taboo_excel@global" in ids and "identity_role@global" in ids  # 必带集不受影响
 
 
 # ---- fix wave 新增：跨 scope 复合键 / 多矛盾对同秒 ----
@@ -304,7 +307,7 @@ def test_cross_scope_same_id_both_injected(conn):
     _entry(conn, "preference", "lang", "语言项目内使用 Go 写服务", scope="project:x")
     conn.commit()
     pack = assemble(conn, None, "w", "u1", budget=2000, query="语言")
-    bodies = [e["text"] for e in pack["entries"] if e["id"] == "preference_lang"]
+    bodies = [e["text"] for e in pack["entries"] if e["id"].startswith("preference_lang@")]
     assert "语言使用 Python 写脚本" in bodies and "语言项目内使用 Go 写服务" in bodies
 
 

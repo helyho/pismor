@@ -4,9 +4,8 @@
   active/degraded 按 taxonomy.dimensions[].file（degraded 是状态不是位置）；
   shell 族（preference/fact/context）的 project:{name} 作用域分流 projects/{name}.md，
   name 过白名单防路径穿越（taboo/identity 恒入必带集文件，修复轮②裁决）。
-- 键约定（上游裁决）：sources.entry_id 是行唯一复合键 "{entries.id}@{scope}"；
-  唯一例外是 UPDATE 轨迹行（topic 以 ~ 前缀）——写入器转移证据时存裸 id
-  （writer._update），JOIN 键按行形态二分。
+- 键约定：entries.id 与 sources.entry_id 同为行键 "{dim}_{topic}@{scope}"，
+  JOIN 直接按 e.id = s.entry_id（轨迹行/快照行同形，无例外）。
 - 确定性输出：查询固定排序 + yaml.safe_dump(sort_keys=False)，同库同输出；
   导出器只读库（仅 SELECT），手工编辑导出文件会在下次导出被覆盖。
 """
@@ -71,15 +70,14 @@ def export(conn, user_source, user_id, out_root: Path) -> Path:
         "SELECT * FROM entries WHERE user_source=? AND user_id=?"
         " ORDER BY dimension, scope, id",
         (user_source, user_id)).fetchall()
-    # 证据行随条目一次取出；轨迹行走裸 id 键，其余走 "{id}@{scope}"（见模块 docstring）
+    # 证据行随条目一次取出；行键唯一形式为 "{dim}_{topic}@{scope}"（见模块 docstring）
     src_by_entry: dict[tuple, list] = {}
     for s in conn.execute(
         "SELECT e.dimension AS e_dim, e.topic AS e_topic, e.scope AS e_scope,"
         "       s.seq, s.origin_type, s.origin_ref, s.quote, s.kind"
         " FROM entries e JOIN sources s"
         "  ON s.user_source=e.user_source AND s.user_id=e.user_id"
-        " AND s.entry_id = CASE WHEN e.topic LIKE '~%' THEN e.id"
-        "                      ELSE e.id || '@' || e.scope END"
+        " AND s.entry_id = e.id"
         " WHERE e.user_source=? AND e.user_id=? ORDER BY s.seq",
         (user_source, user_id)):
         src_by_entry.setdefault((s["e_dim"], s["e_topic"], s["e_scope"]), []).append(s)

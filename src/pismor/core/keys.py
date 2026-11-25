@@ -1,10 +1,10 @@
 """复合键与作用域约定（spec §8.1 / §11）。
 
-- 条目在库内的唯一寻址是五元组 (user_source,user_id,dimension,topic,scope)；
-  展示用 id 不含 scope，跨 scope 同 id 合法。任何跨行关联（conflict_with、
-  pending_clarifications、复核 verdict、澄清目标）都必须额外携带 scope。
-- 对外/持久化的关联标记写成 "{id}@{scope}"（如 preference_style@global）。
-  旧数据里的裸 id 仍可解析：按所在行的 scope 补全（历史冲突对恒为同 scope）。
+- 条目在库内的唯一寻址是五元组 (user_source,user_id,dimension,topic,scope)。
+- 行键统一写作 "{dimension}_{topic}@{scope}"（如 preference_style@global）：
+  entries.id 与 sources.entry_id 同为该值，可直接 JOIN；conflict_with、
+  pending_clarifications、复核 verdict、澄清目标也用同一标记。
+  旧库的裸 id 由 init_schema 启动时迁移补齐。
 """
 import re
 
@@ -17,6 +17,11 @@ VEC_SEP = "\x1f"
 
 def valid_scope(scope: str | None) -> bool:
     return bool(scope) and SCOPE_RE.fullmatch(scope) is not None
+
+
+def entry_key(dimension: str, topic: str, scope: str) -> str:
+    """行键 {dimension}_{topic}@{scope}：entries.id 与 sources.entry_id 共用。"""
+    return f"{dimension}_{topic}{_MARK_SEP}{scope}"
 
 
 def mark(entry_id: str, scope: str) -> str:

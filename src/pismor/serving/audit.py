@@ -37,7 +37,9 @@ def run_audit(conn, taxonomy) -> list[dict]:
 
 
 def _entry(row) -> dict:
-    return {k: row[k] for k in _ENTRY_FIELDS}
+    d = {k: row[k] for k in _ENTRY_FIELDS}
+    d["id"] = row["id"] if "id" in row.keys() else None
+    return d
 
 
 def _loc(row):
@@ -87,7 +89,11 @@ def _adjudicated(tb, pf):
         pf_marks = set(json.loads(pf["conflict_with"] or "[]"))
     except (TypeError, ValueError):
         return False
-    return tb["id"] in pf_marks or pf["id"] in tb_marks
+    # 兼容旧库：conflict_with 可能存裸 id（无 @scope），按行键与裸 id 双重匹配
+    tb_bare = tb["id"].rsplit("@", 1)[0]
+    pf_bare = pf["id"].rsplit("@", 1)[0]
+    return (tb["id"] in pf_marks or tb_bare in pf_marks
+            or pf["id"] in tb_marks or pf_bare in tb_marks)
 
 
 def _conflict_json(conn):
@@ -111,7 +117,7 @@ def _taboo_negation(conn):
         "SELECT e.user_source, e.user_id, e.dimension, e.topic, e.scope, e.id, s.quote"
         " FROM entries e JOIN sources s"
         "  ON s.user_source=e.user_source AND s.user_id=e.user_id"
-        " AND s.entry_id = e.dimension || '_' || e.topic || '@' || e.scope"
+        " AND s.entry_id = e.id"
         " WHERE e.dimension='taboo' AND e.status IN ('active','degraded')").fetchall()
     for r in rows:
         if not _NEGATION_RE.search(r["quote"] or ""):
@@ -139,7 +145,7 @@ def _quote_required(conn):
         "SELECT e.user_source, e.user_id, e.dimension, e.topic, e.scope"
         " FROM entries e LEFT JOIN sources s"
         "  ON s.user_source=e.user_source AND s.user_id=e.user_id"
-        " AND s.entry_id = e.dimension || '_' || e.topic || '@' || e.scope"
+        " AND s.entry_id = e.id"
         " WHERE s.seq IS NULL AND e.topic NOT LIKE '~%'").fetchall()]
 
 
@@ -150,7 +156,7 @@ def _inferred_cap(conn):
         "SELECT DISTINCT e.user_source, e.user_id, e.dimension, e.topic, e.scope, e.confidence"
         " FROM entries e JOIN sources s"
         "  ON s.user_source=e.user_source AND s.user_id=e.user_id"
-        " AND s.entry_id = e.dimension || '_' || e.topic || '@' || e.scope"
+        " AND s.entry_id = e.id"
         " WHERE s.kind='inferred' AND e.confidence > 0.8").fetchall()]
 
 
@@ -218,7 +224,7 @@ def isolate_violations(conn, violations: list[dict], now: str) -> int:
             conn.execute(
                 "INSERT INTO review_history (entry_id, user_source, user_id, verdict, actor,"
                 " ts, note, entry_version) VALUES (?, ?, ?, 'isolated', 'audit', ?, ?, ?)",
-                (f"{e['dimension']}_{e['topic']}", e["user_source"], e["user_id"], now,
+                (e.get("id") or f"{e['dimension']}_{e['topic']}@{e['scope']}", e["user_source"], e["user_id"], now,
                  v["rule"], row["updated_at"]))
             isolated += 1
     return isolated

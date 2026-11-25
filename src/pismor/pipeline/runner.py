@@ -22,7 +22,7 @@ from pismor.serving import assembler
 from pismor.core import fts
 from pismor.core.config import Settings
 from pismor.llm.embedder import Embedder
-from pismor.core.keys import mark, split_mark, valid_scope
+from pismor.core.keys import entry_key, valid_scope
 from pismor.llm.client import LLMClient
 from pismor.core.schemas import canonical_hash
 from pismor.core.taxonomy import load_taxonomy
@@ -49,6 +49,11 @@ def run_pipeline(conn, settings: Settings, event: dict, *, taxonomy=None, llm=No
 
 def _run(conn, settings: Settings, event, taxonomy, llm, embedder) -> None:
     us, uid = event["source"], event["user_ref"]
+    if conn.execute("SELECT 1 FROM tombstones WHERE user_source=? AND user_id=?",
+                    (us, uid)).fetchone():
+        # 删除权（spec §16#4）：tombstone 为永久口径——删除后不再收集新画像，也不调 LLM
+        logger.info("pipeline skip for deleted user %s/%s", us, uid)
+        return
     now = event.get("ts") or datetime.now(timezone.utc).isoformat(timespec="seconds")
     origin_type = event.get("event_type") or "text"
     origin_ref = event.get("origin_ref") or event.get("event_id") or canonical_hash(event)
@@ -134,15 +139,10 @@ def _clarify_pair_rows(conn, us, uid, conflicting_ids) -> list:
     """解析 pending 的矛盾对为存活行；裸 id（旧数据）按现有行补全 scope。"""
     rows, seen = [], set()
     for value in conflicting_ids:
-        entry_id, scope = split_mark(str(value), None)
-        if scope:
-            found = conn.execute(
-                "SELECT * FROM entries WHERE user_source=? AND user_id=? AND id=? AND scope=?"
-                " AND status IN ('active','degraded')", (us, uid, entry_id, scope)).fetchall()
-        else:
-            found = conn.execute(
-                "SELECT * FROM entries WHERE user_source=? AND user_id=? AND id=?"
-                " AND status IN ('active','degraded')", (us, uid, entry_id)).fetchall()
+        # 行键即完整标记 {dim}_{topic}@{scope}；旧裸 id 值同样能匹配旧行
+        found = conn.execute(
+            "SELECT * FROM entries WHERE user_source=? AND user_id=? AND id=?"
+            " AND status IN ('active','degraded')", (us, uid, str(value))).fetchall()
         for r in found:
             key = (r["dimension"], r["topic"], r["scope"])
             if key not in seen:
@@ -155,10 +155,9 @@ def _clarify_pair_rows(conn, us, uid, conflicting_ids) -> list:
         except (TypeError, ValueError):
             marks = []
         for m in marks:
-            eid, scope = split_mark(str(m), r["scope"])
             other = conn.execute(
-                "SELECT * FROM entries WHERE user_source=? AND user_id=? AND id=? AND scope=?"
-                " AND status IN ('active','degraded')", (us, uid, eid, scope)).fetchone()
+                "SELECT * FROM entries WHERE user_source=? AND user_id=? AND id=?"
+                " AND status IN ('active','degraded')", (us, uid, str(m))).fetchone()
             if other is not None:
                 key = (other["dimension"], other["topic"], other["scope"])
                 if key not in seen:
@@ -204,7 +203,7 @@ def _settle_pair(conn, us, uid, pair_rows, applied_keys, now) -> None:
     with conn:
         for old in pair_rows:
             row = conn.execute(
-                "SELECT dimension, topic, scope, status FROM entries"
+                "SELECT id, dimension, topic, scope, status FROM entries"
                 " WHERE user_source=? AND user_id=? AND dimension=? AND topic=? AND scope=?",
                 (us, uid, old["dimension"], old["topic"], old["scope"])).fetchone()
             if row is None:
@@ -230,7 +229,7 @@ def _settle_pair(conn, us, uid, pair_rows, applied_keys, now) -> None:
                 "UPDATE entries SET conflict_with=NULL, updated_at=? WHERE user_source=?"
                 " AND user_id=? AND dimension=? AND topic=? AND scope=?"
                 " AND conflict_with IS NOT NULL", (now, us, uid, *key))
-            writer.resolve_conflicts(conn, us, uid, row["dimension"] + "_" + row["topic"],
+            writer.resolve_conflicts(conn, us, uid, row["id"],
                                      row["scope"], now, revive=True, clear_pending=False)
 
 
@@ -251,7 +250,7 @@ def _write_pending(conn, us, uid, candidates, origin_type, origin_ref, now) -> i
             continue
         try:
             with conn:
-                entry_id = f"{c['dimension']}_{c['topic']}"
+                entry_id = entry_key(c["dimension"], c["topic"], c["scope"])
                 conn.execute(
                     f"INSERT INTO entries ({_PENDING_COLS})"
                     " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
@@ -261,7 +260,7 @@ def _write_pending(conn, us, uid, candidates, origin_type, origin_ref, now) -> i
                 conn.execute(
                     "INSERT INTO sources (entry_id,user_source,user_id,origin_type,origin_ref,"
                     " quote,kind) VALUES (?,?,?,?,?,?,?)",
-                    (f"{entry_id}@{c['scope']}", us, uid, origin_type, origin_ref,
+                    (entry_id, us, uid, origin_type, origin_ref,
                      c["quote"], c.get("kind") or "explicit"))
             n += 1
         except sqlite3.IntegrityError:
@@ -298,6 +297,6 @@ def _record_apply_failure(conn, us, uid, action, exc, now) -> None:
             conn.execute(
                 "INSERT INTO review_history (entry_id, user_source, user_id, verdict, actor,"
                 " ts, note, entry_version) VALUES (?, ?, ?, 'apply_failed', 'pipeline', ?, ?, ?)",
-                (f"{c.get('dimension')}_{c.get('topic')}", us, uid, now, str(exc), ""))
+                (f"{c.get('dimension')}_{c.get('topic')}@{c.get('scope')}", us, uid, now, str(exc), ""))
     except sqlite3.Error:  # 留痕失败不得再冒泡
         logger.exception("failed to record apply failure")

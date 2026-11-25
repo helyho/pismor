@@ -19,11 +19,12 @@ t9() {
   http POST /events "$(bb_event t9u "$ev" "别再给我生成 Excel 公式了, 用 Python")"
   expect_status 202 || return 1
   wait_db "SELECT 1 FROM entries e WHERE e.user_id='t9u' AND e.dimension='taboo'" 90 \
-    || { case_fail "90s 内 taboo 条目未入库"; }
+    || { case_fail "90s 内 taboo 条目未入库"; return 1; }
+  promote_active t9u taboo || return 1
   http GET /profile/bb/t9u
   expect_status 200 || return 1
-  expect_json '[.entries[] | select(.dimension == "taboo")] | length > 0' 'true' || return 1
-  expect_json '.entries[0].dimension' 'taboo' || return 1
+  expect_json '[.entries[] | select(.id | startswith("taboo"))] | length > 0' 'true' || return 1
+  expect_json '.entries[0].id | startswith("taboo")' 'true' || return 1
   case_pass
 }
 # T10 identity 入包（LLM）
@@ -33,10 +34,11 @@ t10() {
   http POST /events "$(bb_event t10u "$ev" "我是一名后端工程师")"
   expect_status 202 || return 1
   wait_db "SELECT 1 FROM entries e WHERE e.user_id='t10u' AND e.dimension='identity'" 90 \
-    || { case_fail "90s 内 identity 条目未入库"; }
+    || { case_fail "90s 内 identity 条目未入库"; return 1; }
+  promote_active t10u identity || return 1
   http GET /profile/bb/t10u
   expect_status 200 || return 1
-  expect_json '[.entries[] | select(.dimension == "identity")] | length > 0' 'true' || return 1
+  expect_json '[.entries[] | select(.id | startswith("identity"))] | length > 0' 'true' || return 1
   case_pass
 }
 # T11 用户隔离：u 有画像后，其他 user / 其他 source 均为空包
@@ -46,10 +48,11 @@ t11() {
   http POST /events "$(bb_event t11u "$ev" "记住, 我自己的小脚本默认都用 Python 写")"
   expect_status 202 || return 1
   wait_db "SELECT 1 FROM entries e WHERE e.user_id='t11u' AND e.dimension='preference'" 90 \
-    || { case_fail "90s 内条目未入库"; }
-  http GET /profile/bb/t11u
+    || { case_fail "90s 内条目未入库"; return 1; }
+  # 无 query 的包只含必带集(taboo+identity)；preference 经 query 召回验证在包
+  http GET "/profile/bb/t11u?query=python"
   expect_status 200 || return 1
-  expect_json '[.entries | length > 0]' 'true' || return 1
+  expect_json '.entries | length > 0' 'true' || return 1
   http GET /profile/bb/t11other
   expect_status 200 || return 1
   expect_json '.entries' '[]' || return 1

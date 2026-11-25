@@ -30,29 +30,29 @@ t14() {
   http POST /events "$(bb_event t14u "$ev" "记住, 我自己的小脚本默认都用 Python 写")"
   expect_status 202 || return 1
   wait_db "SELECT 1 FROM entries e WHERE e.user_id='t14u' AND e.dimension='preference' AND e.topic='lang'" 90 \
-    || { case_fail "90s 内条目未入库"; }
-  local entry_id ver
-  entry_id=$(db "SELECT id FROM entries WHERE user_id='t14u' AND topic='lang' ORDER BY id LIMIT 1")
-  [[ "$entry_id" =~ ^[0-9]+$ ]] || { case_fail "未取到 entry_id: $entry_id"; }
-  ver=$(db "SELECT updated_at FROM entries WHERE id=$entry_id")
-  local vpath="/review/bb/t14u/global/$entry_id/verdict"
+    || { case_fail "90s 内条目未入库"; return 1; }
+  local entry_id ver ver2 scope
+  entry_id=$(db "SELECT id FROM entries WHERE user_source='bb' AND user_id='t14u' AND topic='lang' ORDER BY rowid DESC LIMIT 1")
+  [[ -n "$entry_id" ]] || { case_fail "未取到 entry_id"; return 1; }
+  ver=$(db "SELECT updated_at FROM entries WHERE user_source='bb' AND user_id='t14u' AND id='${entry_id}' ORDER BY rowid DESC LIMIT 1")
+  scope=$(db "SELECT scope FROM entries WHERE user_source='bb' AND user_id='t14u' AND id='${entry_id}' ORDER BY rowid DESC LIMIT 1")
+  local vpath="/review/bb/t14u/${scope}/${entry_id}/verdict"
   # approve：review_history +1，非 noop
-  http POST "$vpath" "{\"verdict\":\"approve\",\"entry_version\":\"$ver\"}"
+  http POST "$vpath" "$(jq -n --arg verdict approve --arg v "$ver" '{verdict:$verdict, entry_version:$v}')"
   expect_status 200 || return 1
   expect_json '.noop' 'false' || return 1
-  expect_db "SELECT count(*) FROM review_history WHERE entry_id=$entry_id" "1" || return 1
+  expect_db "SELECT count(*) FROM review_history WHERE user_source='bb' AND user_id='t14u' AND entry_id='${entry_id}'" "1" || return 1
   # 旧版本重发 → noop（版本失配保护）
-  http POST "$vpath" "{\"verdict\":\"discard\",\"entry_version\":\"$ver\"}"
+  http POST "$vpath" "$(jq -n --arg verdict discard --arg v "$ver" '{verdict:$verdict, entry_version:$v}')"
   expect_status 200 || return 1
   expect_json_true '.noop' || return 1
   # 新版本 discard → 该条目不再生效
-  local ver2
-  ver2=$(db "SELECT updated_at FROM entries WHERE id=$entry_id")
-  [[ -n "$ver2" ]] || { case_fail "discard 前 entry 已消失"; }
-  http POST "$vpath" "{\"verdict\":\"discard\",\"entry_version\":\"$ver2\"}"
+  ver2=$(db "SELECT updated_at FROM entries WHERE user_source='bb' AND user_id='t14u' AND id='${entry_id}' ORDER BY rowid DESC LIMIT 1")
+  [[ -n "$ver2" ]] || { case_fail "discard 前 entry 已消失"; return 1; }
+  http POST "$vpath" "$(jq -n --arg verdict discard --arg v "$ver2" '{verdict:$verdict, entry_version:$v}')"
   expect_status 200 || return 1
   expect_json '.noop' 'false' || return 1
-  expect_db "SELECT count(*) FROM entries WHERE id=$entry_id" "0" || return 1
+  expect_db "SELECT count(*) FROM entries WHERE user_source='bb' AND user_id='t14u' AND id='${entry_id}'" "0" || return 1
   case_pass
 }
 # T15 复核队列结构：200、items 为数组、非空时键齐全

@@ -68,8 +68,9 @@ t6() {
   local cond="e.user_source='bb' AND e.user_id='t6u' AND e.dimension='preference' AND e.topic='lang' AND e.scope='global'"
   wait_db "SELECT 1 FROM entries e WHERE $cond AND e.status='active'" 90 \
     || { case_fail "90s 内 entries 未出现 preference/lang/global active 行"; }
-  expect_db "SELECT count(*) FROM sources s JOIN entries e ON s.entry_id=e.id WHERE $cond AND s.kind='explicit'" "1" || return 1
-  expect_db "SELECT count(*) FROM sources s JOIN entries e ON s.entry_id=e.id WHERE $cond AND s.origin_ref='blackbox:$ev'" "1" || return 1
+  # sources 自带 user_id；entry_id 逻辑键（dimension_topic@scope）与 entries.id（dimension_topic）
+  # 格式不同，黑盒不做内部 JOIN——origin_ref 是本测试写入的唯一引用，直接断言
+  expect_db "SELECT count(*) FROM sources WHERE user_source='bb' AND user_id='t6u' AND origin_ref='blackbox:$ev' AND kind='explicit'" "1" || return 1
   case_pass
 }
 # T7 闲聊零入库（LLM）：90s 窗口内 entries/sources 均无该用户行
@@ -81,7 +82,8 @@ t7() {
   if wait_db "SELECT 1 FROM entries e WHERE e.user_source='bb' AND e.user_id='t7u'" 90; then
     case_fail "闲聊也入库了"
   fi
-  expect_db "SELECT count(*) FROM sources s JOIN entries e ON s.entry_id=e.id WHERE e.user_source='bb' AND e.user_id='t7u'" "0" || return 1
+  # sources 自带 user_id 列（entry_id 逻辑键与 entries.id 格式不同，黑盒不做内部 JOIN）
+  expect_db "SELECT count(*) FROM sources WHERE user_source='bb' AND user_id='t7u'" "0" || return 1
   case_pass
 }
 run_domain_events() {

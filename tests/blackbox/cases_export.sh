@@ -60,8 +60,8 @@ t19() {
   expect_json_true '.deleted' || return 1
   expect_db "SELECT count(*) FROM tombstones WHERE user_source='bb' AND user_id='t19u'" "1" || return 1
   expect_db "SELECT count(*) FROM entries WHERE user_id='t19u'" "0" || return 1
-  expect_db "SELECT count(*) FROM sources WHERE entry_id IN ($ids)" "0" || return 1
-  expect_db "SELECT count(*) FROM review_history WHERE entry_id IN ($ids)" "0" || return 1
+  expect_db "SELECT count(*) FROM sources WHERE user_source='bb' AND user_id='t19u'" "0" || return 1
+  expect_db "SELECT count(*) FROM review_history WHERE user_source='bb' AND user_id='t19u'" "0" || return 1
   [[ ! -e "$root19" ]] || { case_fail "导出目录未删除: $root19"; }
   http GET /profile/bb/t19u
   expect_status 200 || return 1

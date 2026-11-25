@@ -4,7 +4,7 @@
 - 测试形态：bash + curl + jq + sqlite3，真实进程、真实 HTTP、真实 SQLite
 - 配置：`config/settings.example.yaml` 原样传入，无副本、无注入
 - 测试套件：`tests/blackbox/`（`run.sh` + `lib.sh` + 6 个用例域）
-- 提交范围：`0b4c7a1..3dcbc7f`（16 个提交，11 文件，+887/−2）
+- 提交范围：`0b4c7a1..67b7f15`（21 个提交，32 文件，+1583/−76；其中 `cddb7c0` 为并行完成的 FTS/BM25 检索升级，本套件在其之上验收）
 - 报告日期：2026-11-25
 
 ## 1. 执行摘要
@@ -12,10 +12,10 @@
 | 项 | 结论 |
 |---|---|
 | 用例总数 | 26（6 域） |
-| 真实 LLM 模式 | **26/26 PASS，skipped 0，exit 0** |
+| 真实 LLM 模式（向量召回开启） | **26/26 PASS，skipped 0，exit 0** |
 | 无密钥模式 | 9 PASS / 17 SKIP，exit 0 |
 | 可重复性 | 连续两次全量结果一致，`git status` 干净 |
-| 阻塞级缺陷 | 2 个，均已修复（配置 1、产品代码 1） |
+| 已修复缺陷 | 4 个（配置 1、产品代码 3：schema 注入、embedding 端点、召回阈值） |
 | 遗留风险 | 2 项产品行为需产品侧决策（删除权层级、`entries.id` 键格式） |
 
 结论：服务在“真实 LLM + example 配置”组合下的接入、装配、复核、导出、删除、注入防御、并发与容错链路全部可用；测试过程中发现的两处阻塞缺陷（画像**从未落库**）已定位并修复，修复后画像条目真实入库并可被装配召回。
@@ -41,6 +41,7 @@ bash tests/blackbox/run.sh --only assemble,export --keep-data --port 18300
 
 - 性质级断言：不断言 LLM 措辞，只断言结构、维度/主题归属、状态机与数据库事实。
 - `POST /events` 为 202 + 后台管线，落库断言一律 `wait_db` 轮询（默认 90s，最长 120s）。
+- 装配链路随配置：`embedding.enabled: true` 时 query 召回走向量（cos 阈值 `min_similarity: 0.5`），向量不可用或低于阈值时回退词面 BM25（FTS5）。
 - LLM 随机性容错：标 `--retry` 的用例失败后隔 5s 整用例重跑一次；`event_id` 每次唯一化，重跑不会撞产品幂等去重。
 - 装配只取 `status IN (active, degraded)`；LLM 置信度随机落在 `pending_review` 时，用例先用 `promote_active`/`promote_all` 走复核通道固定前置条件，再断言召回。
 
@@ -106,10 +107,12 @@ bash tests/blackbox/run.sh --only assemble,export --keep-data --port 18300
 
 | 运行 | 命令 | 结果 |
 |---|---|---|
-| full_run9 | `LLM_API_KEY=... bash tests/blackbox/run.sh` | `passed 26/26 (skipped 0)`，exit 0 |
-| full_run10 | `bash tests/blackbox/run.sh` | `passed 9/9 (skipped 17)`，exit 0 |
+| final2_key | `LLM_API_KEY=... bash tests/blackbox/run.sh`（向量召回开启） | `passed 26/26 (skipped 0)`，exit 0 |
+| final2_nokey | `env -u LLM_API_KEY bash tests/blackbox/run.sh` | `passed 9/9 (skipped 17)`，exit 0 |
 | 幂等性 | 连续两次同模式全量 | 逐用例结果一致 |
-| 单元层回归 | `.venv/bin/python -m pytest` | 255/255 通过 |
+| 稳定性 | 域 2 单独连跑 3 次（T12 竞态修复后） | 5/5 PASS ×3 |
+| 向量召回 E2E | 单条 Python 画像，3 个相关 / 3 个无关 query | 相关（Python、编程语言）1 条；无关（天气预报、种番茄、股票）0 条 |
+| 单元层回归 | `.venv/bin/python -m pytest` | 279/279 通过 |
 
 ## 5. 发现与修复
 
@@ -127,20 +130,29 @@ bash tests/blackbox/run.sh --only assemble,export --keep-data --port 18300
 
 **影响面**：任何使用 DeepSeek/OpenAI 兼容网关且走 `json_object` 的部署都会受益；`json_schema` 原生支持的供应商行为不变。
 
-### 5.3 `entries.id` 与 `sources.entry_id` 键格式不一致（设计债，未修）
+### 5.3 向量召回两处缺陷（产品代码）
+
+开启 `embedding.enabled` 后暴露，均已修复：
+
+1. **端点重复拼接**：`Embedder` 无条件在 base 后拼 `/embeddings`，而 example 配置的 endpoint 已含 `/v1/embeddings`，请求落到 `/v1/embeddings/embeddings` 404，`EmbedUnavailable` 静默降级，`embeddings` 表恒空、语义 query 召回恒空。修复：幂等拼接（已以 `/embeddings` 结尾则不再追加，`886c10b`），并补单元测试防止回归。
+2. **召回无相似度下限**：`_vector_recall` 只按距离取 top-k，任意 query 都会返回条目（实测 Python 条目对“天气预报”cos=0.41、“股票行情”cos=0.39 仍被召回）。修复：新增 `embedding.min_similarity: 0.5`（`EmbeddingSettings` 字段 + example 配置），由 `_cos_to_l2` 换算成 L2 距离进 SQL 过滤（`ff304ae`）；低于阈值或向量不可用时回退词面 BM25。
+
+### 5.4 `entries.id` 与 `sources.entry_id` 键格式不一致（设计债，未修）
 
 `entries.id` 形如 `preference_lang`，`sources.entry_id` 形如 `preference_lang@global`，两者**永不相等**，无法直接 JOIN。功能不受影响（各自可独立查询），但对外 API 使用者在做证据链追溯时会踩坑。测试已改为各表独立断言。
 
-### 5.4 删除权只在装配/导出层生效（产品行为，需决策）
+### 5.5 删除权只在装配/导出层生效（产品行为，需决策）
 
 `tombstones` 仅在 `assembler.py` 装配时检查。删除后 ingest/runner **不拦截**新事件：同一用户再次上报，`entries` 仍会写入新行，只是 `/profile` 与导出恒为空包。若“删除”应意味着数据不可再生成，需在 intake 层增加 tombstone 检查——属产品语义决策，测试按现行为断言（T20）。
 
-### 5.5 其它观测
+### 5.6 其它观测
 
 - `events_seen` 在管线因 LLM 鉴权失败而中断时仍会写入，故 T3（幂等）在无密钥下亦可 PASS。
 - `POST /events` 的 `content` 上限 8192，超限 422。
 - 装配响应条目字段为 `{id, text, confidence, status}`，**不含 `dimension`**；维度信息只能从 `id` 前缀推断。
 - 非 ASCII query 参数必须百分号编码，裸 UTF-8 被 h11 判 400。
+- `embedding.enabled` 默认 `false`（词面匹配为默认装配路径）；开启后 `embeddings` 为 sqlite-vec `vec0` 虚表，CLI `sqlite3` 无法直接读取，需 `enable_load_extension` 后加载 `sqlite_vec`。
+- T12 曾在全量下间歇失败，根因在测试侧：`wait_db` 等“任意条目入库”会被先落库的无关条目提前满足，提权跑在目标条目写入之前，目标条目随后以 `pending_review` 入库被装配过滤。已改为等 `sources.origin_ref` 精确落库、提权后确认 `active`（`67b7f15`）。
 
 ## 6. 局限与后续建议
 
@@ -149,6 +161,7 @@ bash tests/blackbox/run.sh --only assemble,export --keep-data --port 18300
 3. **budget 截断**未做精确值断言（真实 LLM 下条目数不可控），可在后续加弱断言（`&budget=200` 时 `budget_used<=200`）。
 4. **T26 会破坏 `data/index.db`**：已实现备份/还原与 `--keep-data` 跳过，但该用例必须最后执行（套件已固定顺序）。
 5. **测试独占 `./data`**：`run.sh` 检测到运行中的服务实例会拒绝执行（exit 2），避免误清开发数据。
+6. **向量召回依赖外部 embedding 服务**：服务不可达或维度不匹配时静默降级为词面 BM25，黑盒不区分降级原因；T12 因此只断言“两条召回路径至少一条命中”，不单独断言走向量。
 
 ## 7. 复现方式
 

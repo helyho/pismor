@@ -62,10 +62,9 @@ need_llm() {
 }
 
 # next_event_id <base>：进程内唯一 event_id（retry 重跑拿新 id，不撞产品幂等去重）
-_EVENT_ID_SEQ=0
+# 用 $RANDOM（每次展开重新求值、跨子 shell 无状态）——子 shell 自增计数不回传，不能用
 next_event_id() {
-  _EVENT_ID_SEQ=$((_EVENT_ID_SEQ + 1))
-  printf '%s-%s-%d' "$1" "$$" "$_EVENT_ID_SEQ"
+  printf '%s-%s-%d%d' "$1" "$$" "$RANDOM" "$RANDOM"
 }
 
 # bb_event <user> <event_id> <content>：构造合法事件体（jq 负责转义）

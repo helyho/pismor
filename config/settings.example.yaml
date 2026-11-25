@@ -10,7 +10,7 @@ llm:
   api_key_env: LLM_API_KEY
   timeout_seconds: 120            # 单次请求超时；结构化输出慢模型建议 ≥120
   retries: 1                      # transport 异常/429/5xx 额外重试次数
-  log_preview_chars: 1000         # 响应日志预览长度
+  log_preview_chars: 2048         # 响应日志预览长度
   user_agent: ~                   # 配置后请求头注入 User-Agent（网关 UA 白名单场景）；~ = httpx 原生 UA
   # 结构化输出（默认 OpenAI 格式）。三家对照：
   # - OpenAI:   response_format + {"type":"json_schema","json_schema":{...,"strict":true}}
@@ -23,7 +23,7 @@ llm:
   #             json_schema 在 BigModel 实测可被接受但官方未承诺，勿依赖；
   #             结构靠 System Prompt 写全 Schema + 要求"输出严格 JSON、不要 Markdown 代码块"
   structured_output_param: "response_format"   # 参数名；置空 "" 则请求不带结构化输出参数
-  structured_output_type: "json_schema"        # "json_schema"(OpenAI) | "json_object"(DeepSeek/GLM)
+  structured_output_type: "json_object"        # "json_schema"(OpenAI) | "json_object"(DeepSeek/GLM)
 
 embedding:
   enabled: false                  # 默认关闭：词面匹配为默认装配路径

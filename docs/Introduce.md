@@ -45,17 +45,17 @@ GET /profile ──► assembler（必带集 taboo+identity + 相关集召回 + 
 | `writer.py` | 批量写入、唯一约束兜底、非法状态迁移拒绝 |
 | `clarifier.py` | 矛盾澄清问题 pending 的创建/匹配/消费 |
 | `pipeline.py` | 单事件管线编排（澄清回流 → 触发分级 → 强化/抽取） |
-| `assembler.py` | 画像包装配：必带集恒在、相关集按 query 向量/词面召回、预算裁剪 |
+| `assembler.py` | 画像包装配：必带集恒在、相关集按 query 向量/BM25 词面召回、预算裁剪 |
 | `aggregator.py` | 日批：无强化降级、orphan 复现晋升、归档 |
 | `audit.py` | 状态机/词表一致性审计，违规行隔离进复核 |
 | `backup.py` | `VACUUM INTO` 滚动快照（默认保留 30 份） |
 | `exporter.py` | 按用户导出 md 视图 |
 | `taxonomy.py` | 词表加载与校验（维度/主题/regression_cases） |
-| `schemas.py` / `prompts.py` / `config.py` / `db.py` / `llm.py` / `embedder.py` | 事件模型、抽取模板、配置、连接、LLM 客户端、可选向量 |
+| `schemas.py` / `prompts.py` / `config.py` / `db.py` / `llm.py` / `embedder.py` | 事件模型、抽取模板、配置、连接、LLM 客户端、可选向量；`fts.py`/`tokenizer.py` 为 BM25 影子索引（触发器同步）与分词器 |
 
 ## 快速开始
 
-要求 Python ≥ 3.12。依赖：fastapi、uvicorn、httpx、pydantic、pyyaml、sqlite-vec（扩展随连接加载；`embedding.enabled=false` 时不构造 Embedder、不建向量表，词面匹配为默认装配路径）。
+要求 Python ≥ 3.12。依赖：fastapi、uvicorn、httpx、pydantic、pyyaml、jieba（BM25 词法分词，默认分词器）、sqlite-vec（扩展随连接加载；`embedding.enabled=false` 时不构造 Embedder、不建向量表，BM25 词面匹配为默认装配路径）。
 
 ```bash
 # 安装（任选其一）
@@ -139,7 +139,7 @@ text 事件（显式提交的素材，跳过触发分级直通抽取；`content`
 | 参数 | 默认 | 说明 |
 |---|---|---|
 | `budget` | 2000 | 注入字符预算，超预算按维度优先级（taboo 恒第一）裁剪 |
-| `query` | 无 | 当前对话话题文本，驱动相关集召回（向量优先，失败回退词面） |
+| `query` | 无 | 当前对话话题文本，驱动相关集召回（向量优先，失败回退 BM25 词面检索） |
 | `dimensions` | 全部 | 逗号分隔维度白名单（只作用于相关集；必带集 taboo+identity 恒在） |
 | `include_profile` | true | false 时 entries 为空，其余照常（A/B 对照用） |
 
@@ -169,11 +169,12 @@ curl -s -X POST http://127.0.0.1:8300/review/chat_demo/u_001/global/preference_t
 | 顶层 | `db_path` / `taxonomy_path` / `export_root` | — | 库、词表、导出目录 |
 | `llm` | `endpoint` / `model` / `api_key_env` | — | 抽取与决策所用网关；`timeout_seconds` 结构化输出建议 ≥120 |
 | `llm` | `structured_output_param` / `structured_output_type` | `response_format` / `json_schema` | OpenAI 用 `json_schema`；DeepSeek/GLM 用 `json_object`；置空参数名则不带结构化输出 |
-| `embedding` | `enabled` | false | 默认关闭，词面匹配为默认装配路径；开启后 `dimensions` 须与模型一致，变更触发全量重嵌入 |
+| `embedding` | `enabled` | false | 默认关闭，BM25 词面匹配为默认装配路径；开启后 `dimensions` 须与模型一致，变更触发全量重嵌入 |
 | `gate` | `auto_min` / `review_min` / `inferred_cap` | 0.85 / 0.6 / 0.8 | 直通/复核下界/inferred 置信压顶 |
 | `pipeline` | `trigger_long_message` | 300 | 消息长度突变阈值（字符）：任一 user 消息超限即触发抽取 |
 | `pipeline` | `known_ids_limit` / `reinforce_top_k` / `max_body_chars` | 200 / 20 / 200 | 提示词规模 / 强化条数 / 候选正文截断 |
 | `aggregator` | `degrade_days` / `degrade_confidence` | 90 / 0.7 | 无强化天数×置信参与降级（taboo 恒不时间衰减） |
+| `assembler` | `tokenizer` | jieba | BM25 词法索引分词器（`jieba` 语义分词 / `bigram` 汉字二字组）；写入与查询同源，切换后重跑 `uv run scripts/rebuild_fts.py` 全量重建（启动时也会自动检测并重建） |
 | `assembler` | `taboo_budget_share` / `related_top_k` / `half_life_days` / `clarify_ttl_days` | 0.6 / 20 / 30 / 7 | merge_task taboo 预算占比 / 相关集召回条数 / 强化时效半衰期 / 澄清 TTL |
 | `intake` | `max_content_chars` | 8192 | text 事件 content 上限，超限 422（拒绝而非截断） |
 | `backup` | `keep` | 30 | 快照滚动保留份数 |
@@ -245,7 +246,7 @@ stateDiagram-v2
 3. **feedback**：事件带反馈
 4. **first_query**：库中无该用户存量条目（冷启动每条必抽）
 
-均未命中则跳过抽取（不调 LLM），仅按话题词面命中给存量条目累加强化（`_reinforce`）。
+均未命中则跳过抽取（不调 LLM），仅按话题 BM25 词面相关度命中给存量条目累加强化（`_reinforce`，top-k 按 BM25 排序）。
 
 ## 安全设计
 

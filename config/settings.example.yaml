@@ -26,13 +26,14 @@ llm:
   structured_output_type: "json_object"        # "json_schema"(OpenAI) | "json_object"(DeepSeek/GLM)
 
 embedding:
-  enabled: false                  # 默认关闭：词面匹配为默认装配路径
+  enabled: true                  # 默认关闭：词面匹配为默认装配路径
   endpoint: "http://10.11.11.108:8000/v1/embeddings"
   model: "BAAI/bge-m3"
   api_key_env: EMBEDDING_API_KEY
   dimensions: 1024                # 须与模型输出一致；变更触发全量重嵌入
   batch_size: 32
   timeout_seconds: 30
+  min_similarity: 0.5              # 相关集向量召回最低 cosine 相似度（-1=不过滤）
 
 # ---- 以下段可整体省略（缺省即默认值）----
 

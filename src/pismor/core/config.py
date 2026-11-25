@@ -24,6 +24,7 @@ class EmbeddingSettings:
     dimensions: int
     batch_size: int
     timeout_seconds: float = 30.0
+    min_similarity: float = 0.5  # 向量相关集最低 cosine 相似度；-1=不过滤
 
 @dataclass(frozen=True)
 class GateSettings:

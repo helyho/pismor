@@ -90,7 +90,8 @@ def create_app(settings: Settings, llm=None, embedder=None) -> FastAPI:
                                       taboo_budget_share=a.taboo_budget_share,
                                       related_top_k=a.related_top_k,
                                       half_life_days=a.half_life_days,
-                                      clarify_ttl_days=a.clarify_ttl_days)
+                                      clarify_ttl_days=a.clarify_ttl_days,
+                                      min_similarity=settings.embedding.min_similarity)
 
     @app.get("/review/queue")
     def review_queue():

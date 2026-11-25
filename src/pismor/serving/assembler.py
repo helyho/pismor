@@ -5,6 +5,7 @@ tombstone → 必带集(taboo+identity 全量) → 相关集(向量/词面) → 
 降级链：向量召回异常回退词面；主查询异常只回必带集；必带集也失败返回空包（不抛）。
 """
 import json
+import math
 import re
 import sqlite3
 from datetime import datetime, timezone
@@ -34,7 +35,7 @@ def _empty_pack() -> dict:
 def assemble(conn, embedder, user_source, user_id, budget=2000, dimensions=None,
              include_profile=True, query=None, audit_sink=None, *,
              taboo_budget_share=0.6, related_top_k=20, half_life_days=30.0,
-             clarify_ttl_days=7) -> dict:
+             clarify_ttl_days=7, min_similarity=0.5) -> dict:
     """装配用户画像包。
 
     dimensions: 维度白名单（None=全部）；query: 对话话题文本，驱动相关集召回；
@@ -51,7 +52,7 @@ def assemble(conn, embedder, user_source, user_id, budget=2000, dimensions=None,
         try:
             must = _must_have(conn, user_source, user_id)
             related = _related(conn, embedder, user_source, user_id, query, dimensions,
-                               top_k=related_top_k)
+                               top_k=related_top_k, min_similarity=min_similarity)
         except sqlite3.Error:
             must = _must_have(conn, user_source, user_id)  # 只回必带集
             related = []
@@ -78,7 +79,7 @@ def _must_have(conn, user_source, user_id) -> list[dict]:
 
 
 def _related(conn, embedder, user_source, user_id, query, dimensions, *,
-             top_k: int = 20) -> list[dict]:
+             top_k: int = 20, min_similarity: float = 0.5) -> list[dict]:
     if not query:
         return []
     rows: list[dict] = []
@@ -86,7 +87,7 @@ def _related(conn, embedder, user_source, user_id, query, dimensions, *,
         try:
             vec = embedder.embed([query])[0]
             rows = _vector_recall(conn, json.dumps(vec), user_source, user_id, dimensions,
-                                  top_k=top_k)
+                                  top_k=top_k, min_similarity=min_similarity)
         except (EmbedUnavailable, KeyError, json.JSONDecodeError, IndexError, sqlite3.Error):
             rows = []  # 向量召回不可用（含网关 200 坏体 KeyError）→ 回退词面
     if not rows:
@@ -94,7 +95,17 @@ def _related(conn, embedder, user_source, user_id, query, dimensions, *,
     return rows
 
 
-def _vector_recall(conn, vec_json, user_source, user_id, dimensions, *, top_k: int = 20) -> list[dict]:
+def _cos_to_l2(cos: float) -> float:
+    """cosine 相似度下限 → vec0 L2 距离上限（前提：向量已 L2 归一化，d=sqrt(2-2cos)）。
+
+    -1 等价于不过滤（归一化向量最大距离为 2）；1 只保留与 query 完全同向的向量。
+    """
+    c = max(-1.0, min(1.0, cos))
+    return math.sqrt(2.0 - 2.0 * c)
+
+
+def _vector_recall(conn, vec_json, user_source, user_id, dimensions, *,
+                   top_k: int = 20, min_similarity: float = 0.5) -> list[dict]:
     if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table'"
                     " AND name='embeddings'").fetchone() is None:
         raise sqlite3.OperationalError("embeddings table missing")
@@ -102,10 +113,10 @@ def _vector_recall(conn, vec_json, user_source, user_id, dimensions, *, top_k: i
     sql = ("SELECT {} FROM embeddings v JOIN entries e"
            " ON v.entry_id = e.user_source || char(31) || e.user_id || char(31)"
            "    || e.dimension || char(31) || e.topic || char(31) || e.scope"
-           " WHERE v.embedding MATCH ? AND v.k = {}"
+           " WHERE v.embedding MATCH ? AND v.k = {} AND v.distance <= ?"
            " AND e.user_source = ? AND e.user_id = ?"
            " AND e.status IN ('active','degraded')").format(_MUST_COLS, top_k)
-    args = [vec_json, user_source, user_id]
+    args = [vec_json, _cos_to_l2(min_similarity), user_source, user_id]
     if dimensions:
         sql += " AND e.dimension IN ({})".format(",".join("?" * len(dimensions)))
         args += dimensions

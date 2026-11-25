@@ -222,6 +222,32 @@ def test_vector_recall(conn, seeded):
     assert "preference_coffee" in [e["id"] for e in pack["entries"]]
 
 
+def test_vector_recall_drops_dissimilar(conn, seeded):
+    # query 向量与入库向量反向（L2≈1.095 > cos0.5 对应的 1.0）→ 不得进入相关集；
+    # query 与 summary 无字面交集，词面回退也拿不到，可确认是阈值过滤生效
+    conn.execute("CREATE VIRTUAL TABLE embeddings USING vec0("
+                 "entry_id TEXT PRIMARY KEY, user_source TEXT, user_id TEXT, embedding float[4])")
+    conn.execute("INSERT INTO embeddings VALUES (?, 'w','u1', ?)",
+                 (vec_key("w", "u1", "preference", "coffee", "global"),
+                  json.dumps([-0.1, -0.2, -0.3, -0.4])))
+    conn.commit()
+    pack = assemble(conn, EmbedderStub(), "w", "u1", budget=2000, query="深度学习")
+    assert "preference_coffee" not in [e["id"] for e in pack["entries"]]
+
+
+def test_vector_recall_threshold_configurable(conn, seeded):
+    # min_similarity=-1 → 距离阈值 2.0（等价不过滤），反向向量也召回
+    conn.execute("CREATE VIRTUAL TABLE embeddings USING vec0("
+                 "entry_id TEXT PRIMARY KEY, user_source TEXT, user_id TEXT, embedding float[4])")
+    conn.execute("INSERT INTO embeddings VALUES (?, 'w','u1', ?)",
+                 (vec_key("w", "u1", "preference", "coffee", "global"),
+                  json.dumps([-0.1, -0.2, -0.3, -0.4])))
+    conn.commit()
+    pack = assemble(conn, EmbedderStub(), "w", "u1", budget=2000, query="深度学习",
+                    min_similarity=-1.0)
+    assert "preference_coffee" in [e["id"] for e in pack["entries"]]
+
+
 def test_embed_down_falls_back_to_lexical(conn, seeded):
     pack = assemble(conn, EmbedderDown(), "w", "u1", budget=2000, query="浅烘咖啡")
     assert "preference_coffee" in [e["id"] for e in pack["entries"]]

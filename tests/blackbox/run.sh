@@ -10,12 +10,14 @@ cd "$(dirname "$0")/../.." # 强制仓库根（配置里 db/export 是相对 CWD
 PORT=18300
 TIMEOUT=90
 KEEP_DATA=0
+ONLY=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --keep-data) KEEP_DATA=1; shift ;;
     --port) PORT="$2"; shift 2 ;;
     --timeout) TIMEOUT="$2"; shift 2 ;;
-    *) echo "未知参数: $1（用法: run.sh [--keep-data] [--port N] [--timeout S]）" >&2; exit 2 ;;
+    --only) ONLY="$2"; shift 2 ;;
+    *) echo "未知参数: $1（用法: run.sh [--keep-data] [--port N] [--timeout S] [--only events,assemble,...]）" >&2; exit 2 ;;
   esac
 done
 
@@ -69,8 +71,9 @@ FAIL=0
 SKIP=0
 RESULTS=()
 
-# 逐域执行（Step 1 起增量加入，文件存在才 source）
+# 逐域执行（文件存在才 source；--only 过滤）
 for d in events assemble lifecycle export injection resilience; do
+  if [[ -n "$ONLY" && ",$ONLY," != *",$d,"* ]]; then continue; fi
   f="tests/blackbox/cases_${d}.sh"
   [[ -f "$f" ]] || continue
   # shellcheck disable=SC1090

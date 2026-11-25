@@ -31,6 +31,7 @@ t25() {
 # → 恢复：清库重启，healthz 恢复 200
 t26_corrupt_db() {
   local id="T26" name="损坏库拒启+自恢复" ok=1 detail=""
+  echo "  (T26: 接下来 serve.log 中的 'file is not a database' traceback 是预期产物)"
   kill "$SVC_PID" 2>/dev/null
   wait "$SVC_PID" 2>/dev/null
   echo garbage >data/index.db

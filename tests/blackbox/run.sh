@@ -26,6 +26,13 @@ for t in curl jq sqlite3; do
 done
 [[ -x .venv/bin/python ]] || { echo "缺少 .venv/bin/python（请先创建 venv）"; exit 2; }
 [[ -f scripts/serve.py ]] || { echo "找不到 scripts/serve.py（需在仓库根运行）"; exit 2; }
+# 预检：测试独占 ./data（清库 + T26 故意写坏库），检测到运行中的服务实例则拒绝
+if pgrep -f "scripts/serve.py" >/dev/null 2>&1; then
+  echo "检测到运行中的 pismor 服务实例：" >&2
+  pgrep -fl "scripts/serve.py" >&2
+  echo "测试会清空 ./data 并在 T26 故意写坏 index.db，请先停止服务再跑测试。" >&2
+  exit 2
+fi
 
 # 默认清库保证幂等（data/ exports/ 已 gitignore）
 if ((KEEP_DATA == 0)); then

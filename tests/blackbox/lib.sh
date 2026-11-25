@@ -54,10 +54,10 @@ wait_db() {
   done
 }
 
-# need_llm：LLM_API_KEY 未设置 → 置 SKIP_REASON 并返回 2（SKIP）
+# need_llm：LLM_API_KEY 未设置 → 输出原因并返回 2（SKIP）
 need_llm() {
   if [[ -n "${LLM_API_KEY:-}" ]]; then return 0; fi
-  SKIP_REASON="LLM_API_KEY 未设置"
+  printf 'LLM_API_KEY 未设置\n'
   return 2
 }
 
@@ -83,7 +83,6 @@ run_case() {
   [[ "${1:-}" == "--" ]] && shift
   local fn="$1"
   local attempt out rc
-  SKIP_REASON=""
   for attempt in 0 1; do
     out=$("$fn" 2>&1)
     rc=$?
@@ -97,8 +96,8 @@ run_case() {
       printf '[PASS] %s %s\n' "$id" "$name"
       ;;
     2)
-      SKIP=$((SKIP + 1)); RESULTS+=("[SKIP] $id $name — ${SKIP_REASON:-未知}")
-      printf '[SKIP] %s %s — %s\n' "$id" "$name" "${SKIP_REASON:-未知}"
+      SKIP=$((SKIP + 1)); RESULTS+=("[SKIP] $id $name — ${out:-未知原因}")
+      printf '[SKIP] %s %s — %s\n' "$id" "$name" "${out:-未知原因}"
       ;;
     *)
       FAIL=$((FAIL + 1)); RESULTS+=("[FAIL] $id $name")

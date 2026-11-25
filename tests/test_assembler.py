@@ -106,18 +106,18 @@ def seeded_tombstone(conn):
 
 @pytest.fixture
 def broken_db(conn):
-    # 模拟库部分损坏：词面/澄清查询读 entries.summary 被拒，必带集查询不读 summary 存活
+    # 模拟库部分损坏：词面索引 mem_fts 读取被拒，必带集查询不读 mem_fts 存活
     _entry(conn, "taboo", "excel", "表格类需求一律用 Python 脚本生成", conf=0.95)
     _entry(conn, "identity", "role", "用户是后端工程师", conf=0.9)
     _entry(conn, "preference", "coffee", "用户只喝浅烘咖啡豆", conf=0.8)
     conn.commit()
 
-    def deny_summary(action, arg1, arg2, db_name, trigger):
-        if action == sqlite3.SQLITE_READ and arg1 == "entries" and arg2 == "summary":
+    def deny_mem_fts(action, arg1, arg2, db_name, trigger):
+        if action == sqlite3.SQLITE_READ and arg1 == "mem_fts":
             return sqlite3.SQLITE_DENY
         return sqlite3.SQLITE_OK
 
-    conn.set_authorizer(deny_summary)
+    conn.set_authorizer(deny_mem_fts)
     return conn
 
 

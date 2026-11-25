@@ -19,6 +19,7 @@ from pydantic import BaseModel, ValidationError
 
 from pismor.pipeline import intake, writer
 from pismor.serving import assembler, exporter
+from pismor.core import tokenizer
 from pismor.core.config import Settings
 from pismor.core.db import get_conn, init_schema
 from pismor.llm.embedder import Embedder
@@ -42,6 +43,7 @@ def _pipeline_task(settings: Settings, event: dict, taxonomy, llm, embedder) -> 
 
 
 def create_app(settings: Settings, llm=None, embedder=None) -> FastAPI:
+    tokenizer.set_tokenizer(settings.assembler.tokenizer)  # mem_fts 分词器同源（先于 init_schema）
     taxonomy = load_taxonomy(settings.taxonomy_path)
     llm = llm or LLMClient(settings.llm)
     if embedder is None:

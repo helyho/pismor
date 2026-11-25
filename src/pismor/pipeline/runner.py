@@ -19,6 +19,7 @@ from datetime import datetime, timezone
 
 from pismor.pipeline import clarifier, extractor, gate, resolver, trigger, writer
 from pismor.serving import assembler
+from pismor.core import fts
 from pismor.core.config import Settings
 from pismor.llm.embedder import Embedder
 from pismor.core.keys import mark, split_mark, valid_scope
@@ -102,15 +103,22 @@ def _last_user_text(event: dict) -> str:
 
 
 def _reinforce(conn, us, uid, text, now, *, top_k: int = 20) -> int:
-    """无变化轮次强化：话题词面命中（summary）top-k 条目 +1，刷新 last_reinforced_at。"""
-    tokens = assembler.tokens(text)
-    if not tokens:
+    """无变化轮次强化：话题 BM25 top-k 条目 +1，刷新 last_reinforced_at（M-7）。
+
+    词面命中由 mem_fts MATCH（显式 OR，任一 token 命中即候选）召回，按 BM25
+    相关度排序截断——替代旧 LIKE OR 的表扫描+无序截断：高频通用词被 IDF 降权，
+    长文本偏置被长度归一化抵消，reinforcements 累积为真实相关度信号。
+    mem_fts 未建表（旧库未升级）时 sqlite3.OperationalError 由编排层捕获降级。
+    """
+    toks = assembler.tokens(text)
+    if not toks:
         return 0
-    likes = " OR ".join(["summary LIKE ?"] * len(tokens))
     rows = conn.execute(
-        f"SELECT dimension, topic, scope FROM entries WHERE user_source=? AND user_id=?"
-        f" AND status IN ('active','degraded') AND ({likes}) LIMIT ?",
-        [us, uid] + [f"%{t}%" for t in tokens] + [top_k]).fetchall()
+        "SELECT e.dimension, e.topic, e.scope FROM entries e JOIN mem_fts f"
+        " ON f.rowid = e.rowid WHERE mem_fts MATCH ?"
+        " AND e.user_source=? AND e.user_id=? AND e.status IN ('active','degraded')"
+        " ORDER BY bm25(mem_fts) LIMIT ?",
+        [fts.match_expr(toks), us, uid, top_k]).fetchall()
     if not rows:
         return 0
     with conn:

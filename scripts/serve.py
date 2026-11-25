@@ -11,6 +11,7 @@ import uvicorn
 
 from pismor.pipeline.aggregator import run_daily
 from pismor.serving.api import create_app
+from pismor.core import tokenizer
 from pismor.serving.audit import isolate_violations, run_audit
 from pismor.serving.backup import backup
 from pismor.core.config import load_settings
@@ -42,6 +43,7 @@ def main(argv=None) -> None:
     args = parser.parse_args(argv)
 
     settings = load_settings(args.settings)
+    tokenizer.set_tokenizer(settings.assembler.tokenizer)  # mem_fts 分词器同源
     app = create_app(settings)
     with closing(get_conn(settings.db_path)) as conn:  # 独立短连接做启动检查
         verdict = conn.execute("PRAGMA integrity_check").fetchone()[0]

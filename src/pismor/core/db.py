@@ -3,6 +3,15 @@ from pathlib import Path
 import sqlite_vec
 
 
+from pismor.core import fts as _fts
+from pismor.core import tokenizer as _tokenizer
+
+
+def _fts_terms(summary):
+    """mem_fts 触发器分词 UDF：summary → 空格分隔 token 串（不去重不截断，保 TF）。"""
+    return " ".join(_tokenizer.tokenize(summary or ""))
+
+
 def get_conn(path: Path, check_same_thread: bool = True) -> sqlite3.Connection:
     path.parent.mkdir(parents=True, exist_ok=True)
     # API 进程内路由线程池/BackgroundTasks 共用连接 → check_same_thread=False（api 层传入）
@@ -15,6 +24,8 @@ def get_conn(path: Path, check_same_thread: bool = True) -> sqlite3.Connection:
     sqlite_vec.load(conn)
     conn.enable_load_extension(False)
     conn.execute("SELECT vec_version()")  # 加载 sqlite-vec 扩展
+    # mem_fts 触发器分词 UDF（deterministic：同 summary 恒同输出，可进触发器）
+    conn.create_function("fts_terms", 1, _fts_terms, deterministic=True)
     return conn
 
 
@@ -60,11 +71,41 @@ CREATE TABLE IF NOT EXISTS tombstones (
   user_source TEXT, user_id TEXT, deleted_at TEXT, requested_by TEXT,
   PRIMARY KEY (user_source, user_id)
 );
+CREATE TABLE IF NOT EXISTS fts_meta (
+  key TEXT PRIMARY KEY, value TEXT
+);
+-- BM25 词法影子索引：terms = fts_terms(summary) 预分词串，rowid = entries.rowid。
+-- token 均为空格分隔词（分词在 UDF 完成），unicode61 恰好按空白切分。
+CREATE VIRTUAL TABLE IF NOT EXISTS mem_fts USING fts5(terms, tokenize='unicode61');
+CREATE TRIGGER IF NOT EXISTS trg_mem_fts_ai AFTER INSERT ON entries BEGIN
+  INSERT INTO mem_fts(rowid, terms) VALUES (new.rowid, fts_terms(new.summary));
+END;
+CREATE TRIGGER IF NOT EXISTS trg_mem_fts_au AFTER UPDATE OF summary ON entries BEGIN
+  DELETE FROM mem_fts WHERE rowid=new.rowid;
+  INSERT INTO mem_fts(rowid, terms) VALUES (new.rowid, fts_terms(new.summary));
+END;
+CREATE TRIGGER IF NOT EXISTS trg_mem_fts_ad AFTER DELETE ON entries BEGIN
+  DELETE FROM mem_fts WHERE rowid=old.rowid;
+END;
 """
 
 
 def init_schema(conn: sqlite3.Connection, vec_dimensions: int | None) -> None:
     conn.executescript(SCHEMA)
+    # mem_fts 分词器一致性：配置与建索引时不符 → 全量重建（切换 jieba/bigram 生效）
+    name = _tokenizer.current()
+    row = conn.execute("SELECT value FROM fts_meta WHERE key='tokenizer'").fetchone()
+    if row is None:
+        conn.execute("INSERT INTO fts_meta (key, value) VALUES ('tokenizer', ?)", (name,))
+        _fts.rebuild(conn)  # 旧库升级：存量 entries 回填
+    elif row["value"] != name:
+        _fts.rebuild(conn)
+        conn.execute("UPDATE fts_meta SET value=? WHERE key='tokenizer'", (name,))
+    # 行数漂移兜底（手工删改/异常中断）：不符即重建，低频启动路径代价可接受
+    ne, nf = conn.execute(
+        "SELECT (SELECT count(*) FROM entries), (SELECT count(*) FROM mem_fts)").fetchone()
+    if ne != nf:
+        _fts.rebuild(conn)
     if vec_dimensions:
         conn.execute(
             f"CREATE VIRTUAL TABLE IF NOT EXISTS embeddings USING vec0("

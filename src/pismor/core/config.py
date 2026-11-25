@@ -53,6 +53,7 @@ class AggregatorSettings:
 @dataclass(frozen=True)
 class AssemblerSettings:
     taboo_budget_share: float = 0.6  # merge_task 时 taboo 预算占比
+    tokenizer: str = "jieba"         # BM25 词法索引分词器："jieba" | "bigram"（切换需 rebuild）
     related_top_k: int = 20          # 相关集召回条数
     half_life_days: float = 30.0     # 强化时效半衰期
     clarify_ttl_days: int = 7        # 新建澄清 pending 的 TTL 默认

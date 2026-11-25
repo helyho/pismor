@@ -75,6 +75,7 @@ aggregator:
 
 assembler:
   taboo_budget_share: 0.6         # merge_task 时 taboo 预算占比
+  tokenizer: jieba                # BM25 词法索引分词器：jieba | bigram（切换后需重跑 scripts/rebuild_fts.py）
   related_top_k: 20               # 相关集召回条数
   half_life_days: 30              # 强化时效半衰期
   clarify_ttl_days: 7             # 新建澄清 pending 的 TTL 默认

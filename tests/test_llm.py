@@ -233,3 +233,29 @@ def test_structured_output_json_object_shape():
     payload = json.loads(route.calls.last.request.content)
     assert payload["response_format"] == {"type": "json_object"}
     assert "json_schema" not in payload["response_format"]
+
+@respx.mock
+def test_json_object_schema_injected_into_prompt():
+    # json_object 模式仅保证合法 JSON，schema 必须由提示词引导（实测 DeepSeek 自造
+    # items/entries 顶层键导致候选全丢）——注入 schema 文本到 system prompt
+    route = respx.post("https://llm.test/v1/chat/completions").respond(
+        json={"choices": [{"message": {"content": "{}"}}]})
+    client = LLMClient(LLMSettings(endpoint="https://llm.test/v1", model="m",
+                                   api_key_env="TEST_KEY",
+                                   structured_output_type="json_object"))
+    schema = {"name": "n", "schema": {"type": "object",
+                                      "properties": {"candidates": {"type": "array"}}}}
+    client.chat_json("s", "u", schema)
+    payload = json.loads(route.calls.last.request.content)
+    sys_content = payload["messages"][0]["content"]
+    assert '"candidates"' in sys_content  # schema 注入：容器键显式可见
+    assert "禁止" in sys_content  # 自造顶层键的禁用约束在
+@respx.mock
+def test_json_schema_mode_not_double_inject_schema():
+    # json_schema 模式由 response_format 强制，system prompt 保持原样不重复注入
+    route = respx.post("https://llm.test/v1/chat/completions").respond(
+        json={"choices": [{"message": {"content": "{}"}}]})
+    client = LLMClient(LLMSettings(endpoint="https://llm.test/v1", model="m", api_key_env="TEST_KEY"))
+    client.chat_json("s", "u", {"name": "n", "schema": {"type": "object"}})
+    payload = json.loads(route.calls.last.request.content)
+    assert payload["messages"][0]["content"] == "s"

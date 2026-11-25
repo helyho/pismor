@@ -26,6 +26,15 @@ class LLMClient:
         return headers
 
     def _post_once(self, system: str, user: str, schema: dict) -> httpx.Response:
+        # json_object 模式（DeepSeek/GLM）仅保证合法 JSON，schema 由提示词引导：
+        # 把 JSON Schema 文本显式注入 system，否则模型自造顶层键（实测 items/entries），
+        # 解析端 result.get("candidates") 拿空列表，候选全部丢失
+        if (self._settings.structured_output_param
+                and self._settings.structured_output_type == "json_object"):
+            schema_text = json.dumps(schema.get("schema", {}), ensure_ascii=False)
+            system = (f"{system}\n\n[输出格式硬约束] 必须输出一个严格 JSON 对象，"
+                      f"顶层键与结构严格符合以下 JSON Schema；"
+                      f"禁止改用其他顶层键（items、entries 等一律无效）：\n{schema_text}")
         payload = {
             "model": self._settings.model,
             "messages": [

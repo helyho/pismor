@@ -9,8 +9,8 @@ import math
 import sqlite3
 from datetime import datetime, timezone
 
-from pismor.pipeline.clarifier import issue as _clarify_issue
-from pismor.llm.embedder import EmbedUnavailable
+from pismor.pipeline.clarifier import issue_many as _clarify_issues
+from pismor.llm.embedder import EmbedUnavailable, l2_normalize
 from pismor.core import fts, tokenizer
 from pismor.core.keys import split_mark
 
@@ -83,7 +83,7 @@ def _related(conn, embedder, user_source, user_id, query, dimensions, *,
     rows: list[dict] = []
     if embedder is not None:
         try:
-            vec = embedder.embed([query])[0]
+            vec = l2_normalize(embedder.embed([query])[0])  # 余弦阈值换算依赖单位向量
             rows = _vector_recall(conn, json.dumps(vec), user_source, user_id, dimensions,
                                   top_k=top_k, min_similarity=min_similarity)
         except (EmbedUnavailable, KeyError, json.JSONDecodeError, IndexError, sqlite3.Error):
@@ -137,8 +137,9 @@ def _lexical(conn, user_source, user_id, query_tokens, dimensions, *, top_k: int
     if dimensions:
         sql += " AND e.dimension IN ({})".format(",".join("?" * len(dimensions)))
         args += dimensions
-    sql += " ORDER BY _bm25"
-    rows = [dict(r) for r in conn.execute(sql, args).fetchall()[:top_k]]
+    sql += " ORDER BY _bm25 LIMIT ?"
+    args.append(top_k)  # 审查 #10：截断交给 SQL，避免全量回表后丢弃
+    rows = [dict(r) for r in conn.execute(sql, args).fetchall()]
     for r in rows:
         r["_bm25"] = -r["_bm25"]
     return rows
@@ -210,9 +211,10 @@ def _build(must, related, budget, now, user_ref, include_profile, audit_sink, *,
 
 
 def _clarifications(conn, user_source, user_id, *, ttl_days: int = 7) -> list[dict]:
-    """对称 conflict_with 对 → clarifier.issue 落 pending 并随响应递交（spec §11）。
+    """对称 conflict_with 对 → clarifier.issue_many 落 pending 并随响应递交（spec §11）。
 
     关联标记为 id@scope，按 (id,scope) 定位；同 id 跨 scope 的对互不串扰（C-1）。
+    全部对合并为一次短事务写入（审查 #7），避免读接口长时间持有 WAL 写锁。
     ttl_days 透传为新建 pending 行的 TTL（settings.assembler.clarify_ttl_days）。
     """
     rows = conn.execute(
@@ -230,7 +232,8 @@ def _clarifications(conn, user_source, user_id, *, ttl_days: int = 7) -> list[di
         except (TypeError, ValueError):
             continue
         parsed[key] = marks if isinstance(marks, list) else []
-    out, done = [], set()
+    found: list[tuple[list, dict]] = []
+    done = set()
     for r in rows:
         key = r["id"]
         for other_mark in parsed.get(key, []):
@@ -254,8 +257,9 @@ def _clarifications(conn, user_source, user_id, *, ttl_days: int = 7) -> list[di
             ordered_keys = sorted((key, other_key),
                                   key=lambda k: -(by_key[k]["confidence"] or 0.0))
             marks = list(ordered_keys)
-            question = _clarify_issue(conn, user_source, user_id, marks,
-                                      {k: by_key[k]["summary"] for k in (key, other_key)},
-                                      ttl_days=ttl_days)
-            out.append({"conflicting_ids": marks, "question": question})
-    return out
+            found.append((marks, {k: by_key[k]["summary"] for k in (key, other_key)}))
+    # 一次事务落库全部澄清对（审查 #7：GET 装配路径不逐对提交，缩短写锁占用）
+    questions = _clarify_issues(conn, user_source, user_id, found, ttl_days=ttl_days) \
+        if found else []
+    return [{"conflicting_ids": marks, "question": q}
+            for (marks, _summaries), q in zip(found, questions)]

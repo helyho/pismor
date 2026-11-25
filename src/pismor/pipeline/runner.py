@@ -10,7 +10,8 @@
 - 同 key 二次写入的 sqlite3.IntegrityError 与 IllegalTransition 在本层逐条隔离：
   单条失败不整批回滚，失败写 review_history 留痕后继续（I-2）。
 - 澄清 pending 删除延后到写入成功之后（clarifier.consume）；写入失败/无候选保留 pending（I-17）。
-- 任何异常只记日志不上抛：后台任务失败不得破坏 POST /events 的 202 语义。
+- 任何异常只记日志不上抛：后台任务失败不得破坏 POST /events 的 202 语义；
+  失败时撤销 intake 的 events_seen 标记并返回 False，调用方重发同一事件即可重放（审查 #1）。
 """
 import json
 import logging
@@ -35,8 +36,11 @@ _PENDING_COLS = ("user_source,user_id,dimension,topic,scope,id,confidence,status
 
 
 def run_pipeline(conn, settings: Settings, event: dict, *, taxonomy=None, llm=None,
-                 embedder=None) -> None:
-    """后台执行完整管线；依赖缺省时按 settings 构造真实客户端（测试注入 fake）。"""
+                 embedder=None) -> bool:
+    """后台执行完整管线；依赖缺省时按 settings 构造真实客户端（测试注入 fake）。
+
+    返回是否成功：失败时撤销 intake 的 events_seen 标记（重发同一事件可重放），不冒泡。
+    """
     try:
         taxonomy = taxonomy or load_taxonomy(settings.taxonomy_path)
         llm = llm or LLMClient(settings.llm)
@@ -45,6 +49,20 @@ def run_pipeline(conn, settings: Settings, event: dict, *, taxonomy=None, llm=No
         _run(conn, settings, event, taxonomy, llm, embedder)
     except Exception:  # 后台任务兜底：失败只留日志，不冒泡到上报方
         logger.exception("pipeline failed for event %s", event.get("event_id"))
+        _forget_event(conn, event)
+        return False
+    return True
+
+
+def _forget_event(conn, event):
+    """撤销"已见"标记：LLM/嵌入等瞬时故障后可重放（审查 #1）。"""
+    event_id, source = event.get("event_id"), event.get("source")
+    try:
+        conn.rollback()
+        conn.execute("DELETE FROM events_seen WHERE source=? AND event_id=?", (source, event_id))
+        conn.commit()
+    except sqlite3.Error:  # 撤销失败只留日志，避免二次故障冒泡
+        logger.exception("failed to clear seen marker for event %s", event_id)
 
 
 def _run(conn, settings: Settings, event, taxonomy, llm, embedder) -> None:
@@ -269,21 +287,24 @@ def _write_pending(conn, us, uid, candidates, origin_type, origin_ref, now) -> i
 
 
 def _apply(conn, us, uid, actions, embedder, origin_type, origin_ref, now) -> list[dict]:
-    """整批写入；唯一约束/非法迁移 → 回滚后逐条重放，失败条留痕跳过，返回成功条。"""
+    """整批写入；唯一约束/非法迁移 → 回滚后逐条重放，失败条留痕跳过。
+
+    返回真正落库的动作（由 writer 判定）：无 quote / 非法 scope 等被跳过的候选不计入
+    "已应用"，避免上层误判澄清已被覆盖（审查 #17）。
+    """
     if not actions:
         return []
     try:
-        writer.apply_actions(conn, us, uid, actions, embedder, origin_type, origin_ref, now)
-        return list(actions)
+        return writer.apply_actions(conn, us, uid, actions, embedder, origin_type, origin_ref, now)
     except (sqlite3.IntegrityError, writer.IllegalTransition) as exc:
         logger.warning("batch write failed (%s); replaying per action", exc)
         conn.rollback()
     applied = []
     for action in actions:
         try:
-            writer.apply_actions(conn, us, uid, [action], embedder,
-                                 origin_type, origin_ref, now)
-            applied.append(action)
+            if writer.apply_actions(conn, us, uid, [action], embedder,
+                                    origin_type, origin_ref, now):
+                applied.append(action)
         except (sqlite3.IntegrityError, writer.IllegalTransition) as exc:
             conn.rollback()  # 该候选隔离：不拖垮其余候选
             _record_apply_failure(conn, us, uid, action, exc, now)

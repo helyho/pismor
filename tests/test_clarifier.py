@@ -97,6 +97,21 @@ def test_issue_different_pair_inserts_new(conn):
     assert "要简洁" in q2
 
 
+def test_issue_refreshes_ttl_on_reissue(conn):
+    # 同一对再次发问 = 重新计时：ttl_days 必须跟随新配置，不能沿用旧行的值
+    from pismor.core.keys import canonical_ids
+
+    key = canonical_ids(["a", "b"])
+    conn.execute(
+        "INSERT INTO pending_clarifications"
+        " (user_source,user_id,conflicting_ids,question,issued_at,ttl_days)"
+        " VALUES ('w','u',?,'旧问题','2026-01-01T00:00:00+00:00',7)", (key,))
+    conn.commit()
+    issue(conn, "w", "u", ["a", "b"], {"a": "要正式", "b": "要口语化"}, ttl_days=30)
+    rows = conn.execute("SELECT ttl_days FROM pending_clarifications").fetchall()
+    assert len(rows) == 1 and rows[0]["ttl_days"] == 30
+
+
 def test_no_pending_returns_none_without_llm(conn, fake_llm_yes):
     assert match_incoming(conn, "w", "u", "今天天气不错", fake_llm_yes) is None
     assert fake_llm_yes.calls == []  # 无 pending 不进 LLM
@@ -112,3 +127,17 @@ def test_expire_ttl(conn, seeded_expired_pending):
     assert expire(conn, "2026-12-01") == 1
     remain = conn.execute("SELECT question FROM pending_clarifications").fetchall()
     assert [r["question"] for r in remain] == ["旧问题2"]
+
+
+def test_expire_can_join_caller_transaction(conn):
+    # commit=False：过期删除随调用方事务回滚，供日批保持单事务
+    conn.execute(
+        "INSERT INTO pending_clarifications"
+        " (user_source,user_id,conflicting_ids,question,issued_at,ttl_days)"
+        " VALUES ('w','u','[\"a\",\"b\"]','问题','2026-01-01T00:00:00+00:00',7)")
+    conn.commit()
+    with pytest.raises(RuntimeError):
+        with conn:
+            assert expire(conn, "2026-12-24T10:00:00+08:00", commit=False) == 1
+            raise RuntimeError("rollback")
+    assert conn.execute("SELECT COUNT(*) c FROM pending_clarifications").fetchone()["c"] == 1

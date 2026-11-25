@@ -4,7 +4,12 @@ import json
 import pytest
 
 from pismor.llm.embedder import EmbedUnavailable
-from pismor.core.keys import mark, vec_key
+from pismor.core.keys import vec_key
+
+
+def mark(entry_id: str, scope: str) -> str:
+    """关联标记的本地等价实现（生产侧只保留 split_mark/entry_key）。"""
+    return f"{entry_id}@{scope}"
 from pismor.pipeline.writer import IllegalTransition, apply_actions
 
 NOW = "2026-11-24T00:00:00+08:00"
@@ -337,7 +342,6 @@ def _seed_row(conn, *, dim="preference", topic="lang", scope="global", status="a
 
 def test_resolve_conflicts_exact_mark_scope_and_status(conn):
     # M-2/M-3：只清精确 (id,scope) 的存活行标记；archived 轨迹行与近似 id 行不得被改写
-    from pismor.core.keys import mark
     from pismor.pipeline.writer import resolve_conflicts
     _seed_row(conn, topic="styleX", scope="global",
               conflict_with=json.dumps([mark("preference_styleX", "global")]))
@@ -356,7 +360,6 @@ def test_resolve_conflicts_exact_mark_scope_and_status(conn):
 
 def test_cross_scope_conflict_marks_do_not_cross(conn):
     # 同 id 跨 scope：global 的冲突收尾不得清 project:x 的标记
-    from pismor.core.keys import mark
     from pismor.pipeline.writer import resolve_conflicts
     _seed_row(conn, topic="lang", scope="global",
               conflict_with=json.dumps([mark("preference_style", "project:x")]))
@@ -370,7 +373,6 @@ def test_cross_scope_conflict_marks_do_not_cross(conn):
 
 def test_normal_update_does_not_revive_opponent(conn):
     # M-1：普通演进 UPDATE 只清 conflict_with，不复活冲突对方
-    from pismor.core.keys import mark
     _seed_row(conn, topic="lang", scope="global",
               conflict_with=json.dumps([mark("preference_+lang", "global")]))
     _seed_row(conn, topic="+lang", scope="global", status="degraded",
@@ -462,3 +464,70 @@ def test_entry_id_is_row_key_matching_sources(conn, embedder_stub):
         " ON s.user_source=e.user_source AND s.user_id=e.user_id AND s.entry_id=e.id"
         " WHERE e.id=?", (row["id"],)).fetchone()
     assert hit is not None
+
+
+# ---- 审查修复：事务外批量嵌入 / L2 归一化 / 失效标记重定向 / 已应用动作返回值 ----
+
+
+class CountingEmbedder:
+    def __init__(self, vec=None):
+        self.calls = []
+        self.vec = vec or [0.1, 0.2, 0.3, 0.4]
+
+    def embed(self, texts):
+        self.calls.append(list(texts))
+        return [list(self.vec) for _ in texts]
+
+
+def _with_body(action, body):
+    action["candidate"]["body"] = body
+    return action
+
+
+def test_vectors_embedded_in_one_batch_outside_write(conn):
+    # 审查 #3：嵌入是网络 IO，不得在写事务内逐条发起
+    conn.execute("CREATE VIRTUAL TABLE embeddings USING vec0("
+                 "entry_id TEXT PRIMARY KEY, user_source TEXT, user_id TEXT, embedding float[4])")
+    e = CountingEmbedder()
+    apply_actions(conn, "w", "u",
+                  [_with_body(add_action("preference", "lang", "global"), "第一条"),
+                   _with_body(add_action("preference", "tone", "global"), "第二条")],
+                  e, "text", "e1", NOW)
+    assert len(e.calls) == 1 and len(e.calls[0]) == 2  # 一次批量请求覆盖全部待嵌文本
+    assert conn.execute("SELECT COUNT(*) c FROM embeddings").fetchone()["c"] == 2
+
+
+def test_vectors_l2_normalized_before_store(conn):
+    # 审查 #6：阈值按余弦距离换算，库内向量必须是 L2 归一化后的值
+    conn.execute("CREATE VIRTUAL TABLE embeddings USING vec0("
+                 "entry_id TEXT PRIMARY KEY, user_source TEXT, user_id TEXT, embedding float[2])")
+    apply_actions(conn, "w", "u",
+                  [_with_body(add_action("preference", "lang", "global"), "归一化")],
+                  CountingEmbedder(vec=[3.0, 4.0]), "text", "e1", NOW)
+    stored = json.loads(conn.execute(
+        "SELECT vec_to_json(embedding) j FROM embeddings").fetchone()["j"])
+    assert stored == pytest.approx([0.6, 0.8])
+
+
+def test_release_pending_redirects_dangling_marks(conn):
+    # 审查 #16：pending 行改键后，其他行 conflict_with 里的旧标记必须跟随
+    old_id = _seed_row(conn, topic="style", status="pending_review", degrad=None,
+                       conflict_with=None)
+    _seed_row(conn, topic="tone", status="degraded", conflict_with=json.dumps([old_id]))
+    class E:
+        def embed(self, texts):
+            return [[0.1] * 4 for _ in texts]
+    apply_actions(conn, "w", "u", [update_action("preference", "style", "global")], E(),
+                  "text", "e2", NOW)
+    row = conn.execute("SELECT conflict_with FROM entries WHERE topic='tone'").fetchone()
+    assert json.loads(row["conflict_with"]) == ["preference_!style@global"]
+
+
+def test_apply_actions_returns_only_written_actions(conn):
+    # 审查 #17：无 quote / 非法 scope 的候选被静默跳过，不得出现在"已应用"列表里
+    silent = {"op": "ADD", "candidate": full_cand("preference", "lang", "global", quote=None)}
+    bad_scope = {"op": "ADD", "candidate": full_cand("preference", "tone", "team:x")}
+    written = {"op": "ADD", "candidate": full_cand("preference", "format", "global")}
+    applied = apply_actions(conn, "w", "u", [silent, bad_scope, written],
+                            EmbedderStub(), "text", "e1", NOW)
+    assert [a["candidate"]["topic"] for a in applied] == ["format"]

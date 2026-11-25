@@ -9,7 +9,8 @@ class LLMSettings:
     model: str
     api_key_env: str
     timeout_seconds: float = 120.0  # 结构化输出（全字段 required）实测可超 30s，默认与代理对齐
-    retries: int = 1                # transport 异常/429/5xx 的额外重试次数
+    retries: int = 1
+    retry_backoff_seconds: float = 0.5                # transport 异常/429/5xx 的额外重试次数
     log_preview_chars: int = 1000    # 响应日志预览长度
     user_agent: str | None = None   # 配置后请求头注入 User-Agent（网关 UA 白名单场景）；默认 httpx 原生 UA
     structured_output_param: str = "response_format"  # 结构化输出参数名；置空 "" 则不带该参数

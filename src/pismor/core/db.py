@@ -14,7 +14,8 @@ def _fts_terms(summary):
 
 def get_conn(path: Path, check_same_thread: bool = True) -> sqlite3.Connection:
     path.parent.mkdir(parents=True, exist_ok=True)
-    # API 进程内路由线程池/BackgroundTasks 共用连接 → check_same_thread=False（api 层传入）
+    # 每请求/每后台任务各建独立短连接（api 层不传 check_same_thread），
+    # 连接只在自己线程内使用，因此保持默认 True 即可。
     conn = sqlite3.connect(path, check_same_thread=check_same_thread)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")

@@ -1,4 +1,5 @@
 """嵌入服务客户端：OpenAI 兼容 /embeddings，可降级——不可用抛 EmbedUnavailable，不阻断主流程。"""
+import math
 import os
 
 import httpx
@@ -8,6 +9,17 @@ from pismor.core.config import EmbeddingSettings
 
 class EmbedUnavailable(Exception):
     """嵌入服务未启用、连接失败或返回非 2xx 时抛出。Task 7/13 捕获后降级继续。"""
+
+
+def l2_normalize(vec: list[float]) -> list[float]:
+    """L2 归一化；零向量/非法数值原样返回（装配侧余弦→距离换算依赖单位向量前提）。"""
+    try:
+        norm = math.sqrt(sum(float(x) * float(x) for x in vec))
+    except (TypeError, ValueError):
+        return vec
+    if norm <= 0.0:
+        return vec
+    return [float(x) / norm for x in vec]
 
 
 class Embedder:

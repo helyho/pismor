@@ -5,6 +5,7 @@ import sqlite3
 import pytest
 
 from pismor.serving.assembler import assemble
+from pismor.serving import assembler as assembler_mod
 from pismor.llm.embedder import EmbedUnavailable
 from pismor.core.keys import vec_key
 
@@ -358,3 +359,39 @@ def test_vector_recall_isolates_cross_scope(conn):
     pack = assemble(conn, EmbedderStub(), "w", "u1", budget=2000, query="语言")
     bodies = {e["text"] for e in pack["entries"]}
     assert {"语言使用 Python", "语言项目内使用 Go"} <= bodies
+
+
+class UnitQueryEmbedder:
+    """返回未归一化 query 向量的假嵌入器（[3,4] 范数 5）。"""
+
+    def embed(self, texts):
+        return [[3.0, 4.0] for _ in texts]
+
+
+def test_vector_recall_normalizes_query(conn):
+    # 审查 #6：库内向量是单位向量（[1,0]），query 侧也必须归一化才落在余弦阈值内
+    _entry(conn, "preference", "deep", "深度学习框架的选型经验", conf=0.6)
+    conn.execute("CREATE VIRTUAL TABLE embeddings USING vec0("
+                 "entry_id TEXT PRIMARY KEY, user_source TEXT, user_id TEXT, embedding float[2])")
+    conn.execute("INSERT INTO embeddings VALUES (?, 'w','u1', ?)",
+                 (vec_key("w", "u1", "preference", "deep", "global"), json.dumps([1.0, 0.0])))
+    conn.commit()
+    pack = assemble(conn, UnitQueryEmbedder(), "w", "u1", budget=2000, query="无关主题")
+    assert "preference_deep@global" in [e["id"] for e in pack["entries"]]
+
+
+def test_clarifications_issued_in_single_batch(conn, seeded_conflict_pair, monkeypatch):
+    # 审查 #7：装配路径把全部矛盾对一次交给 issue_many（一次短事务），不逐对提交
+    calls = []
+
+    def fake_issue_many(conn_, us, uid, pairs, ttl_days=7, *, commit=True):
+        calls.append((list(pairs), ttl_days, commit))
+        return [f"q{i}" for i in range(len(pairs))]
+
+    monkeypatch.setattr(assembler_mod, "_clarify_issues", fake_issue_many)
+    pack = assemble(conn, None, "w", "u1", budget=2000)
+    assert len(calls) == 1
+    pairs, _ttl, commit = calls[0]
+    assert len(pairs) == 1 and pairs[0][0]  # 一对矛盾标记
+    assert commit is True
+    assert pack["clarification_needed"][0]["question"] == "q0"

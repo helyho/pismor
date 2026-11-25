@@ -23,6 +23,8 @@ def backup(conn: sqlite3.Connection, backup_dir, keep: int = 30) -> Path:
     finally:
         tmp_target.unlink(missing_ok=True)
     snapshots = sorted(backup_dir.glob("backup-*.db"))  # 文件名按日期，字典序即时间序
-    for stale in snapshots[:-max(0, keep)]:
+    keep = max(0, keep)
+    stale_snapshots = snapshots if keep == 0 else snapshots[:-keep]  # keep=0 语义是"一份不留"
+    for stale in stale_snapshots:
         stale.unlink(missing_ok=True)
     return target

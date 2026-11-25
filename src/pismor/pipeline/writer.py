@@ -12,15 +12,18 @@
 - pending_review 不阻塞演进：同 key 新证据先把待复核行移入 "!" 快照（仍在复核队列），
   再写入规范 active 行（spec §10/§14，I-2）。
 - 引用完整性由本写入器事务保证：entries 与 sources 同事务写入。
-- 向量降级：embed 抛 EmbedUnavailable/KeyError/JSONDecodeError（网关 200+异常体）、
-  sqlite 写入错误（维度配置错等）或 embeddings 表未启用 → 该条目跳过向量行，
-  条目行照写，不抛出（spec §20）。
+- 向量在写事务外批量预先计算（网络 IO 不持有 WAL 写锁），库内向量按 L2 归一化后写入
+  （装配侧余弦→L2 距离换算依赖该前提）；embed 抛 EmbedUnavailable/KeyError/
+  JSONDecodeError（网关 200+异常体）、sqlite 写入错误（维度配置错等）或 embeddings
+  表未启用 → 该条目跳过向量行，条目行照写，不抛出（spec §20）。
+- 已落库动作口径：apply_actions 只返回真正写入的动作（无 quote/非法 scope/目标缺失等
+  被跳过的候选不出现），供上层判断"澄清是否已被写入覆盖"。
 """
 import json
 import logging
 import sqlite3
 
-from pismor.llm.embedder import EmbedUnavailable
+from pismor.llm.embedder import EmbedUnavailable, l2_normalize
 from pismor.core.keys import entry_key, split_mark, valid_scope, vec_key
 
 logger = logging.getLogger("mem.writer")
@@ -37,6 +40,12 @@ _ENTRY_COLS = ("user_source,user_id,dimension,topic,scope,id,confidence,status,b
                "created_at,updated_at,last_reinforced_at,degraded_reason,superseded_by,"
                "topic_new,conflict_with,reinforcements,archived_at")
 
+# 会写入向量行的 op（与 _add/_update/_conflict 的 append 点一一对应）
+_VECTOR_OPS = ("ADD", "UPDATE", "CONFLICT")
+
+# 嵌入降级口径（spec §20）：单条失败只丢该条向量
+_EMBED_ERRORS = (EmbedUnavailable, KeyError, json.JSONDecodeError, IndexError, TypeError)
+
 
 class IllegalTransition(Exception):
     """非法状态迁移（spec §6 状态机之外的边），单条隔离不拖垮整批。"""
@@ -48,34 +57,72 @@ def _check_transition(old_status, new_status):
 
 
 def apply_actions(conn, user_source, user_id, actions, embedder, origin_type, origin_ref, now):
-    """单事务应用 Action 列表；scope 违规候选丢弃记日志（spec §8 作用域白名单）。"""
+    """单事务应用 Action 列表；scope 违规候选丢弃记日志（spec §8 作用域白名单）。
+
+    返回真正落库的 action 列表。嵌入在事务开始前完成（批量一次，失败逐条重试）。
+    """
     # taboo 优先：同批双新增时 taboo 行先落库，preference 行处理时查询可见 → 恒胜降级
     ordered = sorted(actions, key=lambda a: a.get("candidate", {}).get("dimension") != "taboo")
+    precomputed = _precompute_vectors(conn, embedder, ordered)
     vectors: list[tuple[str, str]] = []  # (五元组合成键, 嵌入文本)
+    applied = []
     with conn:
         for action in ordered:
-            _apply_one(conn, user_source, user_id, action, origin_type, origin_ref, now, vectors)
-        _write_vectors(conn, user_source, user_id, embedder, vectors)
+            if _apply_one(conn, user_source, user_id, action, origin_type, origin_ref, now,
+                          vectors):
+                applied.append(action)
+        _write_vectors(conn, user_source, user_id, vectors, precomputed)
+    return applied
 
 
-def _apply_one(conn, us, uid, action, origin_type, origin_ref, now, vectors):
+def _precompute_vectors(conn, embedder, actions):
+    """事务外算向量：{正文: 向量}；批量一次，条数不符或失败时逐条重试以保留单条隔离。"""
+    if embedder is None or not _has_embeddings_table(conn):
+        return {}
+    texts = []
+    for action in actions:
+        c = action.get("candidate") or {}
+        if action.get("op") not in _VECTOR_OPS or not c.get("quote"):
+            continue
+        if not valid_scope(c.get("scope")):
+            continue
+        text = c.get("body")
+        if text and text not in texts:
+            texts.append(text)
+    if not texts:
+        return {}
+    try:
+        vecs = embedder.embed(texts)
+        if len(vecs) == len(texts):
+            return dict(zip(texts, vecs))
+    except _EMBED_ERRORS:
+        pass
+    precomputed = {}
+    for text in texts:
+        try:
+            precomputed[text] = embedder.embed([text])[0]
+        except _EMBED_ERRORS:
+            continue
+    return precomputed
+
+
+def _apply_one(conn, us, uid, action, origin_type, origin_ref, now, vectors) -> bool:
     op, c = action["op"], action["candidate"]
     if not valid_scope(c.get("scope")):
         logger.warning("drop candidate %s/%s: invalid scope %r",
                        c.get("dimension"), c.get("topic"), c.get("scope"))
-        return
+        return False
     if op == "ADD":
-        _add(conn, us, uid, c, now, origin_type, origin_ref, vectors)
-    elif op == "UPDATE":
-        _update(conn, us, uid, c, action["target"], now, origin_type, origin_ref, vectors)
-    elif op == "CONFLICT":
-        _conflict(conn, us, uid, c, action["target"], now, origin_type, origin_ref, vectors)
-    elif op == "NOOP":
-        _noop(conn, us, uid, action["target"], now)
-    elif op == "ORPHAN":
-        _orphan(conn, us, uid, c, now, origin_type, origin_ref)
-    else:
-        raise ValueError(f"unknown op: {op}")
+        return _add(conn, us, uid, c, now, origin_type, origin_ref, vectors)
+    if op == "UPDATE":
+        return _update(conn, us, uid, c, action["target"], now, origin_type, origin_ref, vectors)
+    if op == "CONFLICT":
+        return _conflict(conn, us, uid, c, action["target"], now, origin_type, origin_ref, vectors)
+    if op == "NOOP":
+        return _noop(conn, us, uid, action["target"], now)
+    if op == "ORPHAN":
+        return _orphan(conn, us, uid, c, now, origin_type, origin_ref)
+    raise ValueError(f"unknown op: {op}")
 
 
 def _fetch_row(conn, us, uid, key):
@@ -95,9 +142,9 @@ def _find_taboo(conn, us, uid, c):
         (us, uid, c["topic"], c["scope"])).fetchone()
 
 
-def _add(conn, us, uid, c, now, origin_type, origin_ref, vectors):
+def _add(conn, us, uid, c, now, origin_type, origin_ref, vectors) -> bool:
     if not c.get("quote"):
-        return  # 硬约束（spec §5）：无 quote 的条目拒绝入库
+        return False  # 硬约束（spec §5）：无 quote 的条目拒绝入库
     taboo = _find_taboo(conn, us, uid, c)
     if taboo:
         # taboo 恒胜：preference 新行直接 degraded(conflict_lost)，taboo 行只补标记
@@ -113,11 +160,12 @@ def _add(conn, us, uid, c, now, origin_type, origin_ref, vectors):
         vectors.append((vec_key(us, uid, c["dimension"], c["topic"], c["scope"]), c["body"]))
         if taboo:
             _append_conflict_mark(conn, taboo, entry_id)
+    return bool(entry_id)
 
 
-def _update(conn, us, uid, c, target, now, origin_type, origin_ref, vectors):
+def _update(conn, us, uid, c, target, now, origin_type, origin_ref, vectors) -> bool:
     if not c.get("quote"):
-        return
+        return False
     if target is None:
         raise IllegalTransition("UPDATE requires target")
     d, t, s = target
@@ -131,7 +179,7 @@ def _update(conn, us, uid, c, target, now, origin_type, origin_ref, vectors):
                                  origin_type=origin_type, origin_ref=origin_ref)
         if entry_id:
             vectors.append((vec_key(us, uid, d, t, s), c["body"]))
-        return
+        return bool(entry_id)
     _check_transition(old["status"], "archived")  # 旧行归档轨迹；archived 再 UPDATE 拒绝
     if old["status"] == "degraded":
         _check_transition("degraded", "active")  # 新证据演进恢复 active（spec §6）
@@ -167,6 +215,7 @@ def _update(conn, us, uid, c, target, now, origin_type, origin_ref, vectors):
         (entry_key(d, t, s), us, uid, origin_type, origin_ref, c["quote"],
          c.get("kind") or "explicit"))
     vectors.append((vec_key(us, uid, d, t, s), c["body"]))
+    return True
 
 
 def _release_pending(conn, us, uid, old, now):
@@ -188,6 +237,25 @@ def _release_pending(conn, us, uid, old, now):
     conn.execute(
         "UPDATE sources SET entry_id=? WHERE user_source=? AND user_id=? AND entry_id=?",
         (new_id, us, uid, old["id"]))
+    # 其他行 conflict_with 里指向旧行键的标记同步改写，避免悬空标记被误判为"已裁决"
+    _rekey_conflict_marks(conn, us, uid, old["id"], new_id)
+
+
+def _rekey_conflict_marks(conn, us, uid, old_id, new_id):
+    rows = conn.execute(
+        "SELECT dimension, topic, scope, conflict_with FROM entries"
+        " WHERE user_source=? AND user_id=? AND conflict_with IS NOT NULL",
+        (us, uid)).fetchall()
+    for row in rows:
+        marks = _load_marks(row["conflict_with"], row["scope"])
+        if not marks or old_id not in [str(m) for m in marks]:
+            continue
+        rewritten = [new_id if str(m) == old_id else m for m in marks]
+        conn.execute(
+            "UPDATE entries SET conflict_with=? WHERE user_source=? AND user_id=?"
+            " AND dimension=? AND topic=? AND scope=?",
+            (json.dumps(rewritten, ensure_ascii=False), us, uid,
+             row["dimension"], row["topic"], row["scope"]))
 
 
 def _load_marks(value, default_scope):
@@ -271,9 +339,9 @@ def _superseded_identity(conn, us, uid, d, t, scope, now):
     return topic, entry_key(d, topic, scope)
 
 
-def _conflict(conn, us, uid, c, target, now, origin_type, origin_ref, vectors):
+def _conflict(conn, us, uid, c, target, now, origin_type, origin_ref, vectors) -> bool:
     if not c.get("quote"):
-        return
+        return False
     if target is None:
         raise IllegalTransition("CONFLICT requires target")
     old = _fetch_row(conn, us, uid, target)
@@ -296,7 +364,8 @@ def _conflict(conn, us, uid, c, target, now, origin_type, origin_ref, vectors):
                              status=status, now=now, origin_type=origin_type,
                              origin_ref=origin_ref, confidence=confidence,
                              degraded_reason=reason, conflict_with=conflict_ids)
-    vectors.append((vec_key(us, uid, c["dimension"], f"+{c['topic']}", c["scope"]), c["body"]))
+    if entry_id:
+        vectors.append((vec_key(us, uid, c["dimension"], f"+{c['topic']}", c["scope"]), c["body"]))
     new_mark = entry_id
     if old["dimension"] == "taboo":
         # 旧行是 taboo：只互标 conflict_with，不降置信不降状态
@@ -316,24 +385,26 @@ def _conflict(conn, us, uid, c, target, now, origin_type, origin_ref, vectors):
              now, us, uid, *target))
     if taboo:
         _append_conflict_mark(conn, taboo, new_mark)
+    return bool(entry_id)
 
 
-def _noop(conn, us, uid, target, now):
+def _noop(conn, us, uid, target, now) -> bool:
     if target is None or _fetch_row(conn, us, uid, target) is None:
         raise IllegalTransition(f"NOOP target not found: {target}")
     conn.execute(
         "UPDATE entries SET reinforcements=reinforcements+1, last_reinforced_at=? "
         "WHERE user_source=? AND user_id=? AND dimension=? AND topic=? AND scope=?",
         (now, us, uid, *target))
+    return True
 
 
-def _orphan(conn, us, uid, c, now, origin_type, origin_ref):
+def _orphan(conn, us, uid, c, now, origin_type, origin_ref) -> bool:
     # 观察区键 = topic_new（词表外主题描述）：同用户同 topic_new 复用一行做 reinforce；
     # 空 topic_new 不合并（否则不同主题被压成一行，晋升门槛永不满足，I-1）。
     topic_new = (c.get("topic_new") or c.get("topic") or "").strip()
     if not topic_new:
         logger.warning("drop orphan candidate without topic_new: %s", c.get("body"))
-        return
+        return False
     key = ("orphan", topic_new, c["scope"])
     if _fetch_row(conn, us, uid, key) is not None:
         # 同主题 orphan 复现：计数 +1（spec §8.2 晋升门槛"复现≥3次/30天"依据）
@@ -341,10 +412,11 @@ def _orphan(conn, us, uid, c, now, origin_type, origin_ref):
             "UPDATE entries SET reinforcements=reinforcements+1, last_reinforced_at=? "
             "WHERE user_source=? AND user_id=? AND dimension=? AND topic=? AND scope=?",
             (now, us, uid, *key))
-        return
-    _insert_entry(conn, us, uid, {**c, "topic": topic_new, "topic_new": topic_new},
-                  status="orphan_topic", now=now,
-                  origin_type=origin_type, origin_ref=origin_ref)
+        return True
+    entry_id = _insert_entry(conn, us, uid, {**c, "topic": topic_new, "topic_new": topic_new},
+                             status="orphan_topic", now=now,
+                             origin_type=origin_type, origin_ref=origin_ref)
+    return bool(entry_id)
 
 
 def _insert_entry(conn, us, uid, c, *, status, now, origin_type, origin_ref,
@@ -391,17 +463,18 @@ def _has_embeddings_table(conn):
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='embeddings'").fetchone() is not None
 
 
-def _write_vectors(conn, us, uid, embedder, vectors):
+def _write_vectors(conn, us, uid, vectors, precomputed):
     if not vectors or not _has_embeddings_table(conn):
         return  # embeddings 表未启用（配置降级）：整体跳过向量行
     for key, text in vectors:
+        vec = precomputed.get(text)
+        if vec is None:
+            continue  # 预计算阶段已降级：该条目跳过向量行
         try:
-            vec = embedder.embed([text])[0]
             conn.execute("DELETE FROM embeddings WHERE entry_id=?", (key,))
             conn.execute(
                 "INSERT INTO embeddings (entry_id,user_source,user_id,embedding) VALUES (?,?,?,?)",
-                (key, us, uid, json.dumps(vec)))
-        except (EmbedUnavailable, KeyError, json.JSONDecodeError, IndexError, TypeError,
-                sqlite3.Error):
+                (key, us, uid, json.dumps(l2_normalize(vec))))
+        except (json.JSONDecodeError, TypeError, sqlite3.Error):
             # 降级（spec §20）：该条目跳过向量行，条目行保留；维度配错等 sqlite 错误同样不阻断
             continue

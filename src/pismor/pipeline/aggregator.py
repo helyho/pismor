@@ -35,16 +35,26 @@ _MERGE_SCHEMA = {
 
 def run_daily(conn, taxonomy, llm, auto_promote: bool, now: str, *,
               degrade_days: int = 90, degrade_confidence: float = 0.7) -> dict:
-    """跑全部日批扫描，返回统计计数。降级阈值可由 settings.aggregator 配置。"""
+    """跑全部日批扫描，返回统计计数。降级阈值可由 settings.aggregator 配置。
+
+    整轮单事务（含澄清过期，故 expire 传 commit=False）；taxonomy 追加先改内存（同轮后续组
+    需要看到新 topic），yaml 落盘推迟到提交成功之后——事务回滚时文件与内存都不留痕。
+    """
     stats = {"promoted": 0, "merged": 0, "demoted": 0, "archived": 0,
              "dropped_review": 0, "expired_clarifications": 0, "dropped_orphan": 0}
-    with conn:
-        _promote_orphans(conn, taxonomy, llm, auto_promote, now, stats)
-        stats["demoted"] = _demote(conn, now, degrade_days, degrade_confidence)
-        stats["archived"] = _archive(conn, now)
-        stats["dropped_review"] = _drop_expired_reviews(conn, now)
-        from pismor.pipeline.clarifier import expire
-        stats["expired_clarifications"] = expire(conn, now)
+    appends: list[dict] = []
+    try:
+        with conn:
+            _promote_orphans(conn, taxonomy, llm, auto_promote, now, stats, appends)
+            stats["demoted"] = _demote(conn, now, degrade_days, degrade_confidence)
+            stats["archived"] = _archive(conn, now)
+            stats["dropped_review"] = _drop_expired_reviews(conn, now)
+            from pismor.pipeline.clarifier import expire
+            stats["expired_clarifications"] = expire(conn, now, commit=False)
+    except Exception:
+        _revert_taxonomy(taxonomy, appends)
+        raise
+    _flush_taxonomy(taxonomy, appends)
     return stats
 
 
@@ -67,7 +77,7 @@ def _group_rows(conn, topic_new):
         (topic_new,)).fetchall()
 
 
-def _promote_orphans(conn, taxonomy, llm, auto_promote, now, stats):
+def _promote_orphans(conn, taxonomy, llm, auto_promote, now, stats, appends):
     promote_groups, drop_groups = _fetch_groups(conn, now)
     for topic_new in drop_groups:
         rows = _group_rows(conn, topic_new)
@@ -81,6 +91,8 @@ def _promote_orphans(conn, taxonomy, llm, auto_promote, now, stats):
         if any(r["dimension"] == "taboo" for r in rows):
             _queue_audit(conn, rows, now, note=f"taboo_orphan: {topic_new}")
             continue
+        if _already_queued(conn, rows):
+            continue  # 条目状态没变且已进人工队列：不重复判定、不重复堆审计行
         block = "\n".join(f"- {d.key}({d.name}): {', '.join(d.topics)}"
                           for d in taxonomy.dimensions.values())
         summaries = "；".join(f"{r['summary']}" for r in rows[:5])
@@ -111,7 +123,7 @@ def _promote_orphans(conn, taxonomy, llm, auto_promote, now, stats):
             if not auto_promote:
                 _queue_audit(conn, rows, now, note=f"new_topic_queued: {dim}/{topic}")
                 continue
-            _append_taxonomy(taxonomy, dim, topic, rows)
+            _stage_taxonomy(taxonomy, dim, topic, rows, appends)
         n = _rekey(conn, rows, dim, topic, now)
         stats["promoted"] += n
         if is_merge:
@@ -148,8 +160,28 @@ def _rekey(conn, rows, dim, topic, now):
     return promoted
 
 
-def _queue_audit(conn, rows, now, note):
+def _already_queued(conn, rows) -> bool:
+    """整组行都已按当前版本进过人工队列 → 本轮跳过重复判定。"""
     for r in rows:
+        hit = conn.execute(
+            "SELECT 1 FROM review_history WHERE entry_id=? AND user_source=? AND user_id=?"
+            " AND actor='audit' AND verdict='audit_pending' AND entry_version=? LIMIT 1",
+            (r["id"], r["user_source"], r["user_id"], r["updated_at"])).fetchone()
+        if hit is None:
+            return False
+    return True
+
+
+def _queue_audit(conn, rows, now, note):
+    """逐行入人工队列；同条目同版本同原因重复入队直接跳过（日批可重跑）。"""
+    for r in rows:
+        hit = conn.execute(
+            "SELECT 1 FROM review_history WHERE entry_id=? AND user_source=? AND user_id=?"
+            " AND actor='audit' AND verdict='audit_pending' AND note=? AND entry_version=?"
+            " LIMIT 1",
+            (r["id"], r["user_source"], r["user_id"], note, r["updated_at"])).fetchone()
+        if hit is not None:
+            continue
         conn.execute(
             "INSERT INTO review_history (entry_id, user_source, user_id, verdict, actor,"
             " ts, note, entry_version) VALUES (?, ?, ?, 'audit_pending', 'audit', ?, ?, ?)",
@@ -167,18 +199,44 @@ def _physically_drop(conn, rows):
             (r["user_source"], r["user_id"], r["dimension"], r["topic"], r["scope"]))
 
 
-def _append_taxonomy(taxonomy, dim, topic, rows):
-    """词表追加 topic + 自动生成回归样例；PyYAML 整体重 dump（注释丢失可接受）。"""
-    raw = yaml.safe_load(taxonomy.path.read_text(encoding="utf-8"))
-    for d in raw["dimensions"]:
-        if d["key"] == dim and topic not in d["topics"]:
-            d["topics"].append(topic)
-    raw.setdefault("regression_cases", []).append({
-        "quote": rows[0]["body"],
-        "expect": {"dimension": dim, "topic": topic, "scope": rows[0]["scope"], "kind": "inferred"},
+def _stage_taxonomy(taxonomy, dim, topic, rows, appends):
+    """内存词表立即追加（同轮后续组要能 merge 到新 topic）；yaml 落盘交给 _flush_taxonomy。"""
+    d = taxonomy.dimensions[dim]
+    added = topic not in d.topics
+    if added:
+        d.topics.append(topic)
+    appends.append({
+        "dim": dim,
+        "topic": topic,
+        "added": added,
+        "case": {"quote": rows[0]["body"],
+                 "expect": {"dimension": dim, "topic": topic,
+                            "scope": rows[0]["scope"], "kind": "inferred"}},
     })
+
+
+def _flush_taxonomy(taxonomy, appends):
+    """事务提交成功后一次性重 dump：PyYAML 整体写回（注释丢失可接受）。"""
+    if not appends:
+        return
+    raw = yaml.safe_load(taxonomy.path.read_text(encoding="utf-8"))
+    for a in appends:
+        for d in raw["dimensions"]:
+            if d["key"] == a["dim"] and a["topic"] not in d["topics"]:
+                d["topics"].append(a["topic"])
+        raw.setdefault("regression_cases", []).append(a["case"])
     taxonomy.path.write_text(
         yaml.safe_dump(raw, allow_unicode=True, sort_keys=False), encoding="utf-8")
+
+
+def _revert_taxonomy(taxonomy, appends):
+    """事务回滚时撤销本轮内存追加，避免内存词表领先于库与文件。"""
+    for a in reversed(appends):
+        if not a["added"]:
+            continue
+        topics = taxonomy.dimensions[a["dim"]].topics
+        if a["topic"] in topics:
+            topics.remove(a["topic"])
 
 
 def _demote(conn, now, degrade_days: int = 90, degrade_confidence: float = 0.7):

@@ -127,7 +127,7 @@ def _same_topic_taboo(conn, user_source, user_id, c):
         return None
     return conn.execute(
         "SELECT id, body FROM entries WHERE user_source=? AND user_id=?"
-        " AND dimension='taboo' AND topic=? AND scope=?",
+        " AND dimension='taboo' AND topic=? AND scope=? AND status IN ('active','degraded')",
         (user_source, user_id, c["topic"], c["scope"])).fetchone()
 
 

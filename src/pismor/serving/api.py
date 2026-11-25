@@ -21,7 +21,7 @@ from pismor.pipeline import intake, writer
 from pismor.serving import assembler, exporter
 from pismor.core import tokenizer
 from pismor.core.config import Settings
-from pismor.core.keys import entry_key, split_mark
+from pismor.core.keys import entry_key, split_mark, vec_key
 from pismor.core.db import get_conn, init_schema
 from pismor.llm.embedder import Embedder
 from pismor.llm.client import LLMClient
@@ -140,6 +140,12 @@ def create_app(settings: Settings, llm=None, embedder=None) -> FastAPI:
                     conn.execute(
                         "DELETE FROM sources WHERE user_source=? AND user_id=? AND entry_id=?",
                         (user_source, user_id, row["id"]))
+                    if conn.execute(
+                            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='embeddings'"
+                    ).fetchone():
+                        conn.execute("DELETE FROM embeddings WHERE entry_id=?", (vec_key(
+                            user_source, user_id, row["dimension"], row["topic"],
+                            row["scope"]),))
                 else:
                     # orphan 候选 approve → 观察区（spec §8.2 晋升链入口），其余 → active
                     new_status = ("orphan_topic" if row["dimension"] == "orphan"
@@ -229,7 +235,8 @@ def create_app(settings: Settings, llm=None, embedder=None) -> FastAPI:
     def export_profile(source: str, native_id: str):
         with closing(get_conn(settings.db_path)) as conn:
             try:
-                root = exporter.export(conn, source, native_id, settings.export_root)
+                root = exporter.export(conn, source, native_id, settings.export_root,
+                                       taxonomy)
             except ValueError as exc:  # 路径穿越/非法路径段 → 400，不写任何文件
                 return JSONResponse({"detail": str(exc)}, status_code=400)
         return {"root": str(root)}

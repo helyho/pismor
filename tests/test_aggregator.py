@@ -362,3 +362,65 @@ def test_same_user_multiple_topic_new_not_merged(conn, taxonomy, fake_llm_merge)
     assert stats["promoted"] == 0 and stats["dropped_orphan"] == 0
     rows = conn.execute("SELECT topic_new FROM entries WHERE status='orphan_topic'").fetchall()
     assert {r["topic_new"] for r in rows} == {"多肉养护", "茶叶品鉴", "小说创作"}
+
+
+# ---- fix wave 新增：审计队列幂等 / 词表落盘与内存一致性 / 日批单事务 ----
+
+def test_audit_queue_idempotent_across_runs(conn, seeded_orphans_3, taxonomy,
+                                            fake_llm_invalid_action):
+    # 同一批仍未处置的 orphan 组：第二轮不再调 LLM，也不再堆 audit 行
+    run_daily(conn, taxonomy, fake_llm_invalid_action, auto_promote=True, now=NOW)
+    n1 = conn.execute("SELECT COUNT(*) c FROM review_history WHERE actor='audit'"
+                      ).fetchone()["c"]
+    calls1 = len(fake_llm_invalid_action.calls)
+    assert n1 == 3 and calls1 == 1
+    run_daily(conn, taxonomy, fake_llm_invalid_action, auto_promote=True, now=NOW)
+    n2 = conn.execute("SELECT COUNT(*) c FROM review_history WHERE actor='audit'"
+                      ).fetchone()["c"]
+    assert n2 == n1
+    assert len(fake_llm_invalid_action.calls) == calls1
+
+
+def test_taxonomy_yaml_not_written_when_transaction_fails(conn, taxonomy_writable,
+                                                          fake_llm_new_topic, monkeypatch):
+    # 写盘必须在事务提交之后：事务回滚时文件保持原样，内存追加也要撤掉
+    from pismor.pipeline import aggregator
+
+    _seed_orphans(conn)
+    conn.commit()  # 种子先落库：本用例要验证的是"日批事务整体回滚"
+    before = taxonomy_writable.path.read_text(encoding="utf-8")
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(aggregator, "_rekey", boom)
+    with pytest.raises(RuntimeError):
+        run_daily(conn, taxonomy_writable, fake_llm_new_topic, auto_promote=True, now=NOW)
+    assert taxonomy_writable.path.read_text(encoding="utf-8") == before
+    assert "brevity" not in taxonomy_writable.dimensions["preference"].topics
+    left = conn.execute("SELECT COUNT(*) c FROM entries WHERE status='orphan_topic'"
+                        ).fetchone()["c"]
+    assert left == 3  # 事务整体回滚
+
+
+def test_orphan_new_topic_syncs_memory_topics(conn, taxonomy_writable, fake_llm_new_topic):
+    # 同轮内后续组合并到刚建的新 topic 时，内存词表必须已包含它
+    _seed_orphans(conn)
+    run_daily(conn, taxonomy_writable, fake_llm_new_topic, auto_promote=True, now=NOW)
+    assert "brevity" in taxonomy_writable.dimensions["preference"].topics
+
+
+def test_run_daily_keeps_expire_in_same_transaction(conn, taxonomy, monkeypatch):
+    # 日批是单事务：澄清过期不得自己提前 commit
+    from pismor.pipeline import clarifier as clarifier_mod
+
+    seen = {}
+    real = clarifier_mod.expire
+
+    def spy(conn_, now_, **kwargs):
+        seen.update(kwargs)
+        return real(conn_, now_, **kwargs)
+
+    monkeypatch.setattr(clarifier_mod, "expire", spy)
+    run_daily(conn, taxonomy, FakeLLM([]), auto_promote=True, now=NOW)
+    assert seen.get("commit") is False

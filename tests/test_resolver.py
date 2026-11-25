@@ -126,3 +126,22 @@ def test_orphan_passthrough_without_llm(conn, fake_llm_add):
     actions = resolve(conn, "w", "u", [orphan], fake_llm_add)
     assert actions[0] == {"op": "ORPHAN", "candidate": orphan}
     assert fake_llm_add.calls == []
+
+
+def test_archived_taboo_does_not_force_conflict(conn, seeded_taboo_and_pref):
+    # 审查 #2：已归档 taboo 不再构成互斥（与 writer._find_taboo 的存活口径一致）
+    conn.execute("UPDATE entries SET status='archived', archived_at='2026-11-01T00:00:00+08:00'"
+                 " WHERE dimension='taboo'")
+    conn.commit()
+    llm = ScriptedLLM({"decision": "UPDATE", "target": [], "reason": "演进"})
+    actions = resolve(conn, "w", "u", [cand("preference", "style", "global")], llm)
+    assert actions[0]["op"] == "UPDATE"
+
+
+def test_pending_review_taboo_does_not_force_conflict(conn, seeded_taboo_and_pref):
+    # pending_review 的 taboo 尚未生效，同样不得强制 preference 侧 CONFLICT
+    conn.execute("UPDATE entries SET status='pending_review' WHERE dimension='taboo'")
+    conn.commit()
+    llm = ScriptedLLM({"decision": "UPDATE", "target": [], "reason": "演进"})
+    actions = resolve(conn, "w", "u", [cand("preference", "style", "global")], llm)
+    assert actions[0]["op"] == "UPDATE"

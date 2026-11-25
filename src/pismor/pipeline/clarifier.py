@@ -29,14 +29,36 @@ def _now_iso() -> str:
 
 
 def issue(conn, user_source, user_id, conflicting_ids, summaries,
-          ttl_days: int = 7) -> str:
-    """按矛盾对拼 question 落 pending_clarifications，返回 question 文本。
+          ttl_days: int = 7, *, commit: bool = True) -> str:
+    """单对澄清：委托 issue_many（保持既有调用签名与提交语义）。"""
+    return issue_many(conn, user_source, user_id, [(list(conflicting_ids), summaries)],
+                      ttl_days=ttl_days, commit=commit)[0]
 
+
+def issue_many(conn, user_source, user_id, pairs, ttl_days: int = 7, *,
+               commit: bool = True) -> list[str]:
+    """批量落 pending_clarifications，返回与 pairs 等长的 question 列表。
+
+    pairs: [(conflicting_ids, summaries)]。全部行在同一事务内写入——GET /profile 装配
+    路径可能一次产出多对，逐对提交会放大 WAL 写锁竞争（审查 #7）；commit=False 供日批
+    等外层事务复用，避免提前提交破坏单事务（审查 #19）。
     summaries 以条目关联标记（id@scope）为键；取 conflicting_ids 前两个标记对应摘要
     拼模板。幂等去重：同一用户已存在未过期、集合相同的 pending → 直接复用其 question；
-    同对过期后重发走 UPSERT 刷新 issued_at（TTL 重新计时），不同对同秒各自成行。
+    同对过期后重发走 UPSERT 刷新 issued_at 与 ttl_days（TTL 重新计时），不同对同秒各自成行。
     ttl_days 为新建行 TTL（settings.assembler.clarify_ttl_days 配置）。
     """
+    questions: list[str] = []
+    if commit:
+        with conn:
+            for ids, summaries in pairs:
+                questions.append(_issue_one(conn, user_source, user_id, ids, summaries, ttl_days))
+    else:
+        for ids, summaries in pairs:
+            questions.append(_issue_one(conn, user_source, user_id, ids, summaries, ttl_days))
+    return questions
+
+
+def _issue_one(conn, user_source, user_id, conflicting_ids, summaries, ttl_days) -> str:
     ids = list(conflicting_ids)
     key = canonical_ids(ids)
     for row in conn.execute(
@@ -55,9 +77,9 @@ def issue(conn, user_source, user_id, conflicting_ids, summaries,
         " (user_source, user_id, conflicting_ids, question, issued_at, ttl_days)"
         " VALUES (?, ?, ?, ?, ?, ?)"
         " ON CONFLICT(user_source, user_id, conflicting_ids) DO UPDATE SET"
-        " question=excluded.question, issued_at=excluded.issued_at",
+        " question=excluded.question, issued_at=excluded.issued_at,"
+        " ttl_days=excluded.ttl_days",
         (user_source, user_id, key, question, _now_iso(), ttl_days))
-    conn.commit()
     return question
 
 
@@ -84,7 +106,7 @@ def match_incoming(conn, user_source, user_id, text, llm) -> dict | None:
             "pending_key": row["conflicting_ids"], "answer": text}
 
 
-def consume(conn, user_source, user_id, conflicting_ids) -> int:
+def consume(conn, user_source, user_id, conflicting_ids, *, commit: bool = True) -> int:
     """管线在澄清回答成功写入后调用：删除该矛盾对的 pending 行，返回删除数。"""
     wanted = canonical_ids(conflicting_ids)
     removed = 0
@@ -100,14 +122,19 @@ def consume(conn, user_source, user_id, conflicting_ids) -> int:
                 removed += 1
         except (TypeError, ValueError):
             continue
-    conn.commit()
+    if commit:
+        conn.commit()
     return removed
 
 
-def expire(conn, now) -> int:
-    """删除 issued_at 距 now 超过 ttl_days 的 pending 行，返回删除数。"""
+def expire(conn, now, *, commit: bool = True) -> int:
+    """删除 issued_at 距 now 超过 ttl_days 的 pending 行，返回删除数。
+
+    commit=False 供日批外层事务复用（审查 #19）。
+    """
     cur = conn.execute(
         "DELETE FROM pending_clarifications WHERE julianday(?) - julianday(issued_at) > ttl_days",
         (now,))
-    conn.commit()
+    if commit:
+        conn.commit()
     return cur.rowcount

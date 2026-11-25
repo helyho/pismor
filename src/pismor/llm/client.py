@@ -1,4 +1,4 @@
-"""OpenAI 兼容 LLM 客户端：同步 httpx，JSON Schema 约束输出，transport 异常/429/5xx 重试 1 次。"""
+"""OpenAI 兼容 LLM 客户端：同步 httpx，JSON Schema 约束输出，transport 异常/429/5xx 指数退避重试。"""
 import json
 import logging
 import os
@@ -52,6 +52,17 @@ class LLMClient:
         with httpx.Client(timeout=self._settings.timeout_seconds) as client:
             return client.post(self._url, headers=self._headers(), json=payload)
 
+    def _backoff(self, attempt: int, response: httpx.Response | None = None) -> float:
+        """重试间隔：指数退避；429 若带数值 Retry-After 则取其较大者。"""
+        delay = self._settings.retry_backoff_seconds * (2 ** attempt)
+        if response is not None and response.status_code == 429:
+            raw = response.headers.get("Retry-After")
+            try:
+                delay = max(delay, float(raw))
+            except (TypeError, ValueError):
+                pass  # HTTP-date 形式不解析，退回指数退避
+        return delay
+
     def chat_json(self, system: str, user: str, schema: dict) -> dict:
         """调用 /chat/completions 并解析 content 中的 JSON。
 
@@ -72,10 +83,13 @@ class LLMClient:
                                attempt + 1, retries + 1, exc)
                 if attempt == retries:
                     raise  # 重试耗尽：异常冒泡由调用方处理
+                time.sleep(self._backoff(attempt))
                 continue
             if response.status_code == 429 or response.status_code >= 500:
                 logger.warning("llm retry on status %s (attempt %d/%d)",
                                response.status_code, attempt + 1, retries + 1)
+                if attempt < retries:
+                    time.sleep(self._backoff(attempt, response))
                 continue  # 耗尽后走 raise_for_status，与旧语义一致
             break
         preview = response.text.replace("\n", " ")[:self._settings.log_preview_chars]
@@ -84,4 +98,7 @@ class LLMClient:
                     len(response.content), preview)
         response.raise_for_status()
         content = response.json()["choices"][0]["message"]["content"]
+        if not content:
+            # 拒答/内容过滤会让 content 为 null；json.loads(None) 只会抛难懂的 TypeError
+            raise ValueError("llm response content is empty (message.content is null)")
         return json.loads(content)

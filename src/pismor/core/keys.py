@@ -24,11 +24,6 @@ def entry_key(dimension: str, topic: str, scope: str) -> str:
     return f"{dimension}_{topic}{_MARK_SEP}{scope}"
 
 
-def mark(entry_id: str, scope: str) -> str:
-    """条目关联标记 {id}@{scope}。"""
-    return f"{entry_id}{_MARK_SEP}{scope}"
-
-
 def split_mark(value: str, default_scope: str | None = None) -> tuple[str, str | None]:
     """解析关联标记；裸 id（旧数据）用 default_scope 补全。"""
     if _MARK_SEP in value:

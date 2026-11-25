@@ -16,9 +16,7 @@ from urllib.parse import unquote
 
 import yaml
 
-from pismor.core.taxonomy import load_taxonomy
 
-_REPO = Path(__file__).resolve().parents[3]  # editable/repo 布局下 config/ 在包仓根（src/pismor/serving/ 上溯三级）
 # 修复轮② Critical：scope 由 LLM 抽取产出、上游无格式校验，projects/{name}.md 的
 # name 必须过白名单（字母数字下划线中文连字符，禁 / \ .. 空白点号），不匹配跳过该
 # 文件并记入 export-warnings.txt
@@ -63,8 +61,12 @@ def remove_export(out_root: Path, user_source: str, user_id: str) -> bool:
     return True
 
 
-def export(conn, user_source, user_id, out_root: Path) -> Path:
-    taxonomy = load_taxonomy(_REPO / "config" / "taxonomy.yaml")
+def export(conn, user_source, user_id, out_root: Path, taxonomy) -> Path:
+    """导出 md 文件集；taxonomy 必须由调用方传入（settings.taxonomy_path 加载结果）。
+
+    不接受默认值：仓库内 config/taxonomy.yaml 只在开发布局存在，wheel 安装或自定义词表
+    部署下回落读它会把小节归属/标题与库里的词表判错。
+    """
     _base, root = _user_root(out_root, user_source, user_id)
     rows = conn.execute(
         "SELECT * FROM entries WHERE user_source=? AND user_id=?"

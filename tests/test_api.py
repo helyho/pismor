@@ -482,6 +482,16 @@ def test_backup_keep_configurable(conn, tmp_path):
     assert files[1] == backup(conn, target_dir, keep=2)  # 当日快照同日重跑原子覆盖
 
 
+def test_backup_keep_zero_drops_all(conn, tmp_path):
+    # keep=0 = 不保留任何快照；旧实现 snapshots[:-0] 会一份都不删
+    target_dir = tmp_path / "bk"
+    target_dir.mkdir()
+    for i in range(1, 4):
+        (target_dir / f"backup-2025010{i}.db").write_text("stale")
+    backup(conn, target_dir, keep=0)
+    assert list(target_dir.glob("backup-*.db")) == []
+
+
 # ---- fix wave 新增：跨 scope verdict / pending 演进 / 隔离 / 入口 / 导出 ----
 
 def test_verdict_discard_is_scope_specific(client, conn):
@@ -498,6 +508,27 @@ def test_verdict_discard_is_scope_specific(client, conn):
     assert scopes == {"global"}  # project:x 被删，global 保留
     assert conn.execute("SELECT COUNT(*) c FROM sources WHERE entry_id='preference_lang@project:x'"
                         ).fetchone()["c"] == 0
+
+
+def test_verdict_discard_clears_vectors(client, conn):
+    # 复核中的行可能已有向量（如 active 被审计隔离成 pending_review）；
+    # discard 物理删条目时必须同时清 embeddings，否则留下指向不存在条目的残行
+    from pismor.core.keys import vec_key
+
+    init_schema(conn, 4)  # 模拟启用向量库的部署（app 只在 embedding.enabled 时建表）
+    _seed_entry(conn, "preference", "style", "global", "pending_review", "正式", "正式", 0.7)
+    key = vec_key("webchat", "u1", "preference", "style", "global")
+    conn.execute(
+        "INSERT INTO embeddings (entry_id, user_source, user_id, embedding) VALUES (?,?,?,?)",
+        (key, "webchat", "u1", json.dumps([0.1, 0.2, 0.3, 0.4])))
+    conn.commit()
+    item = next(i for i in client.get("/review/queue").json()["items"]
+                if i["entry_id"] == "preference_style@global")
+    r = client.post("/review/webchat/u1/global/preference_style@global/verdict",
+                    json={"verdict": "discard", "entry_version": item["entry_version"]})
+    assert r.status_code == 200
+    n = conn.execute("SELECT COUNT(*) c FROM embeddings WHERE entry_id=?", (key,)).fetchone()["c"]
+    assert n == 0
 
 
 def test_pending_review_does_not_block_evolution(client, conn, fake_llm):

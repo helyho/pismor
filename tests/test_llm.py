@@ -51,6 +51,36 @@ def test_timeout_retries_zero_raises_immediately():
 
 
 @respx.mock
+def test_retry_backoff_between_attempts(monkeypatch):
+    # 429/5xx 重试之间必须退避（指数），否则连续打满上游
+    from pismor.llm import client as client_mod
+
+    slept = []
+    monkeypatch.setattr(client_mod.time, "sleep", lambda s: slept.append(s))
+    route = respx.post("https://llm.test/v1/chat/completions")
+    route.side_effect = [
+        httpx.Response(500),
+        httpx.Response(500),
+        httpx.Response(200, json={"choices": [{"message": {"content": '{"ok": 1}'}}]}),
+    ]
+    client = LLMClient(LLMSettings(endpoint="https://llm.test/v1", model="m",
+                                   api_key_env="TEST_KEY", retries=2,
+                                   retry_backoff_seconds=0.4))
+    assert client.chat_json("s", "u", {"name": "n", "schema": {}}) == {"ok": 1}
+    assert slept == [0.4, 0.8]
+
+
+@respx.mock
+def test_null_content_raises_value_error():
+    # 上游返回 content=null（拒答/被过滤）时给明确错误，而不是 json.loads(None) 的 TypeError
+    respx.post("https://llm.test/v1/chat/completions").respond(
+        json={"choices": [{"message": {"content": None}}]})
+    client = LLMClient(LLMSettings(endpoint="https://llm.test/v1", model="m", api_key_env="TEST_KEY"))
+    with pytest.raises(ValueError, match="content"):
+        client.chat_json("s", "u", {"name": "n", "schema": {}})
+
+
+@respx.mock
 def test_chat_json_logs_call_and_response(caplog):
     respx.post("https://llm.test/v1/chat/completions").respond(
         json={"choices": [{"message": {"content": '{"ok": 1}'}}]})

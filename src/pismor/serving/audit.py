@@ -22,14 +22,17 @@ _NEGATION_RE = re.compile(r"不|别|禁|勿|拒绝|无需|避免|没有")
 _ENTRY_FIELDS = ("user_source", "user_id", "dimension", "topic", "scope")
 
 
-def run_audit(conn, taxonomy) -> list[dict]:
-    """跑全部规则，返回 [{rule, detail, entry}]；只读，不修改任何数据。"""
+def run_audit(conn, taxonomy, *, inferred_cap: float = 0.8) -> list[dict]:
+    """跑全部规则，返回 [{rule, detail, entry}]；只读，不修改任何数据。
+
+    inferred_cap 与闸门 settings.gate.inferred_cap 同源，避免配置改了审计口径不跟。
+    """
     out = []
     out += _taboo_no_overlap(conn)
     out += _taboo_negation(conn)
     out += _conflict_json(conn)
     out += _quote_required(conn)
-    out += _inferred_cap(conn)
+    out += _inferred_cap(conn, inferred_cap)
     out += _unique_key(conn)
     out += _status_consistency(conn)
     out += _instruction_pattern(conn)
@@ -149,15 +152,15 @@ def _quote_required(conn):
         " WHERE s.seq IS NULL AND e.topic NOT LIKE '~%'").fetchall()]
 
 
-def _inferred_cap(conn):
+def _inferred_cap(conn, cap: float):
     return [_violation("inferred_cap", r,
-                       f"{_loc(r)} inferred confidence {r['confidence']} > 0.8")
+                       f"{_loc(r)} inferred confidence {r['confidence']} > {cap}")
             for r in conn.execute(
         "SELECT DISTINCT e.user_source, e.user_id, e.dimension, e.topic, e.scope, e.confidence"
         " FROM entries e JOIN sources s"
         "  ON s.user_source=e.user_source AND s.user_id=e.user_id"
         " AND s.entry_id = e.id"
-        " WHERE s.kind='inferred' AND e.confidence > 0.8").fetchall()]
+        " WHERE s.kind='inferred' AND e.confidence > ?", (cap,)).fetchall()]
 
 
 def _unique_key(conn):
@@ -175,7 +178,9 @@ def _status_consistency(conn):
         ("status='orphan_topic' AND topic_new IS NULL", "orphan_topic 缺 topic_new"),
         ("status='active' AND degraded_reason IS NOT NULL", "active 残留 degraded_reason"),
         ("status!='archived' AND archived_at IS NOT NULL", "archived_at 越界（仅 archived 可有）"),
-        ("status!='orphan_topic' AND topic_new IS NOT NULL", "topic_new 越界（仅 orphan_topic 可有）"),
+        # pending_review 的 orphan 候选按设计带 topic_new（复核通过才转 orphan_topic）
+        ("status NOT IN ('orphan_topic','pending_review') AND topic_new IS NOT NULL",
+         "topic_new 越界（仅 orphan_topic 可有）"),
         ("topic LIKE '~%' AND status!='archived'", "轨迹行必 archived"),
         ("topic LIKE '+%' AND status NOT IN ('active','degraded')", "'+' 变形行非法状态"),
     ]

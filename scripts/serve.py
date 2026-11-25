@@ -28,7 +28,7 @@ def daily_once(conn, settings, taxonomy, llm, now, backup_dir) -> dict:
                       bool(taxonomy.meta.get("auto_promote", False)), now,
                       degrade_days=settings.aggregator.degrade_days,
                       degrade_confidence=settings.aggregator.degrade_confidence)
-    violations = run_audit(conn, taxonomy)
+    violations = run_audit(conn, taxonomy, inferred_cap=settings.gate.inferred_cap)
     stats["audit_violations"] = len(violations)
     stats["isolated"] = isolate_violations(conn, violations, now)
     backup(conn, backup_dir, keep=settings.backup.keep)

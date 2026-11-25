@@ -171,7 +171,7 @@ def test_status_consistency_illegal_combos(conn, taxonomy):
     seed_entry(conn, uid="r3", dimension="orphan", topic="多肉",
                status="orphan_topic", kind="inferred")  # orphan 缺 topic_new
     seed_entry(conn, uid="r4", degraded_reason="stale")  # active 残留 degraded_reason
-    seed_entry(conn, uid="r5", status="pending_review", topic_new="词表外主题")  # topic_new 越界
+    seed_entry(conn, uid="r5", status="active", topic_new="词表外主题")  # topic_new 越界
     seed_entry(conn, uid="r6", status="degraded", degraded_reason="stale",
                archived_at=NOW)  # archived_at 越界
     seed_entry(conn, uid="r7", topic="~lang:20261124T00:00:1",
@@ -182,6 +182,23 @@ def test_status_consistency_illegal_combos(conn, taxonomy):
     sc = [v for v in out if v["rule"] == "status_consistency"]
     assert {v["detail"].split(" ")[0] for v in sc} == {f"w/r{i}" for i in range(1, 9)}
     assert len(sc) == 8  # 每行恰好一条：字段互斥规则互不重叠
+
+
+def test_pending_orphan_with_topic_new_not_flagged(conn, taxonomy):
+    # 复核队列里的 orphan 候选（status='pending_review' + topic_new 非空）是合法暂存态：
+    # runner._write_pending 就是这么写的，topic_new 越界规则不得误报
+    seed_entry(conn, dimension="orphan", topic="多肉", status="pending_review",
+               topic_new="多肉养护")
+    assert "status_consistency" not in rules(run_audit(conn, taxonomy))
+
+
+def test_inferred_cap_threshold_configurable(conn, taxonomy):
+    # 闸门 inferred_cap 可配置，审计阈值必须跟随，而非硬编码 0.8
+    seed_entry(conn, uid="c1", confidence=0.75, kind="inferred")
+    assert "inferred_cap" not in rules(run_audit(conn, taxonomy))
+    out = run_audit(conn, taxonomy, inferred_cap=0.7)
+    assert "inferred_cap" in rules(out)
+    assert "0.7" in next(v["detail"] for v in out if v["rule"] == "inferred_cap")
 
 
 def test_clean_db_passes(seeded_ok, taxonomy):

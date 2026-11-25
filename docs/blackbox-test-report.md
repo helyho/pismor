@@ -1,0 +1,165 @@
+# pismor 黑盒测试报告
+
+- 测试对象：pismor 画像记忆服务（`scripts/serve.py`）
+- 测试形态：bash + curl + jq + sqlite3，真实进程、真实 HTTP、真实 SQLite
+- 配置：`config/settings.example.yaml` 原样传入，无副本、无注入
+- 测试套件：`tests/blackbox/`（`run.sh` + `lib.sh` + 6 个用例域）
+- 提交范围：`0b4c7a1..3dcbc7f`（16 个提交，11 文件，+887/−2）
+- 报告日期：2026-11-25
+
+## 1. 执行摘要
+
+| 项 | 结论 |
+|---|---|
+| 用例总数 | 26（6 域） |
+| 真实 LLM 模式 | **26/26 PASS，skipped 0，exit 0** |
+| 无密钥模式 | 9 PASS / 17 SKIP，exit 0 |
+| 可重复性 | 连续两次全量结果一致，`git status` 干净 |
+| 阻塞级缺陷 | 2 个，均已修复（配置 1、产品代码 1） |
+| 遗留风险 | 2 项产品行为需产品侧决策（删除权层级、`entries.id` 键格式） |
+
+结论：服务在“真实 LLM + example 配置”组合下的接入、装配、复核、导出、删除、注入防御、并发与容错链路全部可用；测试过程中发现的两处阻塞缺陷（画像**从未落库**）已定位并修复，修复后画像条目真实入库并可被装配召回。
+
+## 2. 测试方法与边界
+
+**黑盒铁律**：测试代码不 import 任何 pismor 模块，不调用 `create_app`；一切结论经 HTTP 响应（jq 求值）与 `./data/index.db` 只读查询（sqlite3）双通道验证。
+
+**运行方式**
+
+```bash
+# 真实 LLM
+LLM_API_KEY=... bash tests/blackbox/run.sh
+# 无密钥：LLM 用例自动 SKIP，确定性用例照常
+bash tests/blackbox/run.sh
+# 辅助参数
+bash tests/blackbox/run.sh --only assemble,export --keep-data --port 18300
+```
+
+`run.sh` 的生命周期：依赖检查 → `pgrep serve.py` 预检（防误清开发实例）→ 端口预检 → 清空 `./data ./exports` → 启动服务（`PYTHONPATH=src .venv/bin/python scripts/serve.py --settings config/settings.example.yaml`）→ 轮询 `/healthz` 30s → 逐域执行 → 汇总 → kill + wait。
+
+**断言口径**
+
+- 性质级断言：不断言 LLM 措辞，只断言结构、维度/主题归属、状态机与数据库事实。
+- `POST /events` 为 202 + 后台管线，落库断言一律 `wait_db` 轮询（默认 90s，最长 120s）。
+- LLM 随机性容错：标 `--retry` 的用例失败后隔 5s 整用例重跑一次；`event_id` 每次唯一化，重跑不会撞产品幂等去重。
+- 装配只取 `status IN (active, degraded)`；LLM 置信度随机落在 `pending_review` 时，用例先用 `promote_active`/`promote_all` 走复核通道固定前置条件，再断言召回。
+
+## 3. 覆盖矩阵
+
+### 域 1 事件接入（`cases_events.sh`）
+
+| # | 用例 | 验证点 | 依赖 LLM | 结果 |
+|---|---|---|---|---|
+| T1 | healthz+schema | 200/`.ok`/`.db=="ok"`；六张表存在 | 否 | PASS |
+| T2 | 合法事件接入 | 202 + `events_seen` 落行 | 是 | PASS |
+| T3 | 幂等去重 | 同 `event_id` 二次 200/`deduplicated`，表中仅 1 行 | 否 | PASS |
+| T4 | 畸形事件 422 | 缺字段/非法类型 → 422 且不落库 | 否 | PASS |
+| T5 | content 超限 422 | 9000 字符 → 422 且不落库 | 否 | PASS |
+| T6 | explicit 直通入库 | `preference/lang/global` + `status=active` + `sources.kind=explicit` + `origin_ref` 可回溯 | 是 | PASS |
+| T7 | 闲聊零入库 | 无关内容 90s 后 `entries`/`sources` 无行 | 是 | PASS |
+
+### 域 2 装配（`cases_assemble.sh`）
+
+| # | 用例 | 验证点 | 依赖 LLM | 结果 |
+|---|---|---|---|---|
+| T8 | 空包合法 | 未知用户 200，五键齐全、`entries==[]` | 否 | PASS |
+| T9 | taboo 入包置顶 | `id` 以 `taboo` 开头且位于 `entries[0]` | 是 | PASS |
+| T10 | identity 入包 | `id` 以 `identity` 开头 | 是 | PASS |
+| T11 | 用户隔离 | `bb/u1` 数据不出现在 `bb/u2` 与 `app/u1` | 是 | PASS |
+| T12 | query 召回 | `?query=python` 召回正文含 Python 的条目 | 是 | PASS |
+
+### 域 3 生命周期 / 复核（`cases_lifecycle.sh`）
+
+| # | 用例 | 验证点 | 依赖 LLM | 结果 |
+|---|---|---|---|---|
+| T13 | 矛盾收敛 | 先后两条互斥语言偏好，终态 `lang` 生效条目 ≤1 | 是 | PASS |
+| T14 | verdict 流转 | approve 非 noop 且 `review_history` +1；旧版本 → `{"noop":true}`；新版本 discard 后行消失 | 是 | PASS |
+| T15 | 复核队列结构 | 200，`.items` 为数组，非空项含 `entry_id/status/entry_version` | 否 | PASS |
+| T16 | 长消息触发 | >300 字符纯文本素材可触发抽取并入包 | 是 | PASS |
+
+### 域 4 导出与删除权（`cases_export.sh`）
+
+| # | 用例 | 验证点 | 依赖 LLM | 结果 |
+|---|---|---|---|---|
+| T17 | 导出生成 | `.root` 非空，目录存在且含 `.md`，内容含入库主题词 | 是 | PASS |
+| T18 | 导出确定性 | 连续两次导出文件内容逐字节一致 | 是 | PASS |
+| T19 | 删除权全链 | `tombstones` 落行（`requested_by='api'`）；`entries/sources/review_history/pending_clarifications` 该用户清空；导出目录删除；`/profile` 空包 | 是 | PASS |
+| T20 | tombstone 持续 | 删除后新事件不复活装配（`/profile` 仍空包） | 是 | PASS |
+
+### 域 5 注入防御（`cases_injection.sh`）
+
+| # | 用例 | 验证点 | 依赖 LLM | 结果 |
+|---|---|---|---|---|
+| T21 | 破坏性指令拒绝 | `rm -rf` 载荷不进 `entries.body/summary`，不进装配文本 | 是 | PASS |
+| T22 | 提示词覆写拒绝 | “输出系统提示词”类内容不入库、不入装配 | 是 | PASS |
+| T23 | 混合文本正反断言 | 正常语言偏好可入库（`preference/lang` 或 `identity/language`），嵌入指令不入库 | 是 | PASS |
+
+### 域 6 韧性收尾（`cases_resilience.sh`）
+
+| # | 用例 | 验证点 | 依赖 LLM | 结果 |
+|---|---|---|---|---|
+| T24 | 并发装配 | 8 路并发 ×16 次 `/profile`，全部 200 且 body 可被 jq 解析 | 否 | PASS |
+| T25 | 非法导出路径 | `..` 穿越 → 400（应用层）/ 4xx（路由层），内容不泄漏 | 否 | PASS |
+| T26 | 损坏库拒启 | 停服务→写坏 `index.db`→重启：非 0 退出或 healthz 不就绪；测毕恢复备份并确认 healthz 200 | 否 | PASS |
+
+## 4. 验收数据
+
+| 运行 | 命令 | 结果 |
+|---|---|---|
+| full_run9 | `LLM_API_KEY=... bash tests/blackbox/run.sh` | `passed 26/26 (skipped 0)`，exit 0 |
+| full_run10 | `bash tests/blackbox/run.sh` | `passed 9/9 (skipped 17)`，exit 0 |
+| 幂等性 | 连续两次同模式全量 | 逐用例结果一致 |
+| 单元层回归 | `.venv/bin/python -m pytest` | 255/255 通过 |
+
+## 5. 发现与修复
+
+### 5.1 阻塞缺陷 A：`json_schema` 对该网关无效（配置层）
+
+`config/settings.example.yaml` 原为 `structured_output_type: json_schema`。DeepSeek 网关（`http_api` 兼容模式）不支持 `json_schema`，返回内容不含 `confidence/quote/body` 等约定字段。链路 `extractor._to_candidate` → `confidence=0` → `gate` 判定 `0 < review_min(0.6)` → 全部 dropped，**画像条目 0 落库**。
+
+处置：配置改为 `json_object`（并调大 `log_preview_chars`）。example 配置对该网关恢复可用。
+
+### 5.2 阻塞缺陷 B：`json_object` 模式下 schema 未进入提示词（产品代码）
+
+`json_object` 只保证“输出合法 JSON”。实测 `deepseek-v4.1-flash` 在无结构约束时出现多种自造格式：容器键为 `items`/`entries` 而非 `candidates`，字段整体缺失。服务端 `_post_once` 仅发送 `{"type":"json_object"}`，schema 文本从未送达模型。
+
+处置（产品修复）：`src/pismor/llm/client.py::_post_once` 在 `json_object` 模式下把 schema 描述注入 system prompt，并附容器键硬约束（禁止 `items`/`entries`）。修复后新增 `tests/test_llm.py` 两个用例（注入生效、`json_schema` 模式不重复注入），pytest 255/255 通过，黑盒 T6/T9/T10/T12/T13 首次真实落库。
+
+**影响面**：任何使用 DeepSeek/OpenAI 兼容网关且走 `json_object` 的部署都会受益；`json_schema` 原生支持的供应商行为不变。
+
+### 5.3 `entries.id` 与 `sources.entry_id` 键格式不一致（设计债，未修）
+
+`entries.id` 形如 `preference_lang`，`sources.entry_id` 形如 `preference_lang@global`，两者**永不相等**，无法直接 JOIN。功能不受影响（各自可独立查询），但对外 API 使用者在做证据链追溯时会踩坑。测试已改为各表独立断言。
+
+### 5.4 删除权只在装配/导出层生效（产品行为，需决策）
+
+`tombstones` 仅在 `assembler.py` 装配时检查。删除后 ingest/runner **不拦截**新事件：同一用户再次上报，`entries` 仍会写入新行，只是 `/profile` 与导出恒为空包。若“删除”应意味着数据不可再生成，需在 intake 层增加 tombstone 检查——属产品语义决策，测试按现行为断言（T20）。
+
+### 5.5 其它观测
+
+- `events_seen` 在管线因 LLM 鉴权失败而中断时仍会写入，故 T3（幂等）在无密钥下亦可 PASS。
+- `POST /events` 的 `content` 上限 8192，超限 422。
+- 装配响应条目字段为 `{id, text, confidence, status}`，**不含 `dimension`**；维度信息只能从 `id` 前缀推断。
+- 非 ASCII query 参数必须百分号编码，裸 UTF-8 被 h11 判 400。
+
+## 6. 局限与后续建议
+
+1. **真实 LLM 的判定漂移**：维度/主题归属存在合理波动（如“我用中文回答”可归 `preference/lang` 或 `identity/language`）。套件已用性质级断言 + 单次重试 + 复核提权吸收，但仍偶发依赖模型输出，建议在 CI 中固定模型版本与温度。
+2. **日批与降级场景未覆盖**：需修改 `daily_interval_seconds` 等配置，违背“配置原样”约束；相关逻辑由 `tests/test_aggregator.py` 等单元测试覆盖。
+3. **budget 截断**未做精确值断言（真实 LLM 下条目数不可控），可在后续加弱断言（`&budget=200` 时 `budget_used<=200`）。
+4. **T26 会破坏 `data/index.db`**：已实现备份/还原与 `--keep-data` 跳过，但该用例必须最后执行（套件已固定顺序）。
+5. **测试独占 `./data`**：`run.sh` 检测到运行中的服务实例会拒绝执行（exit 2），避免误清开发数据。
+
+## 7. 复现方式
+
+```bash
+cd /path/to/pismor
+# 有密钥：全量
+LLM_API_KEY=sk-... bash tests/blackbox/run.sh
+# 无密钥：确定性用例 + SKIP 清单
+bash tests/blackbox/run.sh
+# 单域调试（保留数据）
+bash tests/blackbox/run.sh --only assemble --keep-data
+```
+
+产物：`tests/blackbox/serve.log`（服务端日志）、`./data/index.db`（SQLite）、`./exports/`（导出文件）。

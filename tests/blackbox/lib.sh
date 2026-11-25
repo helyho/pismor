@@ -73,6 +73,22 @@ bb_event() {
     '{source:"bb", user_ref:$u, event_id:$e, event_type:"text", content:$c, ts:$t, origin_ref:("blackbox:" + $e)}'
 }
 
+# promote_active <user> <dimension>：条目停在 pending_review 时走 verdict approve
+# 使其生效（产品正常路径：待复核条目不进包）。已是 active/degraded 直接返回 0。
+promote_active() {
+  local uid="$1" dim="$2" st eid ver scope
+  st=$(db "SELECT status FROM entries WHERE user_id='${uid}' AND dimension='${dim}' ORDER BY rowid DESC LIMIT 1")
+  [[ "$st" == "active" || "$st" == "degraded" ]] && return 0
+  eid=$(db "SELECT id FROM entries WHERE user_id='${uid}' AND dimension='${dim}' ORDER BY rowid DESC LIMIT 1")
+  [[ -n "$eid" ]] || { printf '    promote_active: 未找到 %s/%s 条目\n' "$uid" "$dim"; return 1; }
+  ver=$(db "SELECT updated_at FROM entries WHERE user_source='bb' AND user_id='${uid}' AND id='${eid}' ORDER BY rowid DESC LIMIT 1")
+  scope=$(db "SELECT scope FROM entries WHERE user_source='bb' AND user_id='${uid}' AND id='${eid}' ORDER BY rowid DESC LIMIT 1")
+  http POST "/review/bb/${uid}/${scope}/${eid}/verdict" \
+    "$(jq -n --arg verdict approve --arg v "$ver" '{verdict:$verdict, entry_version:$v}')"
+  expect_status 200 || return 1
+  wait_db "SELECT 1 FROM entries WHERE user_id='${uid}' AND dimension='${dim}' AND status IN ('active','degraded')" 20
+}
+
 case_pass() { return 0; }
 case_fail() { # case_fail <说明>
   printf '    %s\n' "$*"

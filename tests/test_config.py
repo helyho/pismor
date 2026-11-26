@@ -7,7 +7,6 @@ from pismor.core.config import load_settings
 _FULL_YAML = textwrap.dedent("""
     db_path: ./data/index.db
     taxonomy_path: ./config/taxonomy.yaml
-    export_root: ./exports
     llm:
       endpoint: "http://127.0.0.1:8399/v1"
       model: "glm5.3"

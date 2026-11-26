@@ -75,7 +75,6 @@ class ServeSettings:
 class Settings:
     db_path: Path
     taxonomy_path: Path
-    export_root: Path
     llm: LLMSettings
     embedding: EmbeddingSettings
     gate: GateSettings = GateSettings()
@@ -104,7 +103,6 @@ def load_settings(path: Path) -> Settings:
     return Settings(
         db_path=Path(raw["db_path"]),
         taxonomy_path=Path(raw["taxonomy_path"]),
-        export_root=Path(raw.get("export_root", "./exports")),
         llm=LLMSettings(**raw["llm"]),
         embedding=EmbeddingSettings(**raw["embedding"]),
         gate=_section(raw, "gate", GateSettings),

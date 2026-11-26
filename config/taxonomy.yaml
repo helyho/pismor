@@ -12,7 +12,6 @@ scopes:
 dimensions:
   - key: taboo
     name: 禁忌
-    file: taboo.md
     priority: 0
     default_scope: global
     sensitive: false
@@ -26,7 +25,6 @@ dimensions:
 
   - key: identity
     name: 身份
-    file: identity.md
     priority: 1
     default_scope: global
     sensitive: partial
@@ -39,7 +37,6 @@ dimensions:
 
   - key: preference
     name: 偏好
-    file: shell.md
     priority: 2
     default_scope: global
     sensitive: false
@@ -54,7 +51,6 @@ dimensions:
 
   - key: fact
     name: 事实
-    file: shell.md
     priority: 3
     default_scope: global
     sensitive: partial
@@ -68,7 +64,6 @@ dimensions:
 
   - key: context
     name: 情境
-    file: shell.md
     priority: 4
     default_scope: global          # 合法回落值（裸 "project" 不过白名单；带项目名时由抽取器给 project:<名>）
     sensitive: false

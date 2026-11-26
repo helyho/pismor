@@ -87,6 +87,8 @@ stateDiagram-v2
 
 `taxonomy.yaml` 是维度的唯一来源，驱动抽取打标、文件分组、索引校验、装配排序。LLM 只能在 taxonomy 内打标，禁止发明类别与主题词。
 
+> **2026-11-26 变更**：`dimensions[].file` 字段已随导出功能移除；下表"导出归属文件"列仅作历史记录。
+
 | 维度 | 导出归属文件 | 装配优先级 | 说明 |
 |---|---|---|---|
 | taboo | taboo.md | 0（恒第一） | 用户明确说"不要/别再/拒绝"；必须含否定词 quote；跨一切作用域全局生效；**禁止自动建新主题词** |
@@ -264,6 +266,8 @@ topic 使用三个保留前缀：`~` = UPDATE 覆盖前的归档轨迹行（stat
 并发与持久性：`PRAGMA journal_mode=WAL` + `busy_timeout`；条目+证据+向量同一事务写入（向量与条目的原子性是 SQLite 方案相对文件方案的直接收益）；`events_seen` 使幂等键持久化——内存队列崩溃丢事件后平台重放不会重复处理（瘦身项 §18-7 的 SQLite WAL 事件表由本表天然覆盖，该项关闭）。per-user 串行锁不再必要：唯一约束+事务替代文件级防竞争。
 
 ### 8.2 md 导出视图（交付形态）
+
+> **已下线（2026-11-26）**：导出功能已移除（`GET /export`、`exporter.py`、`export_root`）。本节保留为历史设计记录；画像数据的唯一出口为 `GET /profile` 装配包。
 
 md 集不再是存储，按需生成（`GET /export/{source}/{native_id}`）或定时快照，满足"每用户一个或多个 md 画像"的交付形态：
 
@@ -467,7 +471,7 @@ taxonomy 回归样例随版本变更必跑（§7），反例（转述、敏感�
 | 2 | `GET /profile/{source}/{native_id}` | 任意 LLM 应用 | 每轮对话前装配画像包（建议带 `query`） |
 | 3 | `GET /review/queue` / `POST /review/{source}/{native_id}/{scope}/{entry_id}/verdict` | 人工复核 | 待复核列表与判定（approve/discard/fix），写 review_history；scope 在路径中定位跨作用域同 id |
 | 4 | `DELETE /profile/{source}/{native_id}` | 运营/合规 | 用户删除权：删条目行 + tombstones 表留痕 |
-| 5 | `GET /export/{source}/{native_id}` | 人工/交付 | 导出 md 画像视图（§8.2），可定时快照 |
+| 5 | ~~`GET /export/{source}/{native_id}`~~ | — | **已下线（2026-11-26）**：导出功能移除，见 §8.2 注 |
 | 6 | `GET /healthz` | 部署探针 | 进程健康 |
 
 请求/响应核心 schema：

@@ -27,7 +27,6 @@ def settings(tmp_path):
     return Settings(
         db_path=tmp_path / "runner.db",
         taxonomy_path=REPO / "config" / "taxonomy.yaml",
-        export_root=tmp_path / "exports",
         llm=LLMSettings(endpoint="http://llm.test", model="m", api_key_env="LLM_API_KEY"),
         embedding=EmbeddingSettings(enabled=False, endpoint="", model="",
                                     api_key_env="", dimensions=4, batch_size=8),

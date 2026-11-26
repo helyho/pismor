@@ -33,7 +33,6 @@ def _settings(tmp_path, taxonomy_path):
     return Settings(
         db_path=tmp_path / "serve.db",
         taxonomy_path=taxonomy_path,
-        export_root=tmp_path / "exports",
         llm=LLMSettings("http://llm.test", "m", "K"),
         embedding=EmbeddingSettings(False, "", "", "", 4, 8))
 

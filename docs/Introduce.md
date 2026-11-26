@@ -1,9 +1,9 @@
 # pismor — 用户画像记忆系统
 
-针对用户与 LLM 的对话记录及其他文本素材（文档、笔记、邮件、工单等），自动构建并维护每个用户的画像（禁忌/身份/偏好/事实/情境五维），以 **SQLite 单文件库为唯一真相源**、md 文件为导出视图。对话前通过 API 装配画像包注入 prompt，提升回复的个性化质量。
+针对用户与 LLM 的对话记录及其他文本素材（文档、笔记、邮件、工单等），自动构建并维护每个用户的画像（禁忌/身份/偏好/事实/情境五维），以 **SQLite 单文件库为唯一真相源**。对话前通过 API 装配画像包注入 prompt，提升回复的个性化质量。
 
 - 运行形态：单体管线进程（FastAPI + 后台管线 + 日批调度），实时注入为主，纯增量积累
-- 交付形态：`GET /profile/{source}/{native_id}` 返回按字符预算装配好的画像包；md 导出经 API 或日批快照生成
+- 交付形态：`GET /profile/{source}/{native_id}` 返回按字符预算装配好的画像包
 - 设计文档：`docs/superpowers/specs/2026-11-23-user-profile-memory-design.md`（v2 瘦身定稿，含全部决策依据）
 
 ## 核心特性
@@ -50,7 +50,6 @@ GET /profile ──► assembler（必带集 taboo+identity + 相关集召回 + 
 | `aggregator.py` | 日批：无强化降级、orphan 复现晋升、归档 |
 | `audit.py` | 状态机/词表一致性审计，违规行隔离进复核 |
 | `backup.py` | `VACUUM INTO` 滚动快照（默认保留 30 份） |
-| `exporter.py` | 按用户导出 md 视图 |
 | `taxonomy.py` | 词表加载与校验（维度/主题/regression_cases） |
 | `schemas.py` / `prompts.py` / `config.py` / `db.py` / `llm.py` / `embedder.py` | 事件模型、抽取模板、配置、连接、LLM 客户端、可选向量；`fts.py`/`tokenizer.py` 为 BM25 影子索引（触发器同步）与分词器 |
 
@@ -108,8 +107,7 @@ curl -s http://127.0.0.1:8300/review/queue
 | `GET /profile/{source}/{native_id}` | 装配画像包，永不 5xx（降级链） |
 | `GET /review/queue` | 复核队列：pending_review 行 + 未消解矛盾双存行 |
 | `POST /review/{user_source}/{user_id}/{scope}/{entry_id}/verdict` | 复核判定 approve/discard/fix |
-| `DELETE /profile/{source}/{native_id}` | 删除权：清全部画像行 + tombstone 留痕 + 删导出副本 |
-| `GET /export/{source}/{native_id}` | 导出该用户 md 视图（路径非法 → 400） |
+| `DELETE /profile/{source}/{native_id}` | 删除权：清全部画像行 + tombstone 留痕 |
 | `GET /healthz` | 存活 + SQLite 连通（库错误 → 503） |
 
 ### 上报事件
@@ -161,7 +159,7 @@ curl -s -X POST http://127.0.0.1:8300/review/chat_demo/u_001/global/preference_t
 
 ### 删除权
 
-`DELETE /profile/{source}/{native_id}` 清除该用户 entries/sources/review_history/pending_clarifications/embeddings，写入 tombstones（此后装配恒空包），并尽力删除导出副本。建议带 `x-requested-by` 请求头留痕操作发起方。
+`DELETE /profile/{source}/{native_id}` 清除该用户 entries/sources/review_history/pending_clarifications/embeddings，写入 tombstones（此后装配恒空包）。建议带 `x-requested-by` 请求头留痕操作发起方。
 
 ## 配置说明
 
@@ -169,7 +167,7 @@ curl -s -X POST http://127.0.0.1:8300/review/chat_demo/u_001/global/preference_t
 
 | 段 | 关键项 | 默认 | 说明 |
 |---|---|---|---|
-| 顶层 | `db_path` / `taxonomy_path` / `export_root` | — | 库、词表、导出目录 |
+| 顶层 | `db_path` / `taxonomy_path` | — | 库、词表 |
 | `llm` | `endpoint` / `model` / `api_key_env` | — | 抽取与决策所用网关；`timeout_seconds` 结构化输出建议 ≥120 |
 | `llm` | `structured_output_param` / `structured_output_type` | `response_format` / `json_schema` | OpenAI 用 `json_schema`；DeepSeek/GLM 用 `json_object`；置空参数名则不带结构化输出 |
 | `embedding` | `enabled` | false | 默认关闭，BM25 词面匹配为默认装配路径；开启后 `dimensions` 须与模型一致，变更触发全量重嵌入 |
@@ -226,15 +224,15 @@ stateDiagram-v2
 
 ## 词表 taxonomy
 
-`config/taxonomy.yaml` 是维度的唯一来源，驱动抽取打标、导出分组、审计校验、装配排序；`meta.version` 变更需附迁移样例。五维：
+`config/taxonomy.yaml` 是维度的唯一来源，驱动抽取打标、审计校验、装配排序；`meta.version` 变更需附迁移样例。五维：
 
-| 维度 | 归属文件 | 装配优先级 | 要点 |
-|---|---|---|---|
-| taboo | taboo.md | 0（恒第一） | 用户明确"不要/别再/拒绝"；必须含否定词 quote；**禁止运行期扩主题词** |
-| identity | identity.md | 1 | 称谓/语言/时区/职业/组织；仅自述或强证据；region 敏感（脱敏到城市级） |
-| preference | shell.md | 2 | 跨会话复用的选择倾向 |
-| fact | shell.md | 3 | 用户第一人称客观事实；转述他人一律拒绝；health 敏感（仅概括级） |
-| context | shell.md | 4 | 当前任务/一次性约束，生命周期最短 |
+| 维度 | 装配优先级 | 要点 |
+|---|---|---|
+| taboo | 0（恒第一） | 用户明确"不要/别再/拒绝"；必须含否定词 quote；**禁止运行期扩主题词** |
+| identity | 1 | 称谓/语言/时区/职业/组织；仅自述或强证据；region 敏感（脱敏到城市级） |
+| preference | 2 | 跨会话复用的选择倾向 |
+| fact | 3 | 用户第一人称客观事实；转述他人一律拒绝；health 敏感（仅概括级） |
+| context | 4 | 当前任务/一次性约束，生命周期最短 |
 
 - 作用域只允许 `global` 与 `project:{具体项目名}`
 - 敏感 topic（`sensitive: true`）：置信压顶 0.6，含精确位置/医疗细节特征即整条丢弃

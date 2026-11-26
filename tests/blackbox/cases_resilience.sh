@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# 域6 韧性收尾（T24-T26）：并发装配、非法路径、损坏库拒启（必须最后跑并自恢复）
+# 域6 韧性收尾（T24/T26）：并发装配、损坏库拒启（必须最后跑并自恢复）
 
 # T24 并发装配：xargs -P8 并发 GET /profile ×16，全部 200 且每个响应可被 jq 解析
 t24() {
-  # 并发目标：t17u（域4 已建画像；若 T17 被跳过则为空包用户，并发正确性口径不变）
+  # 并发目标：t17u（域4 已不再预建画像，按空包用户并发；并发正确性口径不变）
   local out n bad base i
   base="http://127.0.0.1:${PORT}/profile/bb/t17u"
   # 8 路并发 × 16 次：xargs 汇总状态码到 stdout（run_case 在命令替换子 shell 中，不能用 job control）
@@ -22,19 +22,6 @@ t24() {
       case_fail "响应 body 无法被 jq 解析"
     fi
   done
-  case_pass
-}
-
-# T25 非法导出路径：单段穿越应用层 400；多段穿越被路由层拒绝且不泄漏文件内容
-t25() {
-  http GET "/export/bb/%2e%2e"
-  expect_status 400 || return 1
-  http GET "/export/bb/..%2F..%2Fetc"
-  [[ "$STATUS" == "400" || "$STATUS" == "404" ]] || {
-    printf '    穿越 URL 期望 4xx 拒绝, got %s\n' "$STATUS"
-    return 1
-  }
-  printf '%s' "$BODY" | grep -q 'root:' && { case_fail "穿越响应泄漏了系统文件内容"; }
   case_pass
 }
 
@@ -118,6 +105,5 @@ t26_corrupt_db() {
 
 run_domain_resilience() {
   run_case T24 "并发装配" -- t24
-  run_case T25 "非法导出路径" -- t25
   t26_corrupt_db
 }

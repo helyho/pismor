@@ -6,7 +6,6 @@ import yaml
 class Dimension:
     key: str
     name: str
-    file: str
     priority: int
     default_scope: str
     topics: list[str]
@@ -29,7 +28,7 @@ def load_taxonomy(path: Path) -> Taxonomy:
     dims = {}
     for d in raw["dimensions"]:
         dims[d["key"]] = Dimension(
-            key=d["key"], name=d["name"], file=d["file"], priority=d["priority"],
+            key=d["key"], name=d["name"], priority=d["priority"],
             default_scope=d["default_scope"], topics=d["topics"], guidance=d["guidance"],
             sensitive=d.get("sensitive", False), topic_overrides=d.get("topic_overrides"),
         )

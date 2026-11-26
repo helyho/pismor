@@ -65,7 +65,6 @@ def fake_settings(tmp_path):
     return Settings(
         db_path=tmp_path / "api.db",
         taxonomy_path=REPO / "config" / "taxonomy.yaml",
-        export_root=tmp_path / "exports",
         llm=LLMSettings(endpoint="http://llm.test", model="m", api_key_env="LLM_API_KEY"),
         embedding=EmbeddingSettings(enabled=False, endpoint="", model="",
                                     api_key_env="", dimensions=4, batch_size=8))
@@ -198,15 +197,6 @@ def test_delete_tombstone(client, conn):
     assert conn.execute("SELECT COUNT(*) FROM entries").fetchone()[0] == 0
     tomb = conn.execute("SELECT user_source, user_id FROM tombstones").fetchone()
     assert (tomb["user_source"], tomb["user_id"]) == ("webchat", "u1")
-
-
-def test_export_endpoint(client, conn, fake_settings):
-    _seed_entry(conn, "taboo", "emoji", "global", "active",
-                "不用 emoji", "禁emoji", 0.95)
-    fake_settings.export_root.mkdir(parents=True, exist_ok=True)
-    r = client.get("/export/webchat/u1")
-    assert r.status_code == 200
-    assert (Path(r.json()["root"]) / "taboo.md").exists()
 
 
 def test_conversation_clarification_flow(client, conn, fake_llm):
@@ -649,25 +639,6 @@ def test_clarification_without_candidates_keeps_pending(client, conn, fake_llm):
     client.post("/events", json=dict(CONV_EVENT, event_id="evt_keep",
                                      messages=[{"role": "user", "text": "随便吧"}]))
     assert conn.execute("SELECT COUNT(*) c FROM pending_clarifications").fetchone()["c"] == 1
-
-
-def test_export_rejects_encoded_traversal(client, conn, fake_settings):
-    _seed_entry(conn, "taboo", "emoji", "global", "active", "不用 emoji", "禁emoji", 0.95)
-    root = fake_settings.export_root
-    for path in ("/export/webchat/%2e%2e", "/export/%2e%2e/u1", "/export/webchat/..%2f.."):
-        r = client.get(path)
-        assert r.status_code in (400, 404), (path, r.status_code)
-    assert not (root / "_index.md").exists()
-    assert not (root / "u1").exists()
-    assert not list(root.parent.glob("u1/*.md"))
-
-
-def test_delete_cleans_export_directory(client, conn, fake_settings):
-    _seed_entry(conn, "taboo", "emoji", "global", "active", "不用 emoji", "禁emoji", 0.95)
-    export_root = Path(client.get("/export/webchat/u1").json()["root"])
-    assert export_root.exists()
-    assert client.request("DELETE", "/profile/webchat/u1").json() == {"deleted": True}
-    assert not export_root.exists()  # 导出副本同步清除（spec §16#4）
 
 
 def test_backup_cleans_stale_tmp(conn, tmp_path):

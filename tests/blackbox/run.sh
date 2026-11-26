@@ -5,7 +5,7 @@
 # curl 打 HTTP，断言 = 响应 JSON(jq) + SQLite 落库(sqlite3 查 ./data/index.db)。
 # LLM_API_KEY 缺失时依赖 LLM 的用例标 [SKIP]，确定性用例照常跑。
 set -u
-cd "$(dirname "$0")/../.." # 强制仓库根（配置里 db/export 是相对 CWD 路径）
+cd "$(dirname "$0")/../.." # 强制仓库根（配置里 db 是相对 CWD 路径）
 
 PORT=18300
 TIMEOUT=90
@@ -40,9 +40,9 @@ if lsof -nP -iTCP:"$PORT" -sTCP:LISTEN >/dev/null 2>&1; then
   exit 2
 fi
 
-# 默认清库保证幂等（data/ exports/ 已 gitignore）
+# 默认清库保证幂等（data/ 已 gitignore）
 if ((KEEP_DATA == 0)); then
-  rm -rf data exports
+  rm -rf data
 fi
 
 MODE=real

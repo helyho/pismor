@@ -18,7 +18,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ValidationError
 
 from pismor.pipeline import intake, writer
-from pismor.serving import assembler, exporter
+from pismor.serving import assembler
 from pismor.core import tokenizer
 from pismor.core.config import Settings
 from pismor.core.keys import entry_key, split_mark, vec_key
@@ -224,22 +224,7 @@ def create_app(settings: Settings, llm=None, embedder=None) -> FastAPI:
                     "INSERT OR REPLACE INTO tombstones (user_source, user_id, deleted_at,"
                     " requested_by) VALUES (?, ?, ?, ?)",
                     (source, native_id, _utcnow(), requested_by))
-        # 删除权覆盖导出副本：导出目录与库分离，但同为用户画像数据（spec §16#4）
-        try:
-            exporter.remove_export(settings.export_root, source, native_id)
-        except (ValueError, OSError):
-            pass  # 非法路径段/IO 失败：删除权以主库为准，不阻断删除响应
         return {"deleted": True}
-
-    @app.get("/export/{source}/{native_id}")
-    def export_profile(source: str, native_id: str):
-        with closing(get_conn(settings.db_path)) as conn:
-            try:
-                root = exporter.export(conn, source, native_id, settings.export_root,
-                                       taxonomy)
-            except ValueError as exc:  # 路径穿越/非法路径段 → 400，不写任何文件
-                return JSONResponse({"detail": str(exc)}, status_code=400)
-        return {"root": str(root)}
 
     @app.get("/healthz")
     def healthz():

@@ -159,6 +159,68 @@ def test_noop_reinforces(conn, embedder_stub, seeded_active):
     assert row["reinforcements"] == 3 and row["last_reinforced_at"] == NOW
 
 
+def _seed_degraded(conn):
+    conn.execute(
+        "INSERT INTO entries (user_source,user_id,dimension,topic,scope,id,confidence,status,"
+        "body,summary,created_at,updated_at,last_reinforced_at,reinforcements,degraded_reason)"
+        " VALUES ('w','u','preference','lang','global','preference_lang@global',0.65,'degraded',"
+        "'旧值','旧值','2026-01-01','2026-01-01','2026-01-01',2,'stale')")
+    conn.commit()
+
+
+def test_low_confidence_does_not_revive_degraded(conn, embedder_stub):
+    # spec §6：degraded → active 需新强化证据 ≥ 0.85；低置信只计强化，不覆盖不复活
+    _seed_degraded(conn)
+    action = update_action("preference", "lang", "global")
+    action["candidate"]["confidence"] = 0.7
+    apply_actions(conn, "w", "u", [action], embedder_stub, "conversation", "s1:1", NOW)
+    row = conn.execute("SELECT * FROM entries WHERE topic='lang'").fetchone()
+    assert row["status"] == "degraded" and row["body"] == "旧值"
+    assert row["confidence"] == 0.65          # 低置信候选不得覆盖原置信
+    assert row["reinforcements"] == 3 and row["last_reinforced_at"] == NOW  # 仍计一次强化
+    assert conn.execute("SELECT COUNT(*) c FROM entries WHERE topic LIKE '~%'").fetchone()["c"] == 0
+    assert conn.execute("SELECT COUNT(*) c FROM sources").fetchone()["c"] == 0
+    hist = conn.execute(
+        "SELECT * FROM review_history WHERE decision='revive_rejected'").fetchone()
+    assert hist["actor"] == "pipeline" and hist["note"].startswith("confidence=0.70")
+
+
+def test_confidence_at_threshold_revives_degraded(conn, embedder_stub):
+    # 边界 0.85 应放行（判定为 < 0.85 拒绝）
+    _seed_degraded(conn)
+    action = update_action("preference", "lang", "global")
+    action["candidate"]["confidence"] = 0.85
+    apply_actions(conn, "w", "u", [action], embedder_stub, "conversation", "s1:1", NOW)
+    row = conn.execute("SELECT * FROM entries WHERE topic='lang'").fetchone()
+    assert row["status"] == "active" and row["body"] == "新值"
+    assert conn.execute("SELECT COUNT(*) c FROM entries WHERE topic LIKE '~lang:%'").fetchone()["c"] == 1
+    assert conn.execute("SELECT COUNT(*) c FROM review_history").fetchone()["c"] == 0
+
+
+def test_revive_threshold_follows_gate_auto_min(conn, embedder_stub):
+    # 门槛可配置：auto_min 下调到 0.6 时，0.7 的新证据应能复活
+    _seed_degraded(conn)
+    action = update_action("preference", "lang", "global")
+    action["candidate"]["confidence"] = 0.7
+    apply_actions(conn, "w", "u", [action], embedder_stub, "conversation", "s1:1", NOW,
+                  revive_min_confidence=0.6)
+    row = conn.execute("SELECT * FROM entries WHERE topic='lang'").fetchone()
+    assert row["status"] == "active" and row["body"] == "新值"
+
+
+def test_revive_threshold_can_be_raised(conn, embedder_stub):
+    # auto_min 上调到 0.9 时，0.85 的旧门槛证据不再复活
+    _seed_degraded(conn)
+    action = update_action("preference", "lang", "global")
+    action["candidate"]["confidence"] = 0.85
+    apply_actions(conn, "w", "u", [action], embedder_stub, "conversation", "s1:1", NOW,
+                  revive_min_confidence=0.9)
+    row = conn.execute("SELECT * FROM entries WHERE topic='lang'").fetchone()
+    assert row["status"] == "degraded" and row["body"] == "旧值"
+    assert conn.execute(
+        "SELECT COUNT(*) c FROM review_history WHERE decision='revive_rejected'").fetchone()["c"] == 1
+
+
 def test_embed_down_still_writes(conn, embed_down):
     apply_actions(conn, "w", "u", [add_action()], embed_down, "text", "e1", NOW)  # Review Focus #2
     assert conn.execute("SELECT COUNT(*) c FROM entries").fetchone()["c"] == 1
@@ -197,7 +259,7 @@ def test_orphan_goes_pending(conn, embedder_stub):
 
 
 def test_orphan_recur_reinforces(conn, embedder_stub):
-    # 同主题 orphan 复现：计数 +1（§8.2 晋升门槛依据），不重复插行
+    # 同主题 orphan 复现：计数 +1（§8.2 启用门槛依据），不重复插行
     apply_actions(conn, "w", "u", [orphan_action()], embedder_stub, "text", "e1", NOW)
     apply_actions(conn, "w", "u", [orphan_action()], embedder_stub, "text", "e2", NOW)
     assert conn.execute("SELECT COUNT(*) c FROM entries").fetchone()["c"] == 1

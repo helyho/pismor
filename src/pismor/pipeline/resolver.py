@@ -71,13 +71,13 @@ def resolve(conn, user_source, user_id, candidates, llm):
                                        existing["scope"])})
             continue
         taboo_row = _same_topic_taboo(conn, user_source, user_id, c)
-        verdict = llm.chat_json(RESOLVE_SYSTEM, RESOLVE_USER.format(
+        resolution = llm.chat_json(RESOLVE_SYSTEM, RESOLVE_USER.format(
             old_dim=existing["dimension"], topic=c["topic"], scope=c["scope"],
             old=existing["body"], new_dim=c["dimension"], new=c["body"],
             taboo=_taboo_note(taboo_row)), RESOLVE_SCHEMA)
-        op = verdict.get("decision")
+        op = resolution.get("decision")
         if c["dimension"] == "preference" and taboo_row:
-            op = "CONFLICT"  # taboo 恒胜：preference 侧降级，覆盖 LLM 判定
+            op = "CONFLICT"  # taboo 恒胜：preference 侧衰减，覆盖 LLM 判定
         target = (existing["dimension"], existing["topic"], existing["scope"])
         if op == "UPDATE":
             actions.append({"op": "UPDATE", "candidate": c, "target": target})
@@ -107,13 +107,13 @@ def _neighbor_conflict(conn, user_source, user_id, c, llm):
     if not rows:
         return None
     neighbors = "\n".join(f"- [{r['id']}] {r['body']}" for r in rows)
-    verdict = llm.chat_json(NEIGHBOR_SYSTEM, NEIGHBOR_USER.format(new=c["body"],
+    resolution = llm.chat_json(NEIGHBOR_SYSTEM, NEIGHBOR_USER.format(new=c["body"],
                                                                   neighbors=neighbors),
                             NEIGHBOR_SCHEMA)
-    if not verdict.get("conflict"):
+    if not resolution.get("conflict"):
         return None
     # LLM 指认的对端 id@scope 优先；缺失/不匹配时回退首行
-    accused = str(verdict.get("conflicting_with") or "").strip()
+    accused = str(resolution.get("conflicting_with") or "").strip()
     for r in rows:
         if accused in (r["id"], f"{r['id']}@{r['scope']}"):
             return (r["dimension"], r["topic"], r["scope"])

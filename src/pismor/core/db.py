@@ -52,11 +52,14 @@ CREATE TABLE IF NOT EXISTS sources (
   quote TEXT NOT NULL, kind TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_sources_entry ON sources(user_source, user_id, entry_id);
+CREATE INDEX IF NOT EXISTS idx_entries_status_updated ON entries(status, updated_at);
 CREATE TABLE IF NOT EXISTS review_history (
   entry_id TEXT, user_source TEXT, user_id TEXT,
-  verdict TEXT NOT NULL, actor TEXT NOT NULL, ts TEXT NOT NULL, note TEXT,
+  decision TEXT NOT NULL, actor TEXT NOT NULL, ts TEXT NOT NULL, note TEXT,
   entry_version TEXT NOT NULL
 );
+CREATE INDEX IF NOT EXISTS idx_review_history_entry
+  ON review_history(entry_id, user_source, user_id, ts);
 CREATE TABLE IF NOT EXISTS events_seen (
   source TEXT, event_id TEXT, ts TEXT,
   PRIMARY KEY (source, event_id)
@@ -70,8 +73,39 @@ CREATE TABLE IF NOT EXISTS pending_clarifications (
 );
 CREATE TABLE IF NOT EXISTS tombstones (
   user_source TEXT, user_id TEXT, deleted_at TEXT, requested_by TEXT,
+  purged_at TEXT,
   PRIMARY KEY (user_source, user_id)
 );
+CREATE TABLE IF NOT EXISTS merge_tasks (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_source TEXT NOT NULL, user_id TEXT NOT NULL,
+  taboo_count INTEGER NOT NULL DEFAULT 0,
+  scope_filter TEXT,
+  status TEXT NOT NULL DEFAULT 'open'
+    CHECK (status IN ('open','done','dismissed')),
+  proposal_json TEXT, note TEXT,
+  created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+-- 同一用户同时只保留一条 open 任务：读路径重复装配不重复建单
+CREATE UNIQUE INDEX IF NOT EXISTS uq_merge_tasks_open
+  ON merge_tasks(user_source, user_id) WHERE status='open';
+CREATE INDEX IF NOT EXISTS idx_merge_tasks_status ON merge_tasks(status, updated_at);
+CREATE TABLE IF NOT EXISTS admin_audit (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  actor TEXT NOT NULL, action TEXT NOT NULL, target TEXT NOT NULL,
+  ts TEXT NOT NULL, detail TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_admin_audit_ts ON admin_audit(ts);
+CREATE TABLE IF NOT EXISTS job_runs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  job TEXT NOT NULL,
+  started_at TEXT NOT NULL,
+  finished_at TEXT,
+  ok INTEGER,
+  stats_json TEXT,
+  error TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_job_runs_started ON job_runs(started_at);
 CREATE TABLE IF NOT EXISTS fts_meta (
   key TEXT PRIMARY KEY, value TEXT
 );
@@ -93,6 +127,13 @@ END;
 
 def init_schema(conn: sqlite3.Connection, vec_dimensions: int | None) -> None:
     conn.executescript(SCHEMA)
+    # 旧库升级：tombstones 增加 purged_at（软删除/彻底删除双态）
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(tombstones)")}
+    if "purged_at" not in columns:
+        conn.execute("ALTER TABLE tombstones ADD COLUMN purged_at TEXT")
+        # 旧版本的删除是硬删除，存量 tombstone 的数据已不存在，统一标记为已彻底删除，
+        # 避免升级后把它们显示成“可恢复”。
+        conn.execute("UPDATE tombstones SET purged_at=deleted_at WHERE purged_at IS NULL")
     # 行键迁移（旧库升级）：id 曾为裸 {dimension}_{topic}，与 sources.entry_id 的
     # "{id}@{scope}" 两套格式并存；统一为行键后 entries.id 可直接与 sources JOIN。
     conn.execute(

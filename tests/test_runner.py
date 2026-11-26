@@ -63,3 +63,15 @@ def test_success_returns_true_and_keeps_seen_marker(conn, settings, taxonomy, mo
     assert runner.run_pipeline(conn, settings, event(), taxonomy=taxonomy, llm=object()) is True
     assert called == ["e1"]
     assert _seen(conn) == 1
+
+
+def test_run_links_revive_threshold_to_auto_min(conn, settings, taxonomy, monkeypatch):
+    """复活门槛跟随 gate.auto_min：与显式直通门槛联动，而不是硬编码 0.85。"""
+    from dataclasses import replace
+
+    captured = {}
+    monkeypatch.setattr(runner.extractor, "extract", lambda *a, **k: [])
+    monkeypatch.setattr(runner, "_apply", lambda *a, **kw: captured.update(kw))
+    tuned = replace(settings, gate=replace(settings.gate, auto_min=0.6))
+    runner._run(conn, tuned, event(), taxonomy, None, None)
+    assert captured["revive_min_confidence"] == 0.6

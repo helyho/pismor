@@ -83,33 +83,33 @@ bb_conv_event() {
     '{source:"bb", user_ref:$u, event_id:$e, event_type:"conversation", session_id:("blackbox:" + $e), turn:1, ts:$t, messages:$m}'
 }
 
-# promote_active <user> <dimension>：条目停在 pending_review 时走 verdict approve
+# activate_entry <user> <dimension>：条目停在 pending_review 时走 decision confirm
 # 使其生效（产品正常路径：待复核条目不进包）。已是 active/degraded 直接返回 0。
 # user_id 不是唯一键（PK 含 user_source），故查询都带 user_source；scope 一并锁定
-promote_active() {
+activate_entry() {
   local uid="$1" dim="$2" st eid= ver= scope=
   st=$(db "SELECT status FROM entries WHERE user_source='bb' AND user_id='${uid}' AND dimension='${dim}' ORDER BY rowid DESC LIMIT 1")
   [[ "$st" == "active" || "$st" == "degraded" ]] && return 0
   IFS='|' read -r eid scope ver <<<"$(db "SELECT id || '|' || scope || '|' || updated_at FROM entries WHERE user_source='bb' AND user_id='${uid}' AND dimension='${dim}' ORDER BY rowid DESC LIMIT 1")"
-  [[ -n "$eid" && -n "$scope" && -n "$ver" ]] || { printf '    promote_active: 未找到 %s/%s 条目\n' "$uid" "$dim"; return 1; }
-  http POST "/review/bb/${uid}/${scope}/${eid}/verdict" \
-    "$(jq -n --arg verdict approve --arg v "$ver" '{verdict:$verdict, entry_version:$v}')"
+  [[ -n "$eid" && -n "$scope" && -n "$ver" ]] || { printf '    activate_entry: 未找到 %s/%s 条目\n' "$uid" "$dim"; return 1; }
+  http POST "/review/bb/${uid}/${scope}/${eid}/decision" \
+    "$(jq -n --arg decision confirm --arg v "$ver" '{decision:$decision, entry_version:$v}')"
   expect_status 200 || return 1
   expect_json '.noop' 'false' || return 1
   wait_db "SELECT 1 FROM entries WHERE user_source='bb' AND user_id='${uid}' AND id='${eid}' AND scope='${scope}' AND status IN ('active','degraded')" 30
 }
 
-# promote_all <uid>：把该用户所有非生效条目逐条 approve。
+# activate_all <uid>：把该用户所有非生效条目逐条 confirm。
 # 装配只取 status IN (active,degraded)，而 LLM 置信度会随机落在 pending_review；
 # 用例断言"能被召回"时用它消除随机性（不掩盖问题，只是把前置条件固定）。
-promote_all() {
+activate_all() {
   local uid="$1" eid scope ver
   while IFS='|' read -r eid scope ver; do
     [[ -n "$eid" ]] || continue
-    http POST "/review/bb/${uid}/${scope}/${eid}/verdict" \
-      "$(jq -n --arg verdict approve --arg v "$ver" '{verdict:$verdict, entry_version:$v}')"
+    http POST "/review/bb/${uid}/${scope}/${eid}/decision" \
+      "$(jq -n --arg decision confirm --arg v "$ver" '{decision:$decision, entry_version:$v}')"
     if [[ "$STATUS" != 200 ]]; then
-      printf '    promote_all: %s 复核返回 %s\n' "$eid" "$STATUS"
+      printf '    activate_all: %s 复核返回 %s\n' "$eid" "$STATUS"
       return 1
     fi
   done < <(db "SELECT id || '|' || scope || '|' || updated_at FROM entries WHERE user_source='bb' AND user_id='${uid}' AND status NOT IN ('active','degraded')")

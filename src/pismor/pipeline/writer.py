@@ -43,6 +43,11 @@ _ENTRY_COLS = ("user_source,user_id,dimension,topic,scope,id,confidence,status,b
 # 会写入向量行的 op（与 _add/_update/_conflict 的 append 点一一对应）
 _VECTOR_OPS = ("ADD", "UPDATE", "CONFLICT")
 
+# degraded → active 的复活门槛默认值（spec §6：新强化证据 conf ≥ 0.85）。
+# 只约束管线自动写入；管线按 settings.gate.auto_min 传入（与显式直通门槛联动），
+# 人工复核 confirm / 澄清 revive 是裁决路径，不受此限。
+REVIVE_MIN_CONFIDENCE = 0.85
+
 # 嵌入降级口径（spec §20）：单条失败只丢该条向量
 _EMBED_ERRORS = (EmbedUnavailable, KeyError, json.JSONDecodeError, IndexError, TypeError)
 
@@ -56,10 +61,12 @@ def _check_transition(old_status, new_status):
         raise IllegalTransition(f"illegal transition: {old_status} -> {new_status}")
 
 
-def apply_actions(conn, user_source, user_id, actions, embedder, origin_type, origin_ref, now):
+def apply_actions(conn, user_source, user_id, actions, embedder, origin_type, origin_ref, now,
+                  *, revive_min_confidence: float = REVIVE_MIN_CONFIDENCE):
     """单事务应用 Action 列表；scope 违规候选丢弃记日志（spec §8 作用域白名单）。
 
     返回真正落库的 action 列表。嵌入在事务开始前完成（批量一次，失败逐条重试）。
+    revive_min_confidence 为 degraded → active 的复活门槛（管线传 gate.auto_min）。
     """
     # taboo 优先：同批双新增时 taboo 行先落库，preference 行处理时查询可见 → 恒胜降级
     ordered = sorted(actions, key=lambda a: a.get("candidate", {}).get("dimension") != "taboo")
@@ -69,7 +76,7 @@ def apply_actions(conn, user_source, user_id, actions, embedder, origin_type, or
     with conn:
         for action in ordered:
             if _apply_one(conn, user_source, user_id, action, origin_type, origin_ref, now,
-                          vectors):
+                          vectors, revive_min_confidence):
                 applied.append(action)
         _write_vectors(conn, user_source, user_id, vectors, precomputed)
     return applied
@@ -106,7 +113,8 @@ def _precompute_vectors(conn, embedder, actions):
     return precomputed
 
 
-def _apply_one(conn, us, uid, action, origin_type, origin_ref, now, vectors) -> bool:
+def _apply_one(conn, us, uid, action, origin_type, origin_ref, now, vectors,
+               revive_min_confidence=REVIVE_MIN_CONFIDENCE) -> bool:
     op, c = action["op"], action["candidate"]
     if not valid_scope(c.get("scope")):
         logger.warning("drop candidate %s/%s: invalid scope %r",
@@ -115,7 +123,8 @@ def _apply_one(conn, us, uid, action, origin_type, origin_ref, now, vectors) -> 
     if op == "ADD":
         return _add(conn, us, uid, c, now, origin_type, origin_ref, vectors)
     if op == "UPDATE":
-        return _update(conn, us, uid, c, action["target"], now, origin_type, origin_ref, vectors)
+        return _update(conn, us, uid, c, action["target"], now, origin_type, origin_ref, vectors,
+                       revive_min_confidence)
     if op == "CONFLICT":
         return _conflict(conn, us, uid, c, action["target"], now, origin_type, origin_ref, vectors)
     if op == "NOOP":
@@ -163,7 +172,8 @@ def _add(conn, us, uid, c, now, origin_type, origin_ref, vectors) -> bool:
     return bool(entry_id)
 
 
-def _update(conn, us, uid, c, target, now, origin_type, origin_ref, vectors) -> bool:
+def _update(conn, us, uid, c, target, now, origin_type, origin_ref, vectors,
+            revive_min_confidence=REVIVE_MIN_CONFIDENCE) -> bool:
     if not c.get("quote"):
         return False
     if target is None:
@@ -182,6 +192,17 @@ def _update(conn, us, uid, c, target, now, origin_type, origin_ref, vectors) -> 
         return bool(entry_id)
     _check_transition(old["status"], "archived")  # 旧行归档轨迹；archived 再 UPDATE 拒绝
     if old["status"] == "degraded":
+        conf = float(c.get("confidence") or 0.0)
+        if conf < revive_min_confidence:
+            # 低置信证据不足以复活：只计强化，不覆盖正文、不产生轨迹行（spec §6）
+            logger.warning("revive rejected: %s/%s@%s conf=%.2f < %.2f",
+                           d, t, s, conf, revive_min_confidence)
+            conn.execute(
+                "INSERT INTO review_history (entry_id,user_source,user_id,decision,actor,"
+                "ts,note,entry_version) VALUES (?,?,?,'revive_rejected','pipeline',?,?,?)",
+                (entry_key(d, t, s), us, uid, now,
+                 f"confidence={conf:.2f} < {revive_min_confidence}", old["updated_at"]))
+            return _noop(conn, us, uid, target, now)
         _check_transition("degraded", "active")  # 新证据演进恢复 active（spec §6）
     sup_topic, sup_id = _superseded_identity(conn, us, uid, d, t, s, now)
     # 轨迹行：旧行完整内容原样存档，topic 加 "~" 前缀避开主键；
@@ -400,14 +421,14 @@ def _noop(conn, us, uid, target, now) -> bool:
 
 def _orphan(conn, us, uid, c, now, origin_type, origin_ref) -> bool:
     # 观察区键 = topic_new（词表外主题描述）：同用户同 topic_new 复用一行做 reinforce；
-    # 空 topic_new 不合并（否则不同主题被压成一行，晋升门槛永不满足，I-1）。
+    # 空 topic_new 不合并（否则不同主题被压成一行，启用门槛永不满足，I-1）。
     topic_new = (c.get("topic_new") or c.get("topic") or "").strip()
     if not topic_new:
         logger.warning("drop orphan candidate without topic_new: %s", c.get("body"))
         return False
     key = ("orphan", topic_new, c["scope"])
     if _fetch_row(conn, us, uid, key) is not None:
-        # 同主题 orphan 复现：计数 +1（spec §8.2 晋升门槛"复现≥3次/30天"依据）
+        # 同主题 orphan 复现：计数 +1（spec §8.2 启用门槛"复现≥3次/30天"依据）
         conn.execute(
             "UPDATE entries SET reinforcements=reinforcements+1, last_reinforced_at=? "
             "WHERE user_source=? AND user_id=? AND dimension=? AND topic=? AND scope=?",
@@ -461,6 +482,41 @@ def _append_conflict_mark(conn, taboo_row, other_mark):
 def _has_embeddings_table(conn):
     return conn.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='embeddings'").fetchone() is not None
+
+
+def merge_entries(conn, us, uid, *, src_id, src_scope, dst_id, dst_scope, now) -> dict:
+    """把 src 行并入 dst 行（人工确认的 topic 归一/去重）。
+
+    正文与摘要保留 dst（规范条目优先），置信取二者最大、强化次数累加；
+    src 的证据链（sources）迁移到 dst，conflict_with 中的 src 标记重定向，
+    最后删除 src 行与其向量。调用方负责事务；返回 {"merged": bool}。
+    """
+    src = conn.execute(
+        "SELECT dimension, topic, scope, confidence, reinforcements FROM entries"
+        " WHERE user_source=? AND user_id=? AND id=? AND scope=?",
+        (us, uid, src_id, src_scope)).fetchone()
+    dst = conn.execute(
+        "SELECT dimension, topic, scope FROM entries"
+        " WHERE user_source=? AND user_id=? AND id=? AND scope=?",
+        (us, uid, dst_id, dst_scope)).fetchone()
+    if src is None or dst is None:
+        return {"merged": False}
+    conn.execute(
+        "UPDATE sources SET entry_id=? WHERE user_source=? AND user_id=? AND entry_id=?",
+        (dst_id, us, uid, src_id))
+    _rekey_conflict_marks(conn, us, uid, src_id, dst_id)
+    conn.execute(
+        "UPDATE entries SET confidence=MAX(confidence, ?),"
+        " reinforcements=reinforcements+?, updated_at=?"
+        " WHERE user_source=? AND user_id=? AND id=? AND scope=?",
+        (src["confidence"], src["reinforcements"], now, us, uid, dst_id, dst_scope))
+    conn.execute(
+        "DELETE FROM entries WHERE user_source=? AND user_id=? AND id=? AND scope=?",
+        (us, uid, src_id, src_scope))
+    if _has_embeddings_table(conn):
+        conn.execute("DELETE FROM embeddings WHERE entry_id=?",
+                     (vec_key(us, uid, src["dimension"], src["topic"], src["scope"]),))
+    return {"merged": True}
 
 
 def _write_vectors(conn, us, uid, vectors, precomputed):

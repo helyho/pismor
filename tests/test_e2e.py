@@ -330,7 +330,8 @@ def test_tombstone_empty_pack(client_with_script, db):
     client, _llm = client_with_script([])
     _seed(db, "taboo", "excel", "表格一律用 Python 生成")
     _seed(db, "preference", "coffee", "用户只喝浅烘咖啡豆")
-    assert client.request("DELETE", "/profile/webchat/u1").json() == {"deleted": True}
+    deleted = client.request("DELETE", "/profile/webchat/u1").json()
+    assert deleted == {"deleted": True, "mode": "soft"}
 
     resp = client.get("/profile/webchat/u1?budget=2000")
     assert resp.status_code == 200

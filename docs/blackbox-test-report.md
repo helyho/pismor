@@ -44,7 +44,7 @@ bash tests/blackbox/run.sh --only assemble,privacy --keep-data --port 18300
 - `POST /events` 为 202 + 后台管线，落库断言一律 `wait_db` 轮询（默认 90s，最长 120s）。
 - 装配链路随配置：`embedding.enabled: true` 时 query 召回走向量（cos 阈值 `min_similarity: 0.5`），向量不可用或低于阈值时回退词面 BM25（FTS5）。
 - LLM 随机性容错：标 `--retry` 的用例失败后隔 5s 整用例重跑一次；`event_id` 每次唯一化，重跑不会撞产品幂等去重。
-- 装配只取 `status IN (active, degraded)`；LLM 置信度随机落在 `pending_review` 时，用例先用 `promote_active`/`promote_all` 走复核通道固定前置条件，再断言召回。
+- 装配只取 `status IN (active, degraded)`；LLM 置信度随机落在 `pending_review` 时，用例先用 `activate_entry`/`activate_all` 走复核通道固定前置条件，再断言召回。
 
 ## 3. 覆盖矩阵
 
@@ -76,7 +76,7 @@ bash tests/blackbox/run.sh --only assemble,privacy --keep-data --port 18300
 | # | 用例 | 验证点 | 依赖 LLM | 结果 |
 |---|---|---|---|---|
 | T14 | 矛盾收敛 | 先后两条互斥语言偏好，终态 `lang` 生效条目 ≤1 | 是 | PASS |
-| T15 | verdict 流转 | approve 非 noop 且 `review_history` +1；旧版本 → `{"noop":true}`；新版本 discard 后行消失 | 是 | PASS |
+| T15 | decision 流转 | confirm 非 noop 且 `review_history` +1；旧版本 → `{"noop":true}`；新版本 remove 后行消失 | 是 | PASS |
 | T16 | 复核队列结构 | 200，`.items` 为数组，非空项含 `entry_id/status/entry_version` | 否 | PASS |
 | T17 | 长消息触发 | >300 字符纯文本素材可触发抽取并入包 | 是 | PASS |
 | T18 | 澄清回流闭环 | 互斥偏好双存 → `clarification_needed` 提问 → conversation 回答后 pending 消费；规范行恢复 `active`、`+` 变形行归档、互标清除 | 是 | PASS |

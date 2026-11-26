@@ -1,43 +1,31 @@
 # 画像系统配置示例。复制为 settings.yaml 后按环境修改；
 # api_key_env 指向的密钥从环境变量读取，不落配置文件。
-db_path: ./data/index.db
-taxonomy_path: ./config/taxonomy.yaml
+db_path: ./data/index.db          # 主库路径；管理后台只读，修改需重启
+taxonomy_path: ./config/taxonomy.yaml  # 词表路径；配置中心可编辑，保存后热生效
 
 llm:
-  endpoint: "http://10.242.0.11:8080/v1/"
-  model: "auto"
-  api_key_env: LLM_API_KEY
+  endpoint: "http://10.242.0.11:8080/v1/"  # OpenAI 兼容接口根地址
+  model: "auto"                    # 模型名；网关支持 auto 路由
+  api_key_env: LLM_API_KEY        # 读取密钥的环境变量名；真实密钥不写入文件
   timeout_seconds: 120            # 单次请求超时；结构化输出慢模型建议 ≥120
   retries: 1                      # transport 异常/429/5xx 额外重试次数
   retry_backoff_seconds: 0.5      # 重试退避基数（指数增长；429 时取 Retry-After 较大者）
   log_preview_chars: 2048         # 响应日志预览长度
   user_agent: ~                   # 配置后请求头注入 User-Agent（网关 UA 白名单场景）；~ = httpx 原生 UA
-  # 结构化输出（默认 OpenAI 格式）。三家对照：
-  # - OpenAI:   response_format + {"type":"json_schema","json_schema":{...,"strict":true}}
-  #             Schema 级强制（必填字段/枚举由解码层保证）；旧模型可退 {"type":"json_object"}
-  # - DeepSeek: response_format + {"type":"json_object"} —— 仅保证合法 JSON，不保证结构；
-  #             提示词须含 "json" 字样并给输出示例；max_tokens 给足（截断即坏 JSON）；
-  #             输出非 JSON 时内容被替换为空格，代码侧需处理空白返回（重试）；
-  #             Chat Completions 不支持 json_schema（Responses API 的 text.format 才有）
-  # - GLM(智谱): response_format + {"type":"json_object"} 最通用可靠；
-  #             json_schema 在 BigModel 实测可被接受但官方未承诺，勿依赖；
-  #             结构靠 System Prompt 写全 Schema + 要求"输出严格 JSON、不要 Markdown 代码块"
-  structured_output_param: "response_format"   # 参数名；置空 "" 则请求不带结构化输出参数
-  structured_output_type: "json_object"        # "json_schema"(OpenAI) | "json_object"(DeepSeek/GLM)
+  structured_output_param: "response_format"   # 参数名；置空 "" 则不带；三家均用 response_format
+  structured_output_type: "json_object"        # json_schema=OpenAI 强约束；json_object=DeepSeek/GLM 仅保证合法 JSON
 
 embedding:
-  enabled: true                  # 默认关闭：词面匹配为默认装配路径
-  endpoint: "http://10.11.11.108:8000/v1/embeddings"
-  model: "BAAI/bge-m3"
-  api_key_env: EMBEDDING_API_KEY
+  enabled: true                  # 启用后装配增加向量召回；关闭则只走词面匹配
+  endpoint: "http://10.11.11.108:8000/v1/embeddings"  # 嵌入接口地址
+  model: "BAAI/bge-m3"             # 嵌入模型名；须与 dimensions 匹配
+  api_key_env: EMBEDDING_API_KEY   # 读取密钥的环境变量名；真实密钥不写入文件
   dimensions: 1024                # 须与模型输出一致；变更触发全量重嵌入
-  batch_size: 32
-  timeout_seconds: 30
+  batch_size: 32                   # 单次嵌入请求批量
+  timeout_seconds: 30              # 单次嵌入请求超时（秒）
   min_similarity: 0.5              # 相关集向量召回最低 cosine 相似度（-1=不过滤）
 
-# ---- 以下段可整体省略（缺省即默认值）----
-
-gate:
+gate:  # 本段及以下各段可整体省略，缺省即默认值
   auto_min: 0.85                  # ≥此值且 explicit 直通入库
   review_min: 0.6                 # ≥此值入复核队列，之下丢弃
   inferred_cap: 0.8               # inferred 候选置信压顶
@@ -47,9 +35,7 @@ pipeline:
   reinforce_top_k: 20             # 无变化轮话题强化条数上限
   trigger_long_message: 300       # 消息长度突变阈值（字符）
   max_body_chars: 200             # 候选 body 截断长度
-  # explicit 触发词表：命中任一关键词的消息零阈值直通抽取（中英文）。
-  # 缺省即下方默认词表；可整体替换（如仅中文场景），或追加业务自定义词。
-  trigger_explicit_keywords:
+  trigger_explicit_keywords:  # 命中任一关键词即零阈值直通抽取；可整体替换或追加业务词
     - "记住"                      # 记住我喜欢深色主题
     - "以后"                      # 以后都用 Python
     - "别再"                      # 别再给我推广告
@@ -75,6 +61,7 @@ aggregator:
 
 assembler:
   taboo_budget_share: 0.6         # merge_task 时 taboo 预算占比
+  taboo_merge_threshold: 40       # taboo 存活条数超此值触发归并任务（装配与日批同源）
   tokenizer: jieba                # BM25 词法索引分词器：jieba | bigram（切换后需重跑 scripts/rebuild_fts.py）
   related_top_k: 20               # 相关集召回条数
   half_life_days: 30              # 强化时效半衰期
@@ -84,6 +71,7 @@ intake:
   max_content_chars: 8192         # 事件 content 上限
 
 backup:
+  root: ./backups                 # 备份根：db/ 为 SQLite 快照，config/ 为配置历史
   keep: 30                        # 快照滚动保留份数
 
 serve:

@@ -5,6 +5,9 @@ __pycache__/
 *.egg-info/
 data/
 exports/
+backups/
+web/node_modules/
+web/dist/
 .DS_Store
 **/.DS_Store
 nohup.out
@@ -13,3 +16,4 @@ nohup.out
 integration/
 config/settings.yaml
 integration/settings.yaml
+config/.*.lock

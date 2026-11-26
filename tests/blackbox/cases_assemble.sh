@@ -21,7 +21,7 @@ t10() {
   expect_status 202 || return 1
   wait_db "SELECT 1 FROM entries e WHERE e.user_id='t9u' AND e.dimension='taboo'" 90 \
     || { case_fail "90s 内 taboo 条目未入库"; }
-  promote_active t9u taboo || return 1
+  activate_entry t9u taboo || return 1
   http GET /profile/bb/t9u
   expect_status 200 || return 1
   expect_json '[.entries[] | select(.id | startswith("taboo"))] | length > 0' 'true' || return 1
@@ -36,7 +36,7 @@ t11() {
   expect_status 202 || return 1
   wait_db "SELECT 1 FROM entries e WHERE e.user_id='t10u' AND e.dimension='identity'" 90 \
     || { case_fail "90s 内 identity 条目未入库"; }
-  promote_active t10u identity || return 1
+  activate_entry t10u identity || return 1
   http GET /profile/bb/t10u
   expect_status 200 || return 1
   expect_json '[.entries[] | select(.id | startswith("identity"))] | length > 0' 'true' || return 1
@@ -73,14 +73,14 @@ t13() {
   http POST /events "$(bb_event t12u "$e2" "记住, 我周末喜欢爬山")"
   expect_status 202 || return 1
   # 等 Python 事件真正落库：sources 行由 origin_ref 唯一确定，不依赖 LLM 归类。
-  # 若只等"任意条目入库"，爬山事件先落库时会早退，promote 发生在 Python 条目写入前，
+  # 若只等"任意条目入库"，爬山事件先落库时会早退，activate 发生在 Python 条目写入前，
   # 该条目随后以 pending_review 入库、装配取不到 → 历史间歇 FAIL 的根因。
   wait_db "SELECT 1 FROM sources WHERE user_source='bb' AND user_id='t12u' AND origin_ref='blackbox:$e1'" 120 \
     || { case_fail "120s 内 Python 事件未落库"; }
   # 装配只取 active/degraded；LLM 置信度随机，条目可能停在 pending_review。
   local i
   for i in 1 2 3; do
-    promote_all t12u || { case_fail "promote_all 失败"; }
+    activate_all t12u || { case_fail "activate_all 失败"; }
     wait_db "SELECT 1 FROM entries e WHERE e.user_source='bb' AND e.user_id='t12u' AND e.status='active'" 15 \
       && break
   done

@@ -1,0 +1,308 @@
+import json
+from contextlib import closing
+from pathlib import Path
+
+from fastapi.testclient import TestClient
+
+from pismor.admin.deps import Principal
+from pismor.core.config import EmbeddingSettings, LLMSettings, Settings
+from pismor.core.db import get_conn
+from pismor.serving.api import create_app
+
+
+REPO = Path(__file__).resolve().parents[2]
+VERSION = "2026-01-01T00:00:00+00:00"
+
+
+class FakeLLM:
+    def chat_json(self, system, user, schema):
+        return {"candidates": []}
+
+
+def _settings(tmp_path: Path) -> Settings:
+    return Settings(
+        db_path=tmp_path / "admin.db",
+        taxonomy_path=REPO / "config" / "taxonomy.yaml",
+        llm=LLMSettings(endpoint="http://llm.test", model="m", api_key_env="LLM_API_KEY"),
+        embedding=EmbeddingSettings(
+            enabled=False, endpoint="", model="", api_key_env="",
+            dimensions=4, batch_size=8,
+        ),
+    )
+
+
+def _make_app(tmp_path: Path):
+    app = create_app(_settings(tmp_path), llm=FakeLLM())
+    return app, TestClient(app), tmp_path / "admin.db"
+
+
+def _insert_entry(
+    conn,
+    *,
+    user_source="webchat",
+    user_id="u1",
+    dimension="preference",
+    topic="style",
+    scope="global",
+    status="pending_review",
+    conflict_with=None,
+    summary="summary",
+    body="body",
+    updated_at=VERSION,
+):
+    entry_id = f"{dimension}_{topic}@{scope}"
+    conn.execute(
+        "INSERT INTO entries (user_source,user_id,dimension,topic,scope,id,confidence,"
+        "status,body,summary,created_at,updated_at,last_reinforced_at,degraded_reason,"
+        "superseded_by,topic_new,conflict_with,reinforcements,archived_at)"
+        " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (user_source, user_id, dimension, topic, scope, entry_id, 0.9, status,
+         body, summary, updated_at, updated_at, updated_at, None, None, None,
+         conflict_with, 0, None),
+    )
+    conn.commit()
+    return entry_id
+
+
+def test_queue_filters_and_pagination(tmp_path):
+    app, client, db_path = _make_app(tmp_path)
+    with closing(get_conn(db_path)) as conn:
+        _insert_entry(conn, topic="a", dimension="preference", summary="alpha",
+                      updated_at="2026-01-01T00:00:00+00:00")
+        _insert_entry(conn, topic="b", dimension="fact", user_id="u2", summary="beta",
+                      updated_at="2026-01-02T00:00:00+00:00")
+        _insert_entry(conn, topic="+conflict", dimension="preference", status="active",
+                      summary="conflict summary", conflict_with='["preference_a@global"]',
+                      updated_at="2026-01-03T00:00:00+00:00")
+        _insert_entry(conn, topic="old", dimension="fact", status="archived",
+                      summary="archived", updated_at="2026-01-04T00:00:00+00:00")
+
+    res = client.get("/admin/api/review/queue", params={"page": 1, "page_size": 1})
+    assert res.status_code == 200
+    body = res.json()
+    assert body["total"] == 3
+    assert body["page_size"] == 1
+    assert len(body["items"]) == 1
+    assert body["items"][0]["topic"] == "a"
+
+    res = client.get("/admin/api/review/queue", params={"dimension": "preference"})
+    assert res.json()["total"] == 2
+
+    res = client.get("/admin/api/review/queue", params={"q": "conflict"})
+    assert res.json()["total"] == 1
+    assert res.json()["items"][0]["topic"] == "+conflict"
+
+    res = client.get("/admin/api/review/queue", params={"user_id": "u2"})
+    assert res.json()["total"] == 1
+    assert res.json()["items"][0]["user_id"] == "u2"
+
+    res = client.get("/admin/api/review/facets")
+    facets = res.json()
+    assert {item["value"] for item in facets["dimensions"]} == {"preference", "fact"}
+    assert facets["sources"] == [{"value": "webchat", "count": 3}]
+
+
+def test_entry_detail_returns_evidence_history_and_conflict(tmp_path):
+    app, client, db_path = _make_app(tmp_path)
+    with closing(get_conn(db_path)) as conn:
+        entry_id = _insert_entry(
+            conn, topic="style", conflict_with='["preference_other@global"]')
+        _insert_entry(conn, topic="other", status="active", summary="other summary")
+        conn.execute(
+            "INSERT INTO sources (entry_id,user_source,user_id,origin_type,origin_ref,quote,kind)"
+            " VALUES (?,?,?,?,?,?,?)",
+            (entry_id, "webchat", "u1", "message", "msg-1", "我喜欢简洁", "explicit"),
+        )
+        conn.execute(
+            "INSERT INTO review_history (entry_id,user_source,user_id,decision,actor,ts,note,entry_version)"
+            " VALUES (?,?,?,?,?,?,?,?)",
+            (entry_id, "webchat", "u1", "confirm", "reviewer", VERSION, "ok", VERSION),
+        )
+        conn.execute(
+            "INSERT INTO pending_clarifications (user_source,user_id,conflicting_ids,question,issued_at,ttl_days)"
+            " VALUES (?,?,?,?,?,?)",
+            ("webchat", "u1", json.dumps([entry_id]), "哪个更准确？", VERSION, 7),
+        )
+        conn.commit()
+
+    res = client.get(
+        "/admin/api/review/entry",
+        params={
+            "user_source": "webchat",
+            "user_id": "u1",
+            "entry_id": entry_id,
+            "scope": "global",
+        },
+    )
+    assert res.status_code == 200
+    body = res.json()
+    assert body["entry"]["conflict_marks"] == ["preference_other@global"]
+    assert body["sources"][0]["quote"] == "我喜欢简洁"
+    assert body["history"][0]["decision"] == "confirm"
+    assert body["history"][0]["actor"] == "reviewer"
+    assert body["clarifications"][0]["conflicting_ids"] == [entry_id]
+    assert body["conflicts"][0]["summary"] == "other summary"
+
+
+def test_confirm_remove_fix_and_noop(tmp_path):
+    app, client, db_path = _make_app(tmp_path)
+    with closing(get_conn(db_path)) as conn:
+        entry_id = _insert_entry(conn, topic="style")
+
+    payload = {
+        "user_source": "webchat",
+        "user_id": "u1",
+        "scope": "global",
+        "entry_id": entry_id,
+        "decision": "confirm",
+        "entry_version": VERSION,
+    }
+    res = client.post("/admin/api/review/decision", json=payload)
+    assert res.status_code == 200
+    assert res.json() == {"noop": False, "updated": 1}
+    with closing(get_conn(db_path)) as conn:
+        entry = conn.execute("SELECT status FROM entries WHERE id=?", (entry_id,)).fetchone()
+        history = conn.execute(
+            "SELECT decision, actor FROM review_history WHERE entry_id=?", (entry_id,)
+        ).fetchone()
+    assert entry["status"] == "active"
+    assert (history["decision"], history["actor"]) == ("confirm", "reviewer")
+
+    # 同一版本再次判定：版本已推进，返回 noop
+    res = client.post("/admin/api/review/decision", json=payload)
+    assert res.json()["noop"] is True
+
+    # fix：覆盖摘要与正文
+    with closing(get_conn(db_path)) as conn:
+        current = conn.execute(
+            "SELECT updated_at FROM entries WHERE id=?", (entry_id,)
+        ).fetchone()["updated_at"]
+    res = client.post("/admin/api/review/decision", json={
+        **payload, "decision": "fix", "entry_version": current,
+        "summary": "fixed summary", "body": "fixed body",
+    })
+    assert res.json()["noop"] is False
+    with closing(get_conn(db_path)) as conn:
+        entry = conn.execute(
+            "SELECT summary, body FROM entries WHERE id=?", (entry_id,)
+        ).fetchone()
+    assert (entry["summary"], entry["body"]) == ("fixed summary", "fixed body")
+
+    # remove：条目与证据链删除，处理历史保留
+    with closing(get_conn(db_path)) as conn:
+        current = conn.execute(
+            "SELECT updated_at FROM entries WHERE id=?", (entry_id,)
+        ).fetchone()["updated_at"]
+        conn.execute(
+            "INSERT INTO sources (entry_id,user_source,user_id,origin_type,origin_ref,quote,kind)"
+            " VALUES (?,?,?,?,?,?,?)",
+            (entry_id, "webchat", "u1", "message", "msg-2", "原文", "explicit"),
+        )
+        conn.commit()
+    res = client.post("/admin/api/review/decision", json={
+        **payload, "decision": "remove", "entry_version": current,
+    })
+    assert res.json()["noop"] is False
+    with closing(get_conn(db_path)) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM entries").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM sources").fetchone()[0] == 0
+        decisions = [row[0] for row in conn.execute(
+            "SELECT decision FROM review_history ORDER BY rowid")]
+    assert decisions == ["confirm", "fix", "remove"]
+
+
+def test_detail_404_and_capability(tmp_path):
+    app, client, _ = _make_app(tmp_path)
+    res = client.get("/admin/api/review/entry", params={
+        "user_source": "webchat", "user_id": "u1",
+        "entry_id": "preference_missing@global", "scope": "global",
+    })
+    assert res.status_code == 404
+
+    app.state.principal = Principal(
+        subject="nobody", display_name="无权限", roles=(), capabilities=frozenset()
+    )
+    assert client.get("/admin/api/review/queue").status_code == 403
+    assert client.post("/admin/api/review/decision", json={}).status_code == 403
+
+
+def _add_source(conn, entry_id, quote="不要表格"):
+    conn.execute(
+        "INSERT INTO sources (entry_id,user_source,user_id,origin_type,origin_ref,quote,kind)"
+        " VALUES (?,?,?,?,?,?,?)",
+        (entry_id, "webchat", "u1", "message", "m1", quote, "explicit"))
+    conn.commit()
+
+
+def _decide(client, entry_id, topic):
+    return client.post("/admin/api/review/decision", json={
+        "user_source": "webchat", "user_id": "u1", "scope": "global",
+        "entry_id": entry_id, "decision": "confirm",
+        "entry_version": VERSION, "topic": topic})
+
+
+def test_confirm_rekeys_free_topic_to_whitelist(tmp_path):
+    app, client, db_path = _make_app(tmp_path)
+    with closing(get_conn(db_path)) as conn:
+        eid = _insert_entry(conn, dimension="taboo", topic="不要表格", body="不要用表格")
+        _add_source(conn, eid)
+    res = _decide(client, eid, "output_format")
+    assert res.status_code == 200, res.text
+    assert res.json()["rekeyed_to"] == "output_format"
+    with closing(get_conn(db_path)) as conn:
+        row = conn.execute("SELECT topic,id,status FROM entries").fetchone()
+        assert row["topic"] == "output_format"
+        assert row["id"] == "taboo_output_format@global"
+        assert row["status"] == "active"
+        assert conn.execute("SELECT entry_id FROM sources").fetchone()["entry_id"] == row["id"]
+
+
+def test_confirm_merges_into_existing_topic(tmp_path):
+    app, client, db_path = _make_app(tmp_path)
+    with closing(get_conn(db_path)) as conn:
+        _insert_entry(conn, dimension="taboo", topic="output_format",
+                      body="规范条目", status="active")
+        eid = _insert_entry(conn, dimension="taboo", topic="不要表格", body="自由说法")
+        _add_source(conn, eid)
+    res = _decide(client, eid, "output_format")
+    assert res.status_code == 200, res.text
+    assert res.json()["merged_into"] == "output_format"
+    with closing(get_conn(db_path)) as conn:
+        rows = conn.execute("SELECT id,body FROM entries").fetchall()
+        assert [r["id"] for r in rows] == ["taboo_output_format@global"]
+        assert rows[0]["body"] == "规范条目"  # 保留规范条目正文
+        assert conn.execute("SELECT entry_id FROM sources").fetchone()["entry_id"] == \
+            "taboo_output_format@global"
+
+
+def test_confirm_rejects_topic_outside_whitelist(tmp_path):
+    app, client, db_path = _make_app(tmp_path)
+    with closing(get_conn(db_path)) as conn:
+        eid = _insert_entry(conn, dimension="taboo", topic="不要表格", body="不要用表格")
+    res = _decide(client, eid, "not_in_whitelist")
+    assert res.status_code == 200, res.text
+    assert res.json()["invalid_topic"] is True
+    with closing(get_conn(db_path)) as conn:
+        assert conn.execute("SELECT topic FROM entries").fetchone()["topic"] == "不要表格"
+
+
+def test_merge_tasks_list_and_resolve(tmp_path):
+    app, client, db_path = _make_app(tmp_path)
+    with closing(get_conn(db_path)) as conn:
+        conn.execute(
+            "INSERT INTO merge_tasks (user_source,user_id,taboo_count,status,proposal_json,"
+            "created_at,updated_at) VALUES ('webchat','u1',50,'open','{}',?,?)",
+            (VERSION, VERSION))
+        conn.commit()
+        tid = conn.execute("SELECT id FROM merge_tasks").fetchone()["id"]
+    res = client.get("/admin/api/merge-tasks")
+    assert res.status_code == 200
+    body = res.json()
+    assert body["total"] == 1 and body["items"][0]["taboo_count"] == 50
+    res = client.post(f"/admin/api/merge-tasks/{tid}/resolve",
+                      json={"status": "done", "note": "已归并"})
+    assert res.status_code == 200 and res.json()["status"] == "done"
+    assert client.get("/admin/api/merge-tasks").json()["total"] == 0
+    # 已消解任务重复操作 → 404
+    res = client.post(f"/admin/api/merge-tasks/{tid}/resolve", json={"status": "done"})
+    assert res.status_code == 404

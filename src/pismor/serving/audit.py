@@ -1,4 +1,4 @@
-"""一致性审计（spec §4/§6/§7/§9 invariants SQL 化）：扫描产 violations；隔离动作另置。
+"""一致性审计（spec §4/§6/§7/§9 invariants SQL 化）：扫描产 violations；标记动作另置。
 
 规则集（spec §7 invariants + §4 指令扫描 + §6 状态机静态校验 + §9 taboo 文件规则）：
 - taboo_no_overlap: 同 user 的 taboo 与 preference 存活行近似同主题（相等/子串/共享词根）
@@ -9,8 +9,9 @@
 - quote_required / inferred_cap / unique_key_per_scope / status_consistency /
   instruction_pattern 同前。
 
-violations 每条附 entry 定位（五元组），供 isolate_violations 落复核队列。
-run_audit 只读；隔离动作由 isolate_violations 显式执行（spec §6 审计隔离）。
+violations 每条附 entry 定位（五元组），供 flag_violations 落复核队列。
+停用主题仍保留在 topics 中，审计不做词表外判定：存量条目按原状态保留。
+run_audit 只读；标记动作由 flag_violations 显式执行（spec §6 审计标记）。
 """
 import json
 import re
@@ -36,6 +37,15 @@ def run_audit(conn, taxonomy, *, inferred_cap: float = 0.8) -> list[dict]:
     out += _unique_key(conn)
     out += _status_consistency(conn)
     out += _instruction_pattern(conn)
+    blocked = {
+        (row["user_source"], row["user_id"])
+        for row in conn.execute("SELECT user_source, user_id FROM tombstones")
+    }
+    if blocked:
+        out = [
+            v for v in out
+            if (v["entry"]["user_source"], v["entry"]["user_id"]) not in blocked
+        ]
     return out
 
 
@@ -202,16 +212,21 @@ def _instruction_pattern(conn):
     return out
 
 
-def isolate_violations(conn, violations: list[dict], now: str) -> int:
-    """审计隔离：命中违规的 active 条目转 pending_review + review_history 留痕。
+def flag_violations(conn, violations: list[dict], now: str) -> int:
+    """审计标记：命中违规的 active 条目转 pending_review + review_history 留痕。
 
-    已是 pending/orphan/degraded/archived 的行不重复隔离（幂等）。
+    已是 pending/orphan/degraded/archived 的行不重复标记（幂等）。
     """
-    isolated = 0
+    flagged = 0
     with conn:
         for v in violations:
             e = v.get("entry")
             if not e:
+                continue
+            if conn.execute(
+                "SELECT 1 FROM tombstones WHERE user_source=? AND user_id=?",
+                (e["user_source"], e["user_id"]),
+            ).fetchone():
                 continue
             row = conn.execute(
                 "SELECT status, updated_at FROM entries WHERE user_source=? AND user_id=?"
@@ -227,9 +242,9 @@ def isolate_violations(conn, violations: list[dict], now: str) -> int:
             if cur.rowcount == 0:
                 continue
             conn.execute(
-                "INSERT INTO review_history (entry_id, user_source, user_id, verdict, actor,"
-                " ts, note, entry_version) VALUES (?, ?, ?, 'isolated', 'audit', ?, ?, ?)",
+                "INSERT INTO review_history (entry_id, user_source, user_id, decision, actor,"
+                " ts, note, entry_version) VALUES (?, ?, ?, 'flagged', 'audit', ?, ?, ?)",
                 (e.get("id") or f"{e['dimension']}_{e['topic']}@{e['scope']}", e["user_source"], e["user_id"], now,
                  v["rule"], row["updated_at"]))
-            isolated += 1
-    return isolated
+            flagged += 1
+    return flagged

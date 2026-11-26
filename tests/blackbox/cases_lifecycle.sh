@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 域3 生命周期/复核（T14-T18）：矛盾收敛、verdict 流转、复核队列、长消息触发、澄清回流
+# 域3 生命周期/复核（T14-T18）：矛盾收敛、decision 流转、复核队列、长消息触发、澄清回流
 # event_id 一律经 next_event_id 生成：retry 重跑拿新 id，不撞产品幂等去重
 # T14 矛盾收敛（LLM）：两条 lang 主题矛盾指令，终态生效条目至多 1 条
 t14() {
@@ -30,7 +30,7 @@ t14() {
   expect_status 200 || return 1
   case_pass
 }
-# T15 verdict 流转（LLM 建数据，流转本身确定）：approve→旧版本 noop→discard 行消失
+# T15 decision 流转（LLM 建数据，流转本身确定）：confirm→旧版本 noop→remove 行消失
 # user 每次 attempt 唯一（retry 重跑不污染 review_history 计数）
 t15() {
   need_llm || return 2
@@ -45,26 +45,26 @@ t15() {
   scope=$(db "SELECT scope FROM entries WHERE user_source='bb' AND user_id='${uid}' AND id='${entry_id}' ORDER BY rowid DESC LIMIT 1")
   ver=$(db "SELECT updated_at FROM entries WHERE user_source='bb' AND user_id='${uid}' AND id='${entry_id}' AND scope='${scope}' ORDER BY rowid DESC LIMIT 1")
   [[ -n "$scope" && -n "$ver" ]] || { case_fail "未取到 scope/updated_at"; }
-  local vpath="/review/bb/${uid}/${scope}/${entry_id}/verdict"
-  # updated_at 是秒级：approve 前跨一秒，保证版本推进，"旧版本重发"才有 noop 语义
+  local vpath="/review/bb/${uid}/${scope}/${entry_id}/decision"
+  # updated_at 是秒级：confirm 前跨一秒，保证版本推进，"旧版本重发"才有 noop 语义
   sleep 1
-  http POST "$vpath" "$(jq -n --arg verdict approve --arg v "$ver" '{verdict:$verdict, entry_version:$v}')"
+  http POST "$vpath" "$(jq -n --arg decision confirm --arg v "$ver" '{decision:$decision, entry_version:$v}')"
   expect_status 200 || return 1
   expect_json '.noop' 'false' || return 1
   expect_db "SELECT count(*) FROM review_history WHERE user_source='bb' AND user_id='${uid}' AND entry_id='${entry_id}'" "1" || return 1
   # 旧版本重发 → noop（版本失配保护）
-  http POST "$vpath" "$(jq -n --arg verdict discard --arg v "$ver" '{verdict:$verdict, entry_version:$v}')"
+  http POST "$vpath" "$(jq -n --arg decision remove --arg v "$ver" '{decision:$decision, entry_version:$v}')"
   expect_status 200 || return 1
   expect_json_true '.noop' || return 1
-  # 新版本 discard → 该条目消失
+  # 新版本 remove → 该条目消失
   ver2=$(db "SELECT updated_at FROM entries WHERE user_source='bb' AND user_id='${uid}' AND id='${entry_id}' AND scope='${scope}' ORDER BY rowid DESC LIMIT 1")
-  [[ -n "$ver2" ]] || { case_fail "discard 前 entry 已消失"; }
+  [[ -n "$ver2" ]] || { case_fail "remove 前 entry 已消失"; }
   if [[ "$ver2" == "$ver" ]]; then
     sleep 1
     ver2=$(db "SELECT updated_at FROM entries WHERE user_source='bb' AND user_id='${uid}' AND id='${entry_id}' AND scope='${scope}' ORDER BY rowid DESC LIMIT 1")
   fi
-  [[ "$ver2" != "$ver" ]] || { case_fail "approve 后 updated_at 未推进（版本轮转失效）"; }
-  http POST "$vpath" "$(jq -n --arg verdict discard --arg v "$ver2" '{verdict:$verdict, entry_version:$v}')"
+  [[ "$ver2" != "$ver" ]] || { case_fail "confirm 后 updated_at 未推进（版本轮转失效）"; }
+  http POST "$vpath" "$(jq -n --arg decision remove --arg v "$ver2" '{decision:$decision, entry_version:$v}')"
   expect_status 200 || return 1
   expect_json '.noop' 'false' || return 1
   expect_db "SELECT count(*) FROM entries WHERE user_source='bb' AND user_id='${uid}' AND id='${entry_id}'" "0" || return 1
@@ -145,7 +145,7 @@ t18_clarify() {
 
 run_domain_lifecycle() {
   run_case T14 "矛盾收敛" --retry -- t14
-  run_case T15 "verdict流转" --retry -- t15
+  run_case T15 "decision流转" --retry -- t15
   run_case T16 "复核队列结构" -- t16
   run_case T17 "长消息触发" --retry -- t17
   run_case T18 "澄清回流闭环" --retry -- t18_clarify

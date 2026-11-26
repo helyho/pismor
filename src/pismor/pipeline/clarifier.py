@@ -98,9 +98,9 @@ def match_incoming(conn, user_source, user_id, text, llm) -> dict | None:
         (user_source, user_id)).fetchone()
     if row is None:
         return None
-    verdict = llm.chat_json(CLARIFY_CHECK_SYSTEM, CLARIFY_CHECK_USER.format(
+    decision = llm.chat_json(CLARIFY_CHECK_SYSTEM, CLARIFY_CHECK_USER.format(
         question=row["question"], message=text), ANSWER_CHECK_SCHEMA)
-    if not verdict.get("is_answer"):
+    if not decision.get("is_answer"):
         return None
     return {"conflicting_ids": json.loads(row["conflicting_ids"]),
             "pending_key": row["conflicting_ids"], "answer": text}

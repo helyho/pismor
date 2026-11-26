@@ -54,6 +54,7 @@ class AggregatorSettings:
 @dataclass(frozen=True)
 class AssemblerSettings:
     taboo_budget_share: float = 0.6  # merge_task 时 taboo 预算占比
+    taboo_merge_threshold: int = 40  # taboo 存活条数超过此值触发归并任务（装配与日批同源）
     tokenizer: str = "jieba"         # BM25 词法索引分词器："jieba" | "bigram"（切换需 rebuild）
     related_top_k: int = 20          # 相关集召回条数
     half_life_days: float = 30.0     # 强化时效半衰期
@@ -66,6 +67,7 @@ class IntakeSettings:
 @dataclass(frozen=True)
 class BackupSettings:
     keep: int = 30                  # 快照滚动保留份数
+    root: Path = Path("./backups")  # 备份根目录：db/ 与 config/ 两个子目录
 
 @dataclass(frozen=True)
 class ServeSettings:
@@ -84,27 +86,35 @@ class Settings:
     intake: IntakeSettings = IntakeSettings()
     backup: BackupSettings = BackupSettings()
     serve: ServeSettings = ServeSettings()
+    config_path: Path | None = None  # 管理后台读写 settings.yaml 的路径；直接构造时可为空
 
 
 def _section(raw: dict, name: str, cls):
     """yaml 段缺省时用 dataclass 全默认值；段内字段缺省时用各自默认（向后兼容旧配置）。
 
-    yaml 列表自动转 tuple 注解字段的 tuple，保证与默认值类型一致（如词表）。"""
+    yaml 列表自动转 tuple 注解字段的 tuple，保证与默认值类型一致（如词表）；
+    Path 注解字段自动转 Path；未知字段被过滤，但原文件由 round-trip 保留。"""
     kwargs = dict(raw.get(name) or {})
+    known = set()
     for f in fields(cls):
+        known.add(f.name)
         v = kwargs.get(f.name)
         if isinstance(v, list) and typing.get_origin(f.type) is tuple:
             kwargs[f.name] = tuple(v)
-    return cls(**kwargs)
+        if f.type is Path and isinstance(v, str):
+            kwargs[f.name] = Path(v)
+    return cls(**{k: v for k, v in kwargs.items() if k in known})
 
 
-def load_settings(path: Path) -> Settings:
-    raw = yaml.safe_load(path.read_text(encoding="utf-8"))
+def parse_settings(raw: dict, path: Path | None = None) -> Settings:
+    """把 YAML 原始 dict 转成 Settings；不读文件，供配置中心校验/保存复用。"""
+    if not isinstance(raw, dict):
+        raise ValueError("settings 顶层必须是 mapping")
     return Settings(
         db_path=Path(raw["db_path"]),
         taxonomy_path=Path(raw["taxonomy_path"]),
-        llm=LLMSettings(**raw["llm"]),
-        embedding=EmbeddingSettings(**raw["embedding"]),
+        llm=_section(raw, "llm", LLMSettings),
+        embedding=_section(raw, "embedding", EmbeddingSettings),
         gate=_section(raw, "gate", GateSettings),
         pipeline=_section(raw, "pipeline", PipelineSettings),
         aggregator=_section(raw, "aggregator", AggregatorSettings),
@@ -112,4 +122,10 @@ def load_settings(path: Path) -> Settings:
         intake=_section(raw, "intake", IntakeSettings),
         backup=_section(raw, "backup", BackupSettings),
         serve=_section(raw, "serve", ServeSettings),
+        config_path=path,
     )
+
+
+def load_settings(path: Path) -> Settings:
+    raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    return parse_settings(raw, path=path)

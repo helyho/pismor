@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # 域4 删除权（T19-T20）：删除全链、tombstone 持续
 # event_id 一律经 next_event_id 生成：retry 重跑拿新 id，不撞产品幂等去重
-# T19 删除权全链（LLM 自建数据）：tombstones 留痕、关联表清空、profile 空包
+# T19 删除权全链（LLM 自建数据）：tombstones 留痕、软删除保留关联表、profile 空包
 t18() {
   need_llm || return 2
   local ev; ev=$(next_event_id t19e)
@@ -16,10 +16,9 @@ t18() {
   expect_status 200 || return 1
   expect_json_true '.deleted' || return 1
   expect_db "SELECT count(*) FROM tombstones WHERE user_source='bb' AND user_id='t19u' AND requested_by='api'" "1" || return 1
-  expect_db "SELECT count(*) FROM entries WHERE user_source='bb' AND user_id='t19u'" "0" || return 1
-  expect_db "SELECT count(*) FROM sources WHERE user_source='bb' AND user_id='t19u'" "0" || return 1
-  expect_db "SELECT count(*) FROM review_history WHERE user_source='bb' AND user_id='t19u'" "0" || return 1
-  expect_db "SELECT count(*) FROM pending_clarifications WHERE user_source='bb' AND user_id='t19u'" "0" || return 1
+  expect_db "SELECT count(*) FROM entries WHERE user_source='bb' AND user_id='t19u'" "1" || return 1
+  expect_db "SELECT count(*) FROM sources WHERE user_source='bb' AND user_id='t19u' > 0" "1" || return 1
+  expect_db "SELECT count(*) FROM tombstones WHERE user_source='bb' AND user_id='t19u' AND purged_at IS NULL" "1" || return 1
   http GET /profile/bb/t19u
   expect_status 200 || return 1
   expect_json '.entries' '[]' || return 1
@@ -39,13 +38,10 @@ t19() {
   expect_status 200 || return 1
   expect_json_true '.deleted' || return 1
   http POST /events "$(bb_event t20u "$e2" "记住, 我自己的小脚本默认都用 Python 写")"
-  expect_status 202 || return 1
-  wait_db "SELECT 1 FROM events_seen WHERE event_id='$e2'" 30 || { case_fail "删后事件未被接受"; }
-  sleep 45 # 后台管线处理时延
-  # 产品语义：tombstone 在 intake 拦截——已删除用户的新事件不调 LLM、不写库；
-  # 装配同样恒空包
-  expect_db "SELECT count(*) FROM entries WHERE user_source='bb' AND user_id='t20u'" "0" || return 1
-  expect_db "SELECT count(*) FROM sources WHERE user_source='bb' AND user_id='t20u'" "0" || return 1
+  expect_status 410 || return 1
+  # 产品语义：tombstone 在 intake 前拦截——新事件不写 events_seen、不调 LLM、不写库
+  expect_db "SELECT count(*) FROM entries WHERE user_source='bb' AND user_id='t20u'" "1" || return 1
+  expect_db "SELECT count(*) FROM sources WHERE user_source='bb' AND user_id='t20u' > 0" "1" || return 1
   http GET /profile/bb/t20u
   expect_status 200 || return 1
   expect_json '.entries' '[]' || return 1

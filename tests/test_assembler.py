@@ -361,6 +361,46 @@ def test_vector_recall_isolates_cross_scope(conn):
     assert {"语言使用 Python", "语言项目内使用 Go"} <= bodies
 
 
+# ---- priority 驱动运行时：taxonomy.priority_order() ----
+
+def _row(dimension, topic, body, conf=0.9, status="active"):
+    return {"id": f"{dimension}_{topic}@global", "scope": "global", "dimension": dimension,
+            "body": body, "confidence": conf, "status": status,
+            "updated_at": NOW, "reinforcements": 0}
+
+
+def test_priority_order_controls_render_and_budget():
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc)
+    rows = [_row("preference", "coffee", "只" * 30, 0.95),
+            _row("fact", "city", "住" * 30, 0.5)]
+    # priority 把 fact 放前面：预算只够一条时由 fact 占位（与置信无关）
+    pack = assembler_mod._build(rows, [], 12, now, "u1", True, None,
+                                dimension_order=("taboo", "identity", "fact", "preference"))
+    assert [e["text"] for e in pack["entries"]] == ["住" * 30]
+    # 渲染顺序同样跟随 priority
+    pack = assembler_mod._build(rows, [], 2000, now, "u1", True, None,
+                                dimension_order=("fact", "preference"))
+    assert pack["rendered"].index("住" * 30) < pack["rendered"].index("只" * 30)
+
+
+def test_unlisted_dimension_not_dropped():
+    # 配置新增的维度不在默认顺序里，也必须进入 rendered（此前会被静默丢弃）
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc)
+    rows = [_row("taboo", "excel", "禁忌内容"), _row("skill", "sql", "在学 SQL")]
+    pack = assembler_mod._build(rows, [], 2000, now, "u1", True, None)
+    assert "在学 SQL" in pack["rendered"]
+    assert pack["rendered"].index("禁忌内容") < pack["rendered"].index("在学 SQL")
+
+
+def test_taboo_stays_first_despite_priority(conn, seeded):
+    # 硬约束：即使配置把 taboo 排在后面，注入顺序也不得翻转
+    pack = assemble(conn, None, "w", "u1", budget=2000,
+                    dimension_order=("identity", "taboo"))
+    assert [e["id"] for e in pack["entries"]][0] == "taboo_excel@global"
+
+
 class UnitQueryEmbedder:
     """返回未归一化 query 向量的假嵌入器（[3,4] 范数 5）。"""
 
@@ -395,3 +435,32 @@ def test_clarifications_issued_in_single_batch(conn, seeded_conflict_pair, monke
     assert len(pairs) == 1 and pairs[0][0]  # 一对矛盾标记
     assert commit is True
     assert pack["clarification_needed"][0]["question"] == "q0"
+
+
+def test_current_scope_limits_must_have(conn):
+    _entry(conn, "taboo", "excel", "全局禁忌", scope="global")
+    _entry(conn, "taboo", "excel", "工作项目禁忌", scope="project:work")
+    _entry(conn, "taboo", "excel", "其他项目禁忌", scope="project:other")
+    conn.commit()
+    pack = assemble(conn, None, "w", "u1", budget=2000,
+                    current_scope="project:work")
+    ids = {e["id"] for e in pack["entries"]}
+    assert "taboo_excel@global" in ids
+    assert "taboo_excel@project:work" in ids
+    assert "taboo_excel@project:other" not in ids
+
+
+def test_merge_task_sink_persists_single_open(conn, tmp_path):
+    from pismor.serving.merge_task import DbMergeTaskSink
+    for i in range(50):
+        _entry(conn, "taboo", f"t{i}", "字" * 30, conf=0.5)
+    _entry(conn, "identity", "role", "用户是后端工程师")
+    conn.commit()
+    sink = DbMergeTaskSink(tmp_path / "test.db", "w", "u1", "project:work")
+    pack = assemble(conn, None, "w", "u1", budget=2000,
+                    current_scope="project:work", audit_sink=sink)
+    assert pack["merge_task"] is True
+    assemble(conn, None, "w", "u1", budget=2000, audit_sink=sink)
+    row = conn.execute("SELECT COUNT(*) c, MAX(taboo_count) n FROM merge_tasks"
+                       " WHERE status='open'").fetchone()
+    assert row["c"] == 1 and row["n"] == 50

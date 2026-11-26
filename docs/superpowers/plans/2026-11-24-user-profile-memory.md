@@ -4,7 +4,7 @@
 
 **Goal:** 实现 spec 定义的画像记忆系统：统一事件入口 → 抽取管线 → SQLite 存储 → 装配 API，实时注入画像包。
 
-**Architecture:** 单体 FastAPI 进程：写入侧（POST /events → 幂等 → 触发分级 → LLM 抽取 → 置信度闸门 → 四路决策 → 事务写入）与读取侧（GET /profile → 必带集+相关集装配）同进程；SQLite（sqlite-vec）为唯一真相源；每日聚合任务做 orphan 晋升/降级/废弃；md 导出为视图。
+**Architecture:** 单体 FastAPI 进程：写入侧（POST /events → 幂等 → 触发分级 → LLM 抽取 → 置信度闸门 → 四路决策 → 事务写入）与读取侧（GET /profile → 必带集+相关集装配）同进程；SQLite（sqlite-vec）为唯一真相源；每日聚合任务做 orphan 启用/衰减/废弃；md 导出为视图。
 
 **Tech Stack:** Python 3.12、FastAPI、pydantic v2、httpx（LLM/嵌入服务客户端）、PyYAML、sqlite-vec、pytest + pytest-asyncio + respx。
 
@@ -19,9 +19,9 @@
 - 禁止词表外 topic 直接入库：conversation/text 抽取遇到词表外主题 → `status=orphan_topic` + `topic_new`（spec §8）
 - taboo 维度禁止自动建桶；taboo 与 preference 同主题互斥时 taboo 恒胜；装配顺序 taboo 恒第一（spec §7 invariants）
 - 装配预算默认 2000 token；taboo 条数 >40 时截至预算 60% 并触发归并复审任务（spec §13）
-- 降级参数：90 天无强化且 conf<0.7 → degraded（taboo 除外）；degraded 180 天无任何更新 → archived；orphan 复现 ≥3 次/30 天才晋升；澄清 TTL 7 天（spec §6/§8/§11）
+- 降级参数：90 天无强化且 conf<0.7 → degraded（taboo 除外）；degraded 180 天无任何更新 → archived；orphan 复现 ≥3 次/30 天才启用；澄清 TTL 7 天（spec §6/§8/§11）
 - 条目+sources+embeddings 必须同一 SQLite 事务写入（spec §20）
-- 敏感规则：`health` 仅概括级；`region` 脱敏到城市级；正文指令模式命中 → 隔离 `pending_review`（spec §4/§7）
+- 敏感规则：`health` 仅概括级；`region` 脱敏到城市级；正文指令模式命中 → 标记 `pending_review`（spec §4/§7）
 - 每日 `VACUUM INTO` 备份保留 30 份；启动 `PRAGMA integrity_check`（spec §20）
 - 密钥一律从环境变量读（`api_key_env`），不落配置文件与代码（spec §16/§20）
 
@@ -95,7 +95,7 @@ def taxonomy():
 
 运行 `pytest tests/test_taxonomy.py -v`（尚无测试，先建目录结构使其可运行）。
 
-- [ ] **Step 2: 写 taxonomy.yaml（从 spec §7 样例逐字抄入，五维+invariants+regression_cases+meta.auto_promote）**
+- [ ] **Step 2: 写 taxonomy.yaml（从 spec §7 样例逐字抄入，五维+invariants+regression_cases+meta.auto_activate）**
 
 文件即 spec §7 的 yaml 代码块全文，不增不减。
 
@@ -108,7 +108,7 @@ def test_load_taxonomy(taxonomy):
     assert set(taxonomy.dimensions) == {"taboo", "identity", "preference", "fact", "context"}
     assert taxonomy.dimensions["taboo"].priority == 0
     assert "tool" in taxonomy.dimensions["taboo"].topics
-    assert taxonomy.meta["auto_promote"] is True
+    assert taxonomy.meta["auto_activate"] is True
     assert any(c["quote"].startswith("别再") for c in taxonomy.regression_cases)
 
 def test_missing_file_raises(tmp_path):
@@ -293,7 +293,7 @@ CREATE TABLE IF NOT EXISTS sources (
 CREATE INDEX IF NOT EXISTS idx_sources_entry ON sources(user_source, user_id, entry_id);
 CREATE TABLE IF NOT EXISTS review_history (
   entry_id TEXT, user_source TEXT, user_id TEXT,
-  verdict TEXT NOT NULL, actor TEXT NOT NULL, ts TEXT NOT NULL, note TEXT,
+  decision TEXT NOT NULL, actor TEXT NOT NULL, ts TEXT NOT NULL, note TEXT,
   entry_version TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS events_seen (
@@ -671,13 +671,13 @@ def resolve(conn, user_source, user_id, candidates, llm):
             (user_source, user_id, c["dimension"], c["topic"], c["scope"])).fetchone()
         if existing is None:
             actions.append({"op": "ADD", "candidate": c}); continue
-        verdict = llm.chat_json(RESOLVE_SYSTEM, RESOLVE_USER.format(
+        resolution = llm.chat_json(RESOLVE_SYSTEM, RESOLVE_USER.format(
             old=existing["body"], new=c["body"],
             taboo=existing["dimension"] == "taboo" or c["dimension"] == "taboo"),
             RESOLVE_SCHEMA)
-        if verdict["decision"] == "UPDATE":
+        if resolution["decision"] == "UPDATE":
             actions.append({"op": "UPDATE", "candidate": c, "target": (existing["dimension"], existing["topic"], existing["scope"])})
-        elif verdict["decision"] == "CONFLICT":
+        elif resolution["decision"] == "CONFLICT":
             actions.append({"op": "CONFLICT", "candidate": c, "target": (existing["dimension"], existing["topic"], existing["scope"])})
         else:
             actions.append({"op": "NOOP", "candidate": c,
@@ -841,30 +841,30 @@ def test_corrupt_fallback(conn, broken_db, embedder_stub):  # 降级链
 - Test: `tests/test_aggregator.py`
 
 **Interfaces:**
-- Produces: `run_daily(conn, taxonomy, llm, auto_promote: bool, now: str) -> dict`（返回统计 `{promoted, merged, demoted, archived, dropped_review, expired_clarifications}`）。
+- Produces: `run_daily(conn, taxonomy, llm, auto_activate: bool, now: str) -> dict`（返回统计 `{activated, merged, decayed, archived, dropped_review, expired_clarifications}`）。
 
 - [ ] **Step 1: 失败测试**
 
 ```python
-def test_orphan_promoted_after_threshold(conn, seeded_orphans_3, taxonomy, fake_llm_merge):
-    stats = run_daily(conn, taxonomy, fake_llm_merge, auto_promote=True, now="2026-12-24")
-    assert stats["promoted"] == 3  # 同 topic_new 复现≥3次/30天 → re-key 转 active
+def test_orphan_activated_after_threshold(conn, seeded_orphans_3, taxonomy, fake_llm_merge):
+    stats = run_daily(conn, taxonomy, fake_llm_merge, auto_activate=True, now="2026-12-24")
+    assert stats["activated"] == 3  # 同 topic_new 复现≥3次/30天 → re-key 转 active
     assert conn.execute("SELECT status FROM entries WHERE status='orphan_topic'").fetchone() is None
 
 def test_orphan_dropped_below_threshold(conn, seeded_orphans_1, taxonomy, fake_llm_merge):
-    stats = run_daily(conn, taxonomy, fake_llm_merge, auto_promote=True, now="2026-12-24")
+    stats = run_daily(conn, taxonomy, fake_llm_merge, auto_activate=True, now="2026-12-24")
     assert stats["dropped_orphan"] == 1  # 超期未达门槛
 
-def test_taboo_orphan_never_auto_promote(conn, seeded_taboo_orphan, taxonomy, fake_llm_merge):
-    run_daily(conn, taxonomy, fake_llm_merge, auto_promote=True, now="2026-12-24")
+def test_taboo_orphan_never_auto_activate(conn, seeded_taboo_orphan, taxonomy, fake_llm_merge):
+    run_daily(conn, taxonomy, fake_llm_merge, auto_activate=True, now="2026-12-24")
     # taboo 词表外候选只进人工队列: status 仍 orphan_topic 且有 pending 标记（写入 review_history actor=audit）
     assert conn.execute("SELECT COUNT(*) c FROM entries WHERE dimension='taboo' AND status='orphan_topic'").fetchone()["c"] == 1
 
-def test_demote_stale(conn, seeded_stale_active):
+def test_decay_stale(conn, seeded_stale_active):
     stats = run_daily(conn, taxonomy, FakeLLM([]), True, now=NOW)
     assert conn.execute("SELECT status FROM entries").fetchone()["status"] == "degraded"
 
-def test_taboo_not_demoted_by_time(conn, seeded_stale_taboo):  # taboo 不参与时间衰减
+def test_taboo_not_decayed_by_time(conn, seeded_stale_taboo):  # taboo 不参与时间衰减
     run_daily(conn, taxonomy, FakeLLM([]), True, now=NOW)
     assert conn.execute("SELECT status FROM entries").fetchone()["status"] == "active"
 
@@ -875,9 +875,9 @@ def test_review_expired(conn, seeded_old_pending_review):
 
 - [ ] **Step 2: 失败 → Step 3: 实现**
 
-五个扫描器函数各一条 SQL + 少量逻辑：orphan 聚合（`GROUP BY topic_new HAVING COUNT(*)>=3 AND MIN(created_at)>=date(now,'-30 day')` → 归并判定（LLM 比对候选描述与词表现有 topics：`{"action": "merge_to:lang" | "new_topic"}`）→ merge 直接 UPDATE dimension/topic/re-key + status=active；new_topic 且 auto_promote → 写入 taxonomy.yaml（追加 topics + 自动生成 regression case 追加到 yaml——用 PyYAML round-trip 保留注释不可行，实现为整体重 dump 并接受注释丢失，注释价值在 git 历史）→ 转 active；taboo/sensitive topic → 写 review_history(actor='audit') 不转正）；降级扫描（`last_reinforced_at < now-90d AND confidence<0.7 AND status='active' AND dimension!='taboo'` → degraded/stale）；degraded→archived（`updated_at < now-180d`）；pending_review 超期（`created_at < now-14d`）物理删除行 + review_history 记录；clarifications 过期清理（§8.1）。
+五个扫描器函数各一条 SQL + 少量逻辑：orphan 聚合（`GROUP BY topic_new HAVING COUNT(*)>=3 AND MIN(created_at)>=date(now,'-30 day')` → 归并判定（LLM 比对候选描述与词表现有 topics：`{"action": "merge_to:lang" | "new_topic"}`）→ merge 直接 UPDATE dimension/topic/re-key + status=active；new_topic 且 auto_activate → 写入 taxonomy.yaml（追加 topics + 自动生成 regression case 追加到 yaml——用 PyYAML round-trip 保留注释不可行，实现为整体重 dump 并接受注释丢失，注释价值在 git 历史）→ 转 active；taboo/sensitive topic → 写 review_history(actor='audit') 不转正）；降级扫描（`last_reinforced_at < now-90d AND confidence<0.7 AND status='active' AND dimension!='taboo'` → degraded/stale）；degraded→archived（`updated_at < now-180d`）；pending_review 超期（`created_at < now-14d`）物理删除行 + review_history 记录；clarifications 过期清理（§8.1）。
 
-- [ ] **Step 4: 通过**；**Step 5: Commit** `feat: 每日聚合（orphan 晋升/降级/归档/废弃/清理）`
+- [ ] **Step 4: 通过**；**Step 5: Commit** `feat: 每日聚合（orphan 启用/衰减/归档/废弃/清理）`
 
 ---
 
@@ -954,7 +954,7 @@ def test_pending_in_export(tmp_path, conn, seeded_orphan):
 
 **Interfaces:**
 - Consumes: intake/trigger/extractor/gate/resolver/writer/clarifier/assembler/exporter/audit/aggregator 全部。
-- Produces: `create_app(settings) -> FastAPI`；路由：`POST /events`(202/200)、`GET /profile/{source}/{native_id}`、`GET /review/queue`、`POST /review/{user_source}/{user_id}/{entry_id}/verdict`、`DELETE /profile/{source}/{native_id}`、`GET /export/{source}/{native_id}`、`GET /healthz`；`run_pipeline(conn, settings, event: dict)`（intake→trigger→extract→gate→resolve→apply→clarify 检查）；`backup(conn, backup_dir) -> Path`。
+- Produces: `create_app(settings) -> FastAPI`；路由：`POST /events`(202/200)、`GET /profile/{source}/{native_id}`、`GET /review/queue`、`POST /review/{user_source}/{user_id}/{entry_id}/decision`、`DELETE /profile/{source}/{native_id}`、`GET /export/{source}/{native_id}`、`GET /healthz`；`run_pipeline(conn, settings, event: dict)`（intake→trigger→extract→gate→resolve→apply→clarify 检查）；`backup(conn, backup_dir) -> Path`。
 
 - [ ] **Step 1: 失败测试**（fastapi TestClient + FakeLLM/Embedder 依赖注入）
 
@@ -982,11 +982,11 @@ def test_profile_after_pipeline(app, wait_for_pipeline):
     r = app.get("/profile/webchat/u1?budget=2000")
     assert r.status_code == 200 and "entries" in r.json()
 
-def test_review_verdict_flow(app, seeded_review_entry):
+def test_review_decision_flow(app, seeded_review_entry):
     queue = app.get("/review/queue").json()
     assert queue["items"][0]["entry_id"] == seeded_review_entry
-    r = app.post(f"/review/webchat/u1/{seeded_review_entry}/verdict",
-                 json={"verdict": "approve", "entry_version": seeded_review_version})
+    r = app.post(f"/review/webchat/u1/{seeded_review_entry}/decision",
+                 json={"decision": "confirm", "entry_version": seeded_review_version})
     assert r.status_code == 200
     # 库内 status=active + review_history 一行
 
@@ -1008,7 +1008,7 @@ def test_healthz(app):
 
 `pipeline.py`：`run_pipeline` 按 Task 3–8 顺序编排；conversation 事件先查 `pending_clarifications`（clarifier.match_incoming 命中→证据标 clarification 直通决策）；事件处理在 `BackgroundTasks` 中执行（POST /events 先 intake 幂等登记再入队——intake 登记与处理分离保证 202 语义）。
 
-`api.py`：依赖注入 `create_app(settings, llm=None, embedder=None)`（默认按 settings 构造真实客户端，测试注入 fake）；`GET /profile` 内 try/except 降级链（主查询失败→仅必带集查询再失败→空包 200，永不 5xx）；`DELETE` 事务内删该用户全部行+写 tombstones；`POST /verdict` 携带 entry_version，`updated_at` 不匹配→200 `{"noop": true}`（§14 竞态规则）；`/healthz` 返回 `{"ok": true, "db": "ok"}`。
+`api.py`：依赖注入 `create_app(settings, llm=None, embedder=None)`（默认按 settings 构造真实客户端，测试注入 fake）；`GET /profile` 内 try/except 降级链（主查询失败→仅必带集查询再失败→空包 200，永不 5xx）；`DELETE` 事务内删该用户全部行+写 tombstones；`POST /decision` 携带 entry_version，`updated_at` 不匹配→200 `{"noop": true}`（§14 竞态规则）；`/healthz` 返回 `{"ok": true, "db": "ok"}`。
 
 `backup.py`：`backup(conn, dir)` → `VACUUM INTO`，文件名 `backup-YYYYMMDD.db`，清理 30 份外旧文件；`scripts/serve.py`：uvicorn 入口+启动时 `integrity_check`+调度每日聚合与备份（`while True: sleep` 简单循环线程，KISS）。
 
@@ -1060,7 +1060,7 @@ def test_full_lifecycle(app, wait_for_pipeline, fake_llm_scripted):
 
 ## Self-Review 记录
 
-- **Spec coverage**: §4 安全（Task 5 抽取层+Task 11 审计扫描+Task 9 注入包装）✓；§5 数据模型（Task 2 schema）✓；§6 状态机（Task 7 迁移校验+Task 11 静态审计）✓；§7 taxonomy（Task 1）✓；§8 存储/导出（Task 2/12）✓；§10 管线（Task 3/4/5/6/7/10）✓；§11 冲突与 taboo（Task 6/7/8）✓；§12 淘汰（Task 10）✓；§13 装配（Task 9）✓；§14 校正（Task 8/13 复核路由）✓；§15 评估（Task 11 审计+Task 14 回归脚本；A/B 由 include_profile 参数承担）✓；§16 接口（Task 13）✓；§18 瘦身对照（Git/压缩/correction 协议不实现 ✓ 未出现在任何任务）✓；§20 存储（Task 2/4/13 备份）✓。缺口检查：spec §12 "曾观察前缀注入"（Task 9 覆盖）；spec §14 竞态版本（Task 13 verdict 覆盖）。
+- **Spec coverage**: §4 安全（Task 5 抽取层+Task 11 审计扫描+Task 9 注入包装）✓；§5 数据模型（Task 2 schema）✓；§6 状态机（Task 7 迁移校验+Task 11 静态审计）✓；§7 taxonomy（Task 1）✓；§8 存储/导出（Task 2/12）✓；§10 管线（Task 3/4/5/6/7/10）✓；§11 冲突与 taboo（Task 6/7/8）✓；§12 淘汰（Task 10）✓；§13 装配（Task 9）✓；§14 校正（Task 8/13 复核路由）✓；§15 评估（Task 11 审计+Task 14 回归脚本；A/B 由 include_profile 参数承担）✓；§16 接口（Task 13）✓；§18 瘦身对照（Git/压缩/correction 协议不实现 ✓ 未出现在任何任务）✓；§20 存储（Task 2/4/13 备份）✓。缺口检查：spec §12 "曾观察前缀注入"（Task 9 覆盖）；spec §14 竞态版本（Task 13 decision 覆盖）。
 - **占位符**: 无 TBD/TODO；所有测试含真实断言与代码。
 - **类型一致**: `Action.op` 在 Task 6 定义、Task 7 消费一致；`Candidate` 字段在 Task 5 产出、Task 6/7 消费一致；`assemble` 返回结构在 Task 9/13 一致；`EmbedUnavailable` Task 4 定义、Task 7 捕获一致。
 - **Review Focus**: 五条均有归属任务测试（#1→T3、#2→T4/T7/T13、#3→T2、#4→T7、#5→T3/T13）。

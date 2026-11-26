@@ -108,11 +108,18 @@ def _dimension_block(taxonomy) -> str:
             guidance = guidance[:200] + "…"
         sensitive = sorted(t for t, o in (getattr(d, "topic_overrides", None) or {}).items()
                            if o and o.get("sensitive"))
-        lines.append(f"- {d.key}({d.name}): topics={', '.join(d.topics)}"
+        enabled = _enabled_topics(d)
+        lines.append(f"- {d.key}({d.name}): topics={', '.join(enabled) or '（无）'}"
                      + (f"；sensitive topics: {', '.join(sensitive)}（禁精确细节，仅概括）"
                         if sensitive else "")
                      + (f"；判定要点：{guidance}" if guidance else ""))
     return "\n".join(lines)
+
+
+def _enabled_topics(dim) -> list[str]:
+    """停用主题不注入抽取提示词，避免 LLM 继续生成这些主题的新候选。"""
+    disabled = set(getattr(dim, "disabled_topics", None) or [])
+    return [topic for topic in (dim.topics or []) if topic not in disabled]
 
 
 def _is_sensitive(taxonomy, dimension: str, topic: str) -> bool:
@@ -139,6 +146,14 @@ def _to_candidate(raw: dict, taxonomy, *, max_body: int = MAX_BODY) -> dict | No
         topic = topic_new
     else:
         dim = taxonomy.dimensions[dimension]
+        # 别名归一先于白名单判定：同一语义的不同说法收敛到 canonical topic，
+        # 否则每次换措辞都会新开一行（taboo 词表禁止运行期扩充，只能靠别名收敛）。
+        canonical = (getattr(dim, "topic_aliases", None) or {}).get(topic)
+        if canonical and canonical in (dim.topics or []):
+            topic = canonical
+        if topic in (getattr(dim, "disabled_topics", None) or []):
+            logger.info("disabled topic %s/%s ignored", dimension, topic)
+            return None
         if topic not in (dim.topics or []):
             # 2) 合法维度 + 词表外 topic（spec §7 禁止发明主题词）
             if dimension == "taboo":

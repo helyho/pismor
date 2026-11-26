@@ -9,6 +9,7 @@ import math
 import sqlite3
 from datetime import datetime, timezone
 
+from pismor.pipeline.clarifier import QUESTION_TMPL as _CLARIFY_QUESTION
 from pismor.pipeline.clarifier import issue_many as _clarify_issues
 from pismor.llm.embedder import EmbedUnavailable, l2_normalize
 from pismor.core import fts, tokenizer
@@ -19,9 +20,6 @@ _RENDER_ORDER = ("taboo", "identity", "preference", "fact", "context")
 _TABOO_MERGE_THRESHOLD = 40
 _DEGRADED_PREFIX = "曾观察："
 _MUST_DIMS = ("taboo", "identity")
-# ledger 裁决：必带集排序在 SQL 内显式 priority，不依赖 dict 顺序
-_PRIORITY_ORDER_BY = ("CASE dimension WHEN 'taboo' THEN 0 WHEN 'identity' THEN 1"
-                      " ELSE 2 END, confidence DESC")
 _MUST_COLS = "id, dimension, scope, body, confidence, status, updated_at, reinforcements"
 
 
@@ -30,13 +28,23 @@ def _empty_pack() -> dict:
             "merge_task": False, "rendered": ""}
 
 
+def _dimension_rank(dimension: str, order: dict[str, int]) -> int:
+    """维度排序位：taboo 恒第一（硬约束，不随配置变化），未登记维度排末尾而非丢弃。"""
+    return 0 if dimension == "taboo" else order.get(dimension, len(order))
+
+
 def assemble(conn, embedder, user_source, user_id, budget=2000, dimensions=None,
              include_profile=True, query=None, audit_sink=None, *,
              taboo_budget_share=0.6, related_top_k=20, half_life_days=30.0,
-             clarify_ttl_days=7, min_similarity=0.5) -> dict:
+             clarify_ttl_days=7, min_similarity=0.5,
+             write_clarifications=True, dimension_order=None,
+             current_scope=None, taboo_merge_threshold=_TABOO_MERGE_THRESHOLD) -> dict:
     """装配用户画像包。
 
     dimensions: 维度白名单（None=全部）；query: 对话话题文本，驱动相关集召回；
+    dimension_order: 注入/预算顺序（taxonomy.priority_order()）；None 回落内置顺序；
+    current_scope: 当前项目作用域（global / project:<name>）；None=不过滤（兼容旧调用），
+                   非空时必带集与相关集只取 global + 该 scope，避免跨项目禁忌挤占预算；
     include_profile=False: entries=[] 其余照常（A/B 对照）；
     audit_sink: merge_task 触发时回调 record_merge_task()（审计/聚合消费）；
     预算/召回/时效参数由 settings.assembler 配置（AssemblerSettings）。
@@ -48,17 +56,22 @@ def assemble(conn, embedder, user_source, user_id, budget=2000, dimensions=None,
                         (user_source, user_id)).fetchone():
             return _empty_pack()
         try:
-            must = _must_have(conn, user_source, user_id)
+            must = _must_have(conn, user_source, user_id, dimension_order, current_scope)
             related = _related(conn, embedder, user_source, user_id, query, dimensions,
-                               top_k=related_top_k, min_similarity=min_similarity)
+                               top_k=related_top_k, min_similarity=min_similarity,
+                               current_scope=current_scope)
         except sqlite3.Error:
-            must = _must_have(conn, user_source, user_id)  # 只回必带集
+            must = _must_have(conn, user_source, user_id, dimension_order,
+                              current_scope)  # 只回必带集
             related = []
         pack = _build(must, related, budget, now, user_id, include_profile, audit_sink,
-                      taboo_budget_share=taboo_budget_share, half_life_days=half_life_days)
+                      taboo_budget_share=taboo_budget_share, half_life_days=half_life_days,
+                      dimension_order=dimension_order,
+                      taboo_merge_threshold=taboo_merge_threshold)
         try:
-            pack["clarification_needed"] = _clarifications(conn, user_source, user_id,
-                                                           ttl_days=clarify_ttl_days)
+            pack["clarification_needed"] = _clarifications(
+                conn, user_source, user_id, ttl_days=clarify_ttl_days,
+                write=write_clarifications)
         except sqlite3.Error:
             pack["clarification_needed"] = []
         return pack
@@ -66,18 +79,27 @@ def assemble(conn, embedder, user_source, user_id, budget=2000, dimensions=None,
         return _empty_pack()
 
 
-def _must_have(conn, user_source, user_id) -> list[dict]:
+def _must_have(conn, user_source, user_id, dimension_order=None, current_scope=None) -> list[dict]:
     # dimensions 白名单只作用于相关集；必带集（taboo+identity）无条件恒在
     sql = ("SELECT {} FROM entries WHERE user_source=? AND user_id=?"
            " AND dimension IN ('taboo','identity')"
            " AND status IN ('active','degraded')").format(_MUST_COLS)
     args = [user_source, user_id]
-    sql += f" ORDER BY {_PRIORITY_ORDER_BY}"
-    return [dict(r) for r in conn.execute(sql, args).fetchall()]
+    if current_scope:
+        # 跨项目禁忌不注入当前包：只取全局 + 当前项目（scope 语义见 taxonomy.scopes）
+        sql += " AND scope IN ('global', ?)"
+        args.append(current_scope)
+    sql += " ORDER BY confidence DESC"
+    order = {d: i for i, d in enumerate(dimension_order or _RENDER_ORDER)}
+    rows = [dict(r) for r in conn.execute(sql, args).fetchall()]
+    # 稳定排序：维度位优先，同维保持 confidence DESC
+    rows.sort(key=lambda r: _dimension_rank(r["dimension"], order))
+    return rows
 
 
 def _related(conn, embedder, user_source, user_id, query, dimensions, *,
-             top_k: int = 20, min_similarity: float = 0.5) -> list[dict]:
+             top_k: int = 20, min_similarity: float = 0.5,
+             current_scope: str | None = None) -> list[dict]:
     if not query:
         return []
     rows: list[dict] = []
@@ -85,11 +107,13 @@ def _related(conn, embedder, user_source, user_id, query, dimensions, *,
         try:
             vec = l2_normalize(embedder.embed([query])[0])  # 余弦阈值换算依赖单位向量
             rows = _vector_recall(conn, json.dumps(vec), user_source, user_id, dimensions,
-                                  top_k=top_k, min_similarity=min_similarity)
+                                  top_k=top_k, min_similarity=min_similarity,
+                                  current_scope=current_scope)
         except (EmbedUnavailable, KeyError, json.JSONDecodeError, IndexError, sqlite3.Error):
             rows = []  # 向量召回不可用（含网关 200 坏体 KeyError）→ 回退词面
     if not rows:
-        rows = _lexical(conn, user_source, user_id, tokens(query), dimensions, top_k=top_k)
+        rows = _lexical(conn, user_source, user_id, tokens(query), dimensions, top_k=top_k,
+                        current_scope=current_scope)
     return rows
 
 
@@ -103,7 +127,8 @@ def _cos_to_l2(cos: float) -> float:
 
 
 def _vector_recall(conn, vec_json, user_source, user_id, dimensions, *,
-                   top_k: int = 20, min_similarity: float = 0.5) -> list[dict]:
+                   top_k: int = 20, min_similarity: float = 0.5,
+                   current_scope: str | None = None) -> list[dict]:
     if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table'"
                     " AND name='embeddings'").fetchone() is None:
         raise sqlite3.OperationalError("embeddings table missing")
@@ -115,6 +140,9 @@ def _vector_recall(conn, vec_json, user_source, user_id, dimensions, *,
            " AND e.user_source = ? AND e.user_id = ?"
            " AND e.status IN ('active','degraded')").format(_MUST_COLS, top_k)
     args = [vec_json, _cos_to_l2(min_similarity), user_source, user_id]
+    if current_scope:
+        sql += " AND e.scope IN ('global', ?)"
+        args.append(current_scope)
     if dimensions:
         sql += " AND e.dimension IN ({})".format(",".join("?" * len(dimensions)))
         args += dimensions
@@ -122,7 +150,8 @@ def _vector_recall(conn, vec_json, user_source, user_id, dimensions, *,
     return [dict(r) for r in conn.execute(sql, args).fetchall()]
 
 
-def _lexical(conn, user_source, user_id, query_tokens, dimensions, *, top_k: int = 20) -> list[dict]:
+def _lexical(conn, user_source, user_id, query_tokens, dimensions, *, top_k: int = 20,
+             current_scope: str | None = None) -> list[dict]:
     """词面召回：mem_fts BM25 打分（向量召回不可用时的回退路径，spec §13）。
 
     tokens 来自 tokenizer 同源切词，OR 语义（任一命中即候选）；BM25 负值越小
@@ -134,6 +163,9 @@ def _lexical(conn, user_source, user_id, query_tokens, dimensions, *, top_k: int
            " ON f.rowid = e.rowid WHERE mem_fts MATCH ?"
            " AND e.user_source=? AND e.user_id=? AND e.status IN ('active','degraded')").format(_MUST_COLS)
     args = [fts.match_expr(query_tokens), user_source, user_id]
+    if current_scope:
+        sql += " AND e.scope IN ('global', ?)"
+        args.append(current_scope)
     if dimensions:
         sql += " AND e.dimension IN ({})".format(",".join("?" * len(dimensions)))
         args += dimensions
@@ -168,7 +200,10 @@ def _score(row, now, half_life_days: float = 30.0) -> float:
 
 
 def _build(must, related, budget, now, user_ref, include_profile, audit_sink, *,
-           taboo_budget_share: float = 0.6, half_life_days: float = 30.0) -> dict:
+           taboo_budget_share: float = 0.6, half_life_days: float = 30.0,
+           dimension_order=None,
+           taboo_merge_threshold: int = _TABOO_MERGE_THRESHOLD) -> dict:
+    order = {d: i for i, d in enumerate(dimension_order or _RENDER_ORDER)}
     seen: set[tuple[str, str]] = set()
     merged = []
     for r in list(must) + list(related):
@@ -177,9 +212,9 @@ def _build(must, related, budget, now, user_ref, include_profile, audit_sink, *,
             continue
         seen.add(key)
         merged.append(r)
-    merged.sort(key=lambda r: ({"taboo": 0, "identity": 1}.get(r["dimension"], 2),
+    merged.sort(key=lambda r: (_dimension_rank(r["dimension"], order),
                                -_score(r, now, half_life_days)))
-    merge_task = sum(1 for r in merged if r["dimension"] == "taboo") > _TABOO_MERGE_THRESHOLD
+    merge_task = sum(1 for r in merged if r["dimension"] == "taboo") > taboo_merge_threshold
     taboo_cap = budget * taboo_budget_share if merge_task else None
     entries, used, taboo_used, rendered_rows = [], 0, 0, []
     for r in merged:
@@ -199,7 +234,9 @@ def _build(must, related, budget, now, user_ref, include_profile, audit_sink, *,
         audit_sink.record_merge_task()
     if include_profile and rendered_rows:
         lines = [RENDER_HEADER.format(user_ref=user_ref)]
-        for dim in _RENDER_ORDER:  # 固定维度顺序拼接，条目正文逐行
+        # 按配置顺序拼接实际出现的维度；未登记维度排末尾，绝不静默丢弃
+        present = list(dict.fromkeys(d for d, _ in rendered_rows))
+        for dim in sorted(present, key=lambda d: _dimension_rank(d, order)):
             lines.extend(t for d, t in rendered_rows if d == dim)
         rendered = "\n".join(lines)
     else:
@@ -210,7 +247,8 @@ def _build(must, related, budget, now, user_ref, include_profile, audit_sink, *,
             "rendered": rendered}
 
 
-def _clarifications(conn, user_source, user_id, *, ttl_days: int = 7) -> list[dict]:
+def _clarifications(conn, user_source, user_id, *, ttl_days: int = 7,
+                    write: bool = True) -> list[dict]:
     """对称 conflict_with 对 → clarifier.issue_many 落 pending 并随响应递交（spec §11）。
 
     关联标记为 id@scope，按 (id,scope) 定位；同 id 跨 scope 的对互不串扰（C-1）。
@@ -258,8 +296,15 @@ def _clarifications(conn, user_source, user_id, *, ttl_days: int = 7) -> list[di
                                   key=lambda k: -(by_key[k]["confidence"] or 0.0))
             marks = list(ordered_keys)
             found.append((marks, {k: by_key[k]["summary"] for k in (key, other_key)}))
+    if not found:
+        return []
+    if not write:
+        # 管理后台装配预览必须只读：生成同样的问题文本，但不写 pending_clarifications。
+        return [{"conflicting_ids": marks,
+                 "question": _CLARIFY_QUESTION.format(
+                     s_a=summaries[marks[0]], s_b=summaries[marks[1]])}
+                for marks, summaries in found]
     # 一次事务落库全部澄清对（审查 #7：GET 装配路径不逐对提交，缩短写锁占用）
-    questions = _clarify_issues(conn, user_source, user_id, found, ttl_days=ttl_days) \
-        if found else []
+    questions = _clarify_issues(conn, user_source, user_id, found, ttl_days=ttl_days)
     return [{"conflicting_ids": marks, "question": q}
             for (marks, _summaries), q in zip(found, questions)]

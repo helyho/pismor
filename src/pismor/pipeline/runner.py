@@ -110,7 +110,9 @@ def _run(conn, settings: Settings, event, taxonomy, llm, embedder) -> None:
     auto, review, _dropped = gate.gate(candidates, **_gate_kwargs(settings))
     _write_pending(conn, us, uid, review, origin_type, origin_ref, now)
     actions = resolver.resolve(conn, us, uid, auto, llm)
-    _apply(conn, us, uid, actions, embedder, origin_type, origin_ref, now)
+    # 复活门槛与显式直通门槛联动：auto_min 调低时，同一置信度的新证据也能复活 degraded
+    _apply(conn, us, uid, actions, embedder, origin_type, origin_ref, now,
+           revive_min_confidence=settings.gate.auto_min)
 
 
 def _gate_kwargs(settings: Settings) -> dict:
@@ -200,7 +202,9 @@ def _apply_clarification(conn, us, uid, hit, taxonomy, llm, embedder,
             actions.append({"op": "UPDATE", "candidate": c,
                             "target": (c["dimension"], c["topic"], c["scope"])})
         # archived 同键不可复活（spec §6 非法迁移）：跳过该候选
-    applied = _apply(conn, us, uid, actions, embedder, origin_type, origin_ref, now) if actions else []
+    # 澄清是用户本人的裁决路径，复活不设置信门槛（不受 auto_min 影响）
+    applied = _apply(conn, us, uid, actions, embedder, origin_type, origin_ref, now,
+                     revive_min_confidence=0.0) if actions else []
     if not applied:
         logger.info("clarification produced no writable candidates; pending kept")
         return
@@ -249,7 +253,7 @@ def _write_pending(conn, us, uid, candidates, origin_type, origin_ref, now) -> i
     """review 档候选落 pending_review 行（复核队列入口）；同 key 已有行则跳过。
 
     orphan 候选（dimension='orphan'，status='orphan_topic'）经 inferred cap 后恒落
-    本桶：复核 approve 由 API 按 dimension='orphan' 转 orphan_topic 进观察区（spec §8.2）。
+    本桶：复核 confirm 由 API 按 dimension='orphan' 转 orphan_topic 进观察区（spec §8.2）。
     作用域违规候选丢弃（spec §8 白名单）。
     """
     n = 0
@@ -280,16 +284,19 @@ def _write_pending(conn, us, uid, candidates, origin_type, origin_ref, now) -> i
     return n
 
 
-def _apply(conn, us, uid, actions, embedder, origin_type, origin_ref, now) -> list[dict]:
+def _apply(conn, us, uid, actions, embedder, origin_type, origin_ref, now,
+           revive_min_confidence=writer.REVIVE_MIN_CONFIDENCE) -> list[dict]:
     """整批写入；唯一约束/非法迁移 → 回滚后逐条重放，失败条留痕跳过。
 
     返回真正落库的动作（由 writer 判定）：无 quote / 非法 scope 等被跳过的候选不计入
     "已应用"，避免上层误判澄清已被覆盖（审查 #17）。
+    revive_min_confidence 透传 writer：degraded → active 的复活门槛。
     """
     if not actions:
         return []
     try:
-        return writer.apply_actions(conn, us, uid, actions, embedder, origin_type, origin_ref, now)
+        return writer.apply_actions(conn, us, uid, actions, embedder, origin_type, origin_ref, now,
+                                    revive_min_confidence=revive_min_confidence)
     except (sqlite3.IntegrityError, writer.IllegalTransition) as exc:
         logger.warning("batch write failed (%s); replaying per action", exc)
         conn.rollback()
@@ -297,7 +304,8 @@ def _apply(conn, us, uid, actions, embedder, origin_type, origin_ref, now) -> li
     for action in actions:
         try:
             if writer.apply_actions(conn, us, uid, [action], embedder,
-                                    origin_type, origin_ref, now):
+                                    origin_type, origin_ref, now,
+                                    revive_min_confidence=revive_min_confidence):
                 applied.append(action)
         except (sqlite3.IntegrityError, writer.IllegalTransition) as exc:
             conn.rollback()  # 该候选隔离：不拖垮其余候选
@@ -310,7 +318,7 @@ def _record_apply_failure(conn, us, uid, action, exc, now) -> None:
     try:
         with conn:
             conn.execute(
-                "INSERT INTO review_history (entry_id, user_source, user_id, verdict, actor,"
+                "INSERT INTO review_history (entry_id, user_source, user_id, decision, actor,"
                 " ts, note, entry_version) VALUES (?, ?, ?, 'apply_failed', 'pipeline', ?, ?, ?)",
                 (f"{c.get('dimension')}_{c.get('topic')}@{c.get('scope')}", us, uid, now, str(exc), ""))
     except sqlite3.Error:  # 留痕失败不得再冒泡

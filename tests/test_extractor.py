@@ -138,3 +138,29 @@ def test_summary_truncated_to_20(taxonomy):
         "confidence": 0.9, "kind": "explicit", "quote": "q", "topic_new": None}]}])
     out = extract(_text_ev("q"), taxonomy, llm, known_ids=[])
     assert len(out[0]["summary"]) == 20
+
+
+def test_disabled_topic_not_prompted_or_written(taxonomy):
+    dim = taxonomy.dimensions["preference"]
+    dim.topics.append("legacy_topic")
+    dim.disabled_topics.append("legacy_topic")
+    llm = FakeLLM([{"candidates": [{
+        "dimension": "preference", "topic": "legacy_topic", "scope": "global",
+        "body": "旧偏好", "summary": "旧偏好", "confidence": 0.9, "kind": "explicit",
+        "quote": "以前用 legacy", "topic_new": None,
+    }]}])
+    ev = {"event_type": "text", "source": "d", "user_ref": "u", "content": "以前用 legacy", "ts": "t"}
+    assert extract(ev, taxonomy, llm, known_ids=[]) == []
+    assert "legacy_topic" not in llm.calls[0]["system"]
+
+
+def test_taboo_topic_alias_normalized_to_whitelist(taxonomy):
+    llm = FakeLLM([{"candidates": [{"dimension": "taboo", "topic": "表格", "scope": "global",
+        "body": "不要表格", "summary": "不要表格", "confidence": 0.9, "kind": "explicit",
+        "quote": "别用表格", "topic_new": None}]}])
+    ev = {"event_type": "text", "source": "w", "user_ref": "u", "content": "别用表格", "ts": "t"}
+    out = extract(ev, taxonomy, llm, known_ids=[])
+    assert out[0]["topic"] == "output_format"
+    assert not out[0].get("force_review")  # 归一后落入白名单，不再进人工队列
+    auto, review, _dropped = gate(out)
+    assert len(auto) == 1 and review == []

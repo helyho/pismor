@@ -3,7 +3,7 @@
 - 条目在库内的唯一寻址是五元组 (user_source,user_id,dimension,topic,scope)。
 - 行键统一写作 "{dimension}_{topic}@{scope}"（如 preference_style@global）：
   entries.id 与 sources.entry_id 同为该值，可直接 JOIN；conflict_with、
-  pending_clarifications、复核 verdict、澄清目标也用同一标记。
+  pending_clarifications、复核 decision、澄清目标也用同一标记。
   旧库的裸 id 由 init_schema 启动时迁移补齐。
 """
 import re

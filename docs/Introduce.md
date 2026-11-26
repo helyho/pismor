@@ -38,13 +38,14 @@ GET /profile ──► assembler（必带集 taboo+identity + 相关集召回 + 
 |---|---|
 | `api.py` | FastAPI 路由，管线投后台任务 |
 | `intake.py` | pydantic 校验、content 上限、event_id 去重（`events_seen` 表） |
-| `trigger.py` | 触发分级规则（spec §10 成本控制核心） |
-| `extractor.py` | conversation/text 双模板抽取 + 词表归一 + 指令/敏感安全层 |
+| `normalize.py` | conversation/text → `NormalizedEvent` 管线视图：dialogue/document 策略 + 用户域文本拆分 |
+| `trigger.py` | 触发分级规则（spec §10 成本控制核心，仅 dialogue） |
+| `extractor.py` | dialogue/document 双模板抽取（conversation/text 两种入口）+ 词表归一 + 指令/敏感安全层 |
 | `gate.py` | 置信闸门：≥auto_min 且 explicit 直通；≥review_min 入复核；之下丢弃 |
 | `resolver.py` | 同主题新旧比较决策器（taboo 与 preference 相撞 taboo 恒胜） |
 | `writer.py` | 批量写入、唯一约束兜底、非法状态迁移拒绝 |
 | `clarifier.py` | 矛盾澄清问题 pending 的创建/匹配/消费 |
-| `pipeline.py` | 单事件管线编排（澄清回流 → 触发分级 → 强化/抽取） |
+| `runner.py` | 单事件管线编排（澄清回流 → 触发分级 → 强化/抽取） |
 | `assembler.py` | 画像包装配：必带集恒在、相关集按 query 向量/BM25 词面召回、预算裁剪 |
 | `aggregator.py` | 日批：无强化降级、orphan 复现晋升、归档 |
 | `audit.py` | 状态机/词表一致性审计，违规行隔离进复核 |

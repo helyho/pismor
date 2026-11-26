@@ -353,13 +353,14 @@ flowchart TD
     A[事件上报 POST /events<br/>event_type: conversation / text] --> B{幂等: source+event_id<br/>已处理? events_seen 表}
     B -->|是| Z[丢弃]
     B -->|否| V{schema 校验<br/>messages 至少一条非空 user<br/>否则 422}
-    V --> T0{event_type}
-    T0 -->|conversation| C{触发分级<br/>按序: explicit → 长度突变 → force_extract → 首查}
+    V --> N[normalize<br/>conversation → dialogue<br/>text → document]
+    N --> T0{mode}
+    T0 -->|dialogue| C{触发分级<br/>按序: explicit → 长度突变 → force_extract → 首查}
     C -->|explicit 声明| E
     C -->|普通消息| D{规则版变化检测:<br/>长度突变 / force_extract / 会话首查}
     D -->|无变化| F[reinforcement 批内+1<br/>不调 LLM]
     D -->|有变化| E[抽取 LLM<br/>仅 user 角色为用户域证据<br/>输入: 相关维度id列表截断 + 词表]
-    T0 -->|text| E2[抽取 LLM<br/>整段为用户域, 归属校验更严<br/>引用/转述他人内容不作画像]
+    T0 -->|document| E2[抽取 LLM<br/>整段为用户域, 归属校验更严<br/>引用/转述他人内容不作画像]
     E --> G{置信度闸门}
     E2 --> G
     G -->|>=0.85 explicit| H[决策]
@@ -372,6 +373,7 @@ flowchart TD
 关键机制：
 
 - **多形态素材规则**：conversation 事件仅 user 角色消息为用户域证据，assistant 消息仅作上下文；text 事件（文档/笔记/邮件/工单/评论等任意文本）默认整段为用户域——用户亲写的文本比对话更真实——但归属校验更严：文本内引用、转述他人的内容不作为用户画像（与 fact 维度"转述他人不入库"同构）。text 事件单条硬顶 8K 字符，超出由上报方分块。
+- **内部事件视图**（B 层）：intake 校验通过后，conversation/text 统一经 `pipeline/normalize.py` 规范化为 `NormalizedEvent`——`mode=dialogue|document` 决定策略，`prompt_text` 是送抽取的完整文本（dialogue 保留 assistant 上下文），`user_texts` 只含用户域证据。下游 trigger/extractor/runner 不再解析原始 `event_type` 或 `messages`；对外契约与 `sources.origin_type` 值域不变。
 - **幂等键** `source+event_id` 持久化于 `events_seen` 表（§8.1），重放天然去重，崩溃后已处理事件不重复处理；event_id 由上报方提供，缺省时服务端以 hash 兜底。
 - **触发分级**（成本控制核心，仅作用于 conversation）：explicit 声明与显式 force_extract 零阈值直通（后者前提由 §16 入口校验保证：messages 至少一条非空 user，否则 422）；普通消息先过规则版变化检测，无变化仅批内累加 reinforcement，不调 LLM。text 事件是显式提交的素材，直接进抽取，由置信度闸门兜底。
 - **抽取输入只带 id 列表与词表**，不带现有条目正文——比对集中在决策步，防抽取器锚定现有画像导致错误自我固化（该分工不可合并）。id 列表按维度截断、只带同 scope 相关维度；截断的漏报风险由复核队列统计兜底。

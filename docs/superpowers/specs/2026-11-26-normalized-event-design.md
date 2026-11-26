@@ -100,40 +100,36 @@ class NormalizedEvent:
 
 选 1 的理由：B 层的价值在"下游无法再绕过视图"，只有类型边界能保证这一点。
 
-## 5. 验收
+## 5. 验收（已完成）
 
 **测试**
 
-- 新增 `tests/test_normalize.py`：
-  - conversation：多 user/assistant 混排 → `prompt_text` 保留全部消息、`user_texts` 只含 user 且保序、`force_extract` 透传；
-  - text：`mode == "document"`、`prompt_text == content`、`user_texts == (content,)`；
-  - 缺省 `event_type` 走 text 兜底；`force_extract` 缺省为 False。
-- 改 `tests/test_trigger.py` / `tests/test_extractor.py` 的 fixture 为 `normalize({...})`；
-- `tests/test_runner.py` / `test_e2e.py` 行为断言不变，全量 pytest 通过。
+- 新增 `tests/test_normalize.py`（6 例）：conversation 的 `prompt_text` 保序含 assistant、`user_texts` 只含非空 user 且保序、`force_extract` 透传；text 的 `mode/prompt_text/user_texts`；缺省 `event_type` 走 text 兜底；空 content；`force_extract` 仅严格 `True` 生效。
+- `tests/test_extractor.py` / `tests/test_api.py` 加本地测试适配器：用例继续用原始 dict 表达输入，内部 `normalize()` 后再调真实签名，避免逐个改十余处调用。
+- `tests/test_prompts.py` 的 `_conv_ev()` 直接返回 `NormalizedEvent`。
+- `scripts/run_regression.py` 的 `extract()` 调用处包裹 `normalize()`。
 
-**静态检查**
+**结果**
+
+- 基线 313 passed → 改造后 **319 passed**（新增 6 例），`test_e2e.py::test_run_regression_dry` 通过。
+- 静态收敛检查：
 
 ```bash
 grep -rn 'get("event_type")\|\["event_type"\]' src/pismor
-# 期望只剩 normalize.py 的读取与 intake.py 的回写
+# 仅剩 intake.py 的回写与 normalize.py 的读取
+grep -rn 'get("messages")\|\["messages"\]' src/pismor
+# 仅剩 normalize.py
 ```
 
-## 6. 改造顺序
+## 6. 改造顺序（已执行）
 
-1. 新增 `normalize.py` + `test_normalize.py`（不改任何现有调用）；
-2. 改 `extractor.extract` 签名与模板选择，跑 `test_extractor`；
-3. 改 `trigger.should_extract` 签名与遍历来源，跑 `test_trigger` / `test_runner`；
+1. 新增 `normalize.py` + `test_normalize.py`；
+2. 改 `extractor.extract` 签名与模板选择；
+3. 改 `trigger.should_extract` 签名与遍历来源；
 4. 改 `runner._run` 接线，删除 `_last_user_text` / `_render_messages`；
-5. 全量 pytest + 上面的 grep 检查。
+5. 改 `scripts/run_regression.py` 与测试适配器；
+6. 全量 pytest + 静态收敛检查。
 
-## 7. 基线依赖与执行方式（待确认）
+## 7. 执行记录
 
-当前 `main` 工作区存在**未提交改动**，与本设计直接相邻：
-
-- `schemas.py`：`feedback` 被 `force_extract` 取代；messages 必须含至少一条 user；
-- `intake.py`：把 `event_type` / `force_extract` 归一化回写原始 dict；
-- `trigger.py`：`feedback` 触发改为 `force_extract` 触发。
-
-本设计按这些改动**生效后**的语义编写（`force_extract`、user 文本非空）。实现必须在独立 worktree 进行，避免与原会话同时改同一批文件；基线取「`main` HEAD + 上述未提交 diff」。
-
-待确认：是复制当前未提交 diff 作为 worktree 基线，还是等原会话提交后从新 HEAD 拉分支。两种方式对 B 层代码本身没有差别。
+原会话已把基线改动提交为 `0bef15c feat(intake): conversation 反馈字段改为 force_extract 并校验 user 证据`，主工作区干净。因此未复制 diff：直接从 `0bef15c` 新建 worktree `/Users/helyho/Work/Python/pismor-normalized`，分支 `feat/normalized-event`，基线 313 passed 后开始改造。

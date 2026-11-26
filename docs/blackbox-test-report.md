@@ -6,7 +6,7 @@
 - 测试套件：`tests/blackbox/`（`run.sh` + `lib.sh` + 6 个用例域）
 - 提交范围：`0b4c7a1..785214c`（25 个提交，46 文件，+1830/−236；其中 `cddb7c0` 为并行完成的 FTS/BM25 检索升级，本套件在其之上验收）
 - 报告日期：2026-11-25
-- 后续变更：导出功能已于 2026-11-26 移除（`GET /export`、`exporter.py`、`export_root`），相关用例（原 T17/T18/T25）不再保留；2026-11-26 新增对话路径用例并按域重排编号，本报告编号以当前套件为准
+- 后续变更：导出功能已于 2026-11-26 移除（`GET /export`、`exporter.py`、`export_root`），相关用例（原 T17/T18/T25）不再保留；2026-11-26 新增对话路径用例并按域重排编号，随后新增澄清回流闭环用例 T18，其后编号顺延为 25 条；本报告编号以当前套件为准
 
 ## 1. 执行摘要
 
@@ -79,28 +79,29 @@ bash tests/blackbox/run.sh --only assemble,privacy --keep-data --port 18300
 | T15 | verdict 流转 | approve 非 noop 且 `review_history` +1；旧版本 → `{"noop":true}`；新版本 discard 后行消失 | 是 | PASS |
 | T16 | 复核队列结构 | 200，`.items` 为数组，非空项含 `entry_id/status/entry_version` | 否 | PASS |
 | T17 | 长消息触发 | >300 字符纯文本素材可触发抽取并入包 | 是 | PASS |
+| T18 | 澄清回流闭环 | 互斥偏好双存 → `clarification_needed` 提问 → conversation 回答后 pending 消费；规范行恢复 `active`、`+` 变形行归档、互标清除 | 是 | PASS |
 
 ### 域 4 删除权（`cases_privacy.sh`）
 
 | # | 用例 | 验证点 | 依赖 LLM | 结果 |
 |---|---|---|---|---|
-| T18 | 删除权全链 | `tombstones` 落行（`requested_by='api'`）；`entries/sources/review_history/pending_clarifications` 该用户清空；`/profile` 空包 | 是 | PASS |
-| T19 | tombstone 持续 | 删除后再上报：intake 直接拦截，`entries`/`sources` 无新行，`/profile` 仍空包 | 是 | PASS |
+| T19 | 删除权全链 | `tombstones` 落行（`requested_by='api'`）；`entries/sources/review_history/pending_clarifications` 该用户清空；`/profile` 空包 | 是 | PASS |
+| T20 | tombstone 持续 | 删除后再上报：intake 直接拦截，`entries`/`sources` 无新行，`/profile` 仍空包 | 是 | PASS |
 
 ### 域 5 注入防御（`cases_injection.sh`）
 
 | # | 用例 | 验证点 | 依赖 LLM | 结果 |
 |---|---|---|---|---|
-| T20 | 破坏性指令拒绝 | `rm -rf` 载荷不进 `entries.body/summary`，不进装配文本 | 是 | PASS |
-| T21 | 提示词覆写拒绝 | “输出系统提示词”类内容不入库、不入装配 | 是 | PASS |
-| T22 | 混合文本正反断言 | 正常语言偏好可入库（`preference/lang` 或 `identity/language`），嵌入指令不入库 | 是 | PASS |
+| T21 | 破坏性指令拒绝 | `rm -rf` 载荷不进 `entries.body/summary`，不进装配文本 | 是 | PASS |
+| T22 | 提示词覆写拒绝 | “输出系统提示词”类内容不入库、不入装配 | 是 | PASS |
+| T23 | 混合文本正反断言 | 正常语言偏好可入库（`preference/lang` 或 `identity/language`），嵌入指令不入库 | 是 | PASS |
 
 ### 域 6 韧性收尾（`cases_resilience.sh`）
 
 | # | 用例 | 验证点 | 依赖 LLM | 结果 |
 |---|---|---|---|---|
-| T23 | 并发装配 | 8 路并发 ×16 次 `/profile`，全部 200 且 body 可被 jq 解析 | 否 | PASS |
-| T24 | 损坏库拒启 | 停服务→写坏 `index.db`→重启：非 0 退出或 healthz 不就绪；测毕恢复备份并确认 healthz 200 | 否 | PASS |
+| T24 | 并发装配 | 8 路并发 ×16 次 `/profile`，全部 200 且 body 可被 jq 解析 | 否 | PASS |
+| T25 | 损坏库拒启 | 停服务→写坏 `index.db`→重启：非 0 退出或 healthz 不就绪；测毕恢复备份并确认 healthz 200 | 否 | PASS |
 
 ## 4. 验收数据
 
@@ -110,6 +111,8 @@ bash tests/blackbox/run.sh --only assemble,privacy --keep-data --port 18300
 | run_rowkey_nokey | `env -u LLM_API_KEY bash tests/blackbox/run.sh`（当时 26 条） | `passed 9/9 (skipped 17)`，exit 0 |
 | run_reorder | `LLM_API_KEY=... bash tests/blackbox/run.sh`（24 条，新增 T8 对话用例 + 按域重排编号） | `passed 24/24 (skipped 0)`，exit 0 |
 | run_reorder_nokey | `env -u LLM_API_KEY bash tests/blackbox/run.sh`（24 条） | `passed 8/8 (skipped 16)`，exit 0 |
+| run_clarify | `LLM_API_KEY=... bash tests/blackbox/run.sh`（25 条，新增 T18 澄清回流闭环） | `passed 25/25 (skipped 0)`，exit 0 |
+| run_clarify_nokey | `env -u LLM_API_KEY bash tests/blackbox/run.sh`（25 条） | `passed 8/8 (skipped 17)`，exit 0 |
 | 幂等性 | 连续两次同模式全量 | 逐用例结果一致 |
 | 稳定性 | 域 2 单独连跑 3 次（T13 竞态修复后） | 5/5 PASS ×3 |
 | 向量召回 E2E | 单条 Python 画像，3 个相关 / 3 个无关 query | 相关（Python、编程语言）1 条；无关（天气预报、种番茄、股票）0 条 |
@@ -148,7 +151,7 @@ bash tests/blackbox/run.sh --only assemble,privacy --keep-data --port 18300
 
 原 `tombstones` 仅在 `assembler.py` 装配时检查。删除后 ingest/runner **不拦截**新事件：同一用户再次上报，`entries` 仍会写入新行，只是 `/profile` 与导出恒为空包。
 
-处置：`runner._run` 入口先查 tombstone，命中即记录日志并返回，不再调用 LLM、不写任何表。T19 因此从“装配空包”加严为“intake 拦截：`entries`/`sources` 计数为 0 且 `/profile` 空包”；单测新增 `test_events_from_deleted_user_not_persisted`（202 但零落库、LLM 零调用）。
+处置：`runner._run` 入口先查 tombstone，命中即记录日志并返回，不再调用 LLM、不写任何表。T20 因此从“装配空包”加严为“intake 拦截：`entries`/`sources` 计数为 0 且 `/profile` 空包”；单测新增 `test_events_from_deleted_user_not_persisted`（202 但零落库、LLM 零调用）。
 
 ### 5.6 其它观测
 
@@ -164,7 +167,7 @@ bash tests/blackbox/run.sh --only assemble,privacy --keep-data --port 18300
 1. **真实 LLM 的判定漂移**：维度/主题归属存在合理波动（如“我用中文回答”可归 `preference/lang` 或 `identity/language`）。套件已用性质级断言 + 单次重试 + 复核提权吸收，但仍偶发依赖模型输出，建议在 CI 中固定模型版本与温度。
 2. **日批与降级场景未覆盖**：需修改 `daily_interval_seconds` 等配置，违背“配置原样”约束；相关逻辑由 `tests/test_aggregator.py` 等单元测试覆盖。
 3. **budget 截断**未做精确值断言（真实 LLM 下条目数不可控），可在后续加弱断言（`&budget=200` 时 `budget_used<=200`）。
-4. **T24 会破坏 `data/index.db`**：已实现备份/还原与 `--keep-data` 跳过，但该用例必须最后执行（套件已固定顺序）。
+4. **T25 会破坏 `data/index.db`**：已实现备份/还原与 `--keep-data` 跳过，但该用例必须最后执行（套件已固定顺序）。
 5. **测试独占 `./data`**：`run.sh` 检测到运行中的服务实例会拒绝执行（exit 2），避免误清开发数据。
 6. **向量召回依赖外部 embedding 服务**：服务不可达或维度不匹配时静默降级为词面 BM25，黑盒不区分降级原因；T13 因此只断言“两条召回路径至少一条命中”，不单独断言走向量。
 

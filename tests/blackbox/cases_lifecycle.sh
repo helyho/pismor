@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 域3 生命周期/复核（T14-T17）：矛盾收敛、verdict 流转、复核队列、长消息触发
+# 域3 生命周期/复核（T14-T18）：矛盾收敛、verdict 流转、复核队列、长消息触发、澄清回流
 # event_id 一律经 next_event_id 生成：retry 重跑拿新 id，不撞产品幂等去重
 # T14 矛盾收敛（LLM）：两条 lang 主题矛盾指令，终态生效条目至多 1 条
 t14() {
@@ -93,9 +93,60 @@ t17() {
     || { case_fail "长消息 120s 内未入库"; }
   case_pass
 }
+# T18 澄清回流闭环（LLM）：互斥偏好双存 → 装配提问 → 对话回答 → pending 消费、冲突消解
+t18_clarify() {
+  need_llm || return 2
+  local uid="t18u${RANDOM}" e1 e2 e3 n waited=0
+  e1=$(next_event_id t18a)
+  e2=$(next_event_id t18b)
+  e3=$(next_event_id t18c)
+
+  # 1) 两条同 key 互斥偏好（preference/verbosity）：简短 vs 详细 → 双存 degraded
+  http POST /events "$(bb_event "$uid" "$e1" "以后回答我都简短一点")"
+  expect_status 202 || return 1
+  wait_db "SELECT 1 FROM sources WHERE user_source='bb' AND user_id='$uid' AND origin_ref='blackbox:$e1'" 120 \
+    || { case_fail "第一条未完成"; }
+  http POST /events "$(bb_event "$uid" "$e2" "以后回答我都详细一点")"
+  expect_status 202 || return 1
+  wait_db "SELECT 1 FROM sources WHERE user_source='bb' AND user_id='$uid' AND origin_ref='blackbox:$e2'" 120 \
+    || { case_fail "第二条未完成"; }
+
+  # 2) 矛盾双方 degraded 且 conflict_with 互指
+  n=$(db "SELECT count(*) FROM entries WHERE user_source='bb' AND user_id='$uid' AND status='degraded' AND conflict_with IS NOT NULL")
+  [[ "$n" -ge 2 ]] || { case_fail "未形成矛盾双存（degraded=${n}）"; }
+
+  # 3) 装配触发澄清：响应带问题
+  http GET "/profile/bb/$uid"
+  expect_status 200 || return 1
+  expect_json_true '.clarification_needed | length > 0' || return 1
+
+  # 4) 用户以 conversation 回答（澄清只消费 dialogue 事件）
+  http POST /events "$(bb_conv_event "$uid" "$e3" '[{"role":"user","text":"以后都按详细来"},{"role":"assistant","text":"好的，以后回答尽量详细。"}]')"
+  expect_status 202 || return 1
+
+  # 5) 等 pending 被消费
+  while ((waited < 120)); do
+    n=$(db "SELECT count(*) FROM pending_clarifications WHERE user_source='bb' AND user_id='$uid'")
+    [[ "$n" == "0" ]] && break
+    sleep 2
+    waited=$((waited + 2))
+  done
+  [[ "$n" == "0" ]] || { case_fail "回答后 pending 未消费（120s）"; }
+
+  # 6) 收敛：规范行生效、+ 变形行归档、互标清除、装配不再提问
+  expect_db "SELECT status FROM entries WHERE user_source='bb' AND user_id='$uid' AND id='preference_verbosity@global'" "active" || return 1
+  expect_db "SELECT status FROM entries WHERE user_source='bb' AND user_id='$uid' AND id='preference_+verbosity@global'" "archived" || return 1
+  expect_db "SELECT count(*) FROM entries WHERE user_source='bb' AND user_id='$uid' AND id IN ('preference_verbosity@global','preference_+verbosity@global') AND conflict_with IS NOT NULL" "0" || return 1
+  http GET "/profile/bb/$uid"
+  expect_status 200 || return 1
+  expect_json '.clarification_needed | length' '0' || return 1
+  case_pass
+}
+
 run_domain_lifecycle() {
   run_case T14 "矛盾收敛" --retry -- t14
   run_case T15 "verdict流转" --retry -- t15
   run_case T16 "复核队列结构" -- t16
   run_case T17 "长消息触发" --retry -- t17
+  run_case T18 "澄清回流闭环" --retry -- t18_clarify
 }

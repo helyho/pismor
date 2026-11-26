@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# 域4 删除权（T18-T19）：删除全链、tombstone 持续
+# 域4 删除权（T19-T20）：删除全链、tombstone 持续
 # event_id 一律经 next_event_id 生成：retry 重跑拿新 id，不撞产品幂等去重
-# T18 删除权全链（LLM 自建数据）：tombstones 留痕、关联表清空、profile 空包
+# T19 删除权全链（LLM 自建数据）：tombstones 留痕、关联表清空、profile 空包
 t18() {
   need_llm || return 2
   local ev; ev=$(next_event_id t19e)
@@ -25,7 +25,7 @@ t18() {
   expect_json '.entries' '[]' || return 1
   case_pass
 }
-# T19 tombstone 持续（LLM）：删后含触发词事件不得复活画像
+# T20 tombstone 持续（LLM）：删后含触发词事件不得复活画像
 t19() {
   need_llm || return 2
   local e1 e2
@@ -52,6 +52,6 @@ t19() {
   case_pass
 }
 run_domain_privacy() {
-  run_case T18 "删除权全链" -- t18
-  run_case T19 "tombstone持续" --retry -- t19
+  run_case T19 "删除权全链" -- t18
+  run_case T20 "tombstone持续" --retry -- t19
 }

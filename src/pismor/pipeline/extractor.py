@@ -16,6 +16,7 @@ import re
 from pismor.core.keys import valid_scope
 from pismor.llm.prompts import (CLARIFY_EXTRACT_SYSTEM, CLARIFY_EXTRACT_USER,
                          EXTRACT_CONVERSATION, EXTRACT_TEXT, INSTRUCTION_RE, MAX_BODY)
+from pismor.pipeline.normalize import NormalizedEvent
 
 logger = logging.getLogger("mem.extractor")
 
@@ -50,18 +51,16 @@ _OUTPUT_SCHEMA = _schema("extract_candidates")
 _CLARIFY_SCHEMA = _schema("clarify_candidates")
 
 
-def extract(ev: dict, taxonomy, llm, known_ids: list[str], *, max_body: int = MAX_BODY) -> list[dict]:
-    """单事件抽取画像候选。conversation/text 走各自模板；逐条过滤后返回。"""
+def extract(ev: NormalizedEvent, taxonomy, llm, known_ids: list[str], *,
+            max_body: int = MAX_BODY) -> list[dict]:
+    """单事件抽取画像候选。dialogue/document 走各自模板；逐条过滤后返回。"""
     block = _dimension_block(taxonomy)
     ids_line = ", ".join(known_ids) if known_ids else "（无）"
-    if ev.get("event_type") == "text":
-        content = ev.get("content", "")
+    if ev.mode == "document":
         system = EXTRACT_TEXT.format(dimension_block=block, known_ids=ids_line)
-        user = content
     else:
         system = EXTRACT_CONVERSATION.format(dimension_block=block, known_ids=ids_line)
-        user = _render_messages(ev.get("messages", []))
-    result = llm.chat_json(system, user, _OUTPUT_SCHEMA)
+    result = llm.chat_json(system, ev.prompt_text, _OUTPUT_SCHEMA)
     out = []
     for raw in result.get("candidates", []):
         cand = _to_candidate(raw, taxonomy, max_body=max_body)
@@ -114,10 +113,6 @@ def _dimension_block(taxonomy) -> str:
                         if sensitive else "")
                      + (f"；判定要点：{guidance}" if guidance else ""))
     return "\n".join(lines)
-
-
-def _render_messages(messages: list[dict]) -> str:
-    return "\n".join(f"{m.get('role')}: {m.get('text', '')}" for m in messages)
 
 
 def _is_sensitive(taxonomy, dimension: str, topic: str) -> bool:

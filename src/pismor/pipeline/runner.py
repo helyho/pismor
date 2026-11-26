@@ -1,10 +1,10 @@
 """事件管线编排：澄清回流 → 触发分级 → 抽取 → 置信闸门 → 决策 → 写入（spec §10，intake 在 API 层先行）。
 
 编排层职责（计划裁决）：
-- conversation 事件开头查 pending_clarifications（clarifier.match_incoming 命中 →
+- dialogue 事件开头查 pending_clarifications（clarifier.match_incoming 命中 →
   回答先经 extractor.extract_clarification 规范化，再按 UPDATE / scope 拆分 /
-  单侧降级收敛矛盾对；text 事件不参与澄清关联，直通抽取）。
-- 触发分级（spec §10 成本控制）：conversation 未命中变化检测 → 不调抽取 LLM，
+  单侧降级收敛矛盾对；document 事件不参与澄清关联，直通抽取）。
+- 触发分级（spec §10 成本控制）：dialogue 未命中变化检测 → 不调抽取 LLM，
   按话题词面命中 top-20 条目 reinforcements+1 / last_reinforced_at=now（M-7）。
 - 置信闸门 review 档在本层落 pending_review 行进复核队列。
 - 同 key 二次写入的 sqlite3.IntegrityError 与 IllegalTransition 在本层逐条隔离：
@@ -19,6 +19,7 @@ import sqlite3
 from datetime import datetime, timezone
 
 from pismor.pipeline import clarifier, extractor, gate, resolver, trigger, writer
+from pismor.pipeline.normalize import normalize
 from pismor.serving import assembler
 from pismor.core import fts
 from pismor.core.config import Settings
@@ -73,16 +74,17 @@ def _run(conn, settings: Settings, event, taxonomy, llm, embedder) -> None:
         logger.info("pipeline skip for deleted user %s/%s", us, uid)
         return
     now = event.get("ts") or datetime.now(timezone.utc).isoformat(timespec="seconds")
-    origin_type = event.get("event_type") or "text"
+    ev = normalize(event)
+    origin_type = ev.event_type
     origin_ref = event.get("origin_ref") or event.get("event_id") or canonical_hash(event)
     known_ids = [r["id"] for r in conn.execute(
         "SELECT DISTINCT id FROM entries WHERE user_source=? AND user_id=?"
         " AND status IN ('active','degraded') LIMIT ?",
         (us, uid, settings.pipeline.known_ids_limit)).fetchall()]
 
-    if origin_type == "conversation":
-        # 澄清回流仅作用于 conversation（spec §10/§11），先于触发分级
-        text = _last_user_text(event)
+    if ev.is_dialogue:
+        # 澄清回流仅作用于 dialogue（spec §10/§11），先于触发分级
+        text = ev.last_user_text
         if text:
             hit = clarifier.match_incoming(conn, us, uid, text, llm)
             if hit:
@@ -91,7 +93,7 @@ def _run(conn, settings: Settings, event, taxonomy, llm, embedder) -> None:
                                      max_body=settings.pipeline.max_body_chars)
                 return
         do_extract, reason = trigger.should_extract(
-            event, has_history=bool(known_ids),
+            ev, has_history=bool(known_ids),
             long_message=settings.pipeline.trigger_long_message,
             explicit_re=trigger.build_explicit_re(
                 settings.pipeline.trigger_explicit_keywords))
@@ -103,7 +105,7 @@ def _run(conn, settings: Settings, event, taxonomy, llm, embedder) -> None:
                         event.get("event_id"), reason, n)
             return
 
-    candidates = extractor.extract(event, taxonomy, llm, known_ids,
+    candidates = extractor.extract(ev, taxonomy, llm, known_ids,
                                    max_body=settings.pipeline.max_body_chars)
     auto, review, _dropped = gate.gate(candidates, **_gate_kwargs(settings))
     _write_pending(conn, us, uid, review, origin_type, origin_ref, now)
@@ -115,14 +117,6 @@ def _gate_kwargs(settings: Settings) -> dict:
     g = settings.gate
     return {"auto_min": g.auto_min, "review_min": g.review_min,
             "inferred_cap": g.inferred_cap}
-
-
-def _last_user_text(event: dict) -> str:
-    messages = event.get("messages") or []
-    for m in reversed(messages):
-        if m.get("role") == "user" and m.get("text"):
-            return m["text"]
-    return ""
 
 
 def _reinforce(conn, us, uid, text, now, *, top_k: int = 20) -> int:

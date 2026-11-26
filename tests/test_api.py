@@ -10,7 +10,15 @@ from pismor.core.config import EmbeddingSettings, LLMSettings, Settings
 from pismor.serving.backup import backup
 from pismor.core.db import get_conn, init_schema
 from pismor.pipeline.runner import run_pipeline
-from pismor.pipeline.trigger import build_explicit_re, should_extract
+from pismor.pipeline.normalize import normalize
+from pismor.pipeline.trigger import build_explicit_re, should_extract as _should_extract
+
+
+def should_extract(event, *args, **kwargs):
+    """测试适配器：用例以原始事件 dict 表达输入，先经 normalize 得到管线视图。"""
+    if "event_type" not in event:
+        event = {**event, "event_type": "conversation"}
+    return _should_extract(normalize(event), *args, **kwargs)
 
 REPO = Path(__file__).resolve().parent.parent
 NOW = "2026-11-24T10:00:00+08:00"

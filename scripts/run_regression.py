@@ -21,6 +21,7 @@ if str(_REPO / "src") not in sys.path:
     sys.path.insert(0, str(_REPO / "src"))
 
 from pismor.pipeline import extractor, gate  # noqa: E402
+from pismor.pipeline.normalize import normalize  # noqa: E402
 from pismor.core.config import load_settings  # noqa: E402
 from pismor.llm.client import LLMClient  # noqa: E402
 from pismor.core.taxonomy import load_taxonomy  # noqa: E402
@@ -111,7 +112,7 @@ def main(argv=None) -> int:
     for i, case in enumerate(taxonomy.regression_cases, 1):
         case_llm = ExpectReplayLLM(case) if args.dry else llm
         try:
-            candidates = extractor.extract(_text_event(case, i), taxonomy, case_llm,
+            candidates = extractor.extract(normalize(_text_event(case, i)), taxonomy, case_llm,
                                            known_ids=[])
         except Exception as exc:  # 单例失败不影响其余样例，整体仍非全绿
             print(f"[FAIL] {i}. {case['quote']} — 抽取异常: {exc}")

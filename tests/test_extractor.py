@@ -1,5 +1,11 @@
-from pismor.pipeline.extractor import extract
+from pismor.pipeline.extractor import extract as _extract
 from pismor.pipeline.gate import gate
+from pismor.pipeline.normalize import normalize
+
+
+def extract(ev, *args, **kwargs):
+    """测试适配器：用例继续用原始事件 dict 表达输入，管线视图由 normalize 产出。"""
+    return _extract(normalize(ev), *args, **kwargs)
 
 
 class FakeLLM:

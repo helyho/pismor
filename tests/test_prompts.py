@@ -15,6 +15,7 @@ import pytest
 from pismor.pipeline import extractor, resolver
 from pismor.core.keys import valid_scope
 from pismor.llm.prompts import EXTRACT_CONVERSATION, EXTRACT_TEXT
+from pismor.pipeline.normalize import normalize
 from pismor.pipeline.writer import _insert_entry
 
 
@@ -46,7 +47,7 @@ def _conv_ev(messages=None, event_type="conversation", content=None):
     else:
         ev.update({"event_type": "conversation", "session_id": "s1", "turn": 1,
                    "messages": messages or [{"role": "user", "text": "以后都用 Python"}]})
-    return ev
+    return normalize(ev)
 
 
 # ---------- 1) guidance 注入（维度词表块） ----------

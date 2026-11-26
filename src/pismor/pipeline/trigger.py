@@ -1,9 +1,11 @@
-"""触发分级（spec §10 成本控制核心，仅作用于 conversation）：
+"""触发分级（spec §10 成本控制核心，仅作用于 dialogue）：
 
 explicit 声明与显式 force_extract 零阈值直通；普通消息先过规则版变化检测，无变化仅批内
-累加 reinforcement，不调 LLM。text 事件是显式提交的素材，直通抽取（spec §10）。
+累加 reinforcement，不调 LLM。document 事件是显式提交的素材，直通抽取（spec §10）。
 """
 import re
+
+from pismor.pipeline.normalize import NormalizedEvent
 
 # 默认词表与 settings.pipeline.trigger_explicit_keywords 保持一致（中英文声明关键词）。
 _DEFAULT_EXPLICIT_KEYWORDS = (
@@ -30,7 +32,7 @@ def build_explicit_re(keywords) -> re.Pattern:
 _EXPLICIT_RE = build_explicit_re(_DEFAULT_EXPLICIT_KEYWORDS)
 
 
-def should_extract(event: dict, has_history: bool, *, long_message: int = 300,
+def should_extract(ev: NormalizedEvent, has_history: bool, *, long_message: int = 300,
                    explicit_re: re.Pattern | None = None) -> tuple[bool, str]:
     """规则版变化检测：返回 (是否抽取, 命中规则)。
 
@@ -41,21 +43,13 @@ def should_extract(event: dict, has_history: bool, *, long_message: int = 300,
     其余 (e) False（不调抽取 LLM）。
     """
     ere = explicit_re or _EXPLICIT_RE
-    for m in event.get("messages") or []:
-        if m.get("role") != "user":
-            continue
-        text = m.get("text") or ""
+    for text in ev.user_texts:
         if ere.search(text):
             return True, "explicit"
         if len(text) > long_message:
             return True, "long_message"
-    if event.get("force_extract") and _has_user_text(event):
+    if ev.force_extract and ev.user_texts:
         return True, "forced"
     if not has_history:
         return True, "first_query"
     return False, "no_change"
-
-
-def _has_user_text(event: dict) -> bool:
-    return any(m.get("role") == "user" and (m.get("text") or "").strip()
-               for m in event.get("messages") or [])

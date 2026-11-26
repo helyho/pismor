@@ -26,12 +26,12 @@ def S(name, response):
 
 
 def conv(event_id, text, *, source="webchat", user="u1", session="s1", turn=1,
-         ts=NOW, feedback=None):
+         ts=NOW, force_extract=False):
     return {"source": source, "user_ref": user, "event_id": event_id,
             "event_type": "conversation", "session_id": session, "turn": turn,
             "ts": ts, "messages": [{"role": "user", "text": text},
                                    {"role": "assistant", "text": "好的"}],
-            "feedback": feedback or []}
+            "force_extract": force_extract}
 
 
 def text_event(event_id, content, *, source="webchat", user="u1", ts=NOW):

@@ -35,11 +35,13 @@ class ConversationEvent(_Base):
     session_id: str
     turn: int
     messages: list[dict] = Field(min_length=1)  # [{"role": "user"|"assistant", "text": str}]
-    feedback: list[dict] = []
+    # 上报方判定本轮值得抽取；None 等同 false
+    force_extract: bool | None = None
 
     @field_validator("messages")
     @classmethod
     def _validate_messages(cls, value: list[dict]) -> list[dict]:
+        has_user = False
         for message in value:
             if not isinstance(message, dict):
                 raise ValueError("message must be an object")
@@ -49,6 +51,9 @@ class ConversationEvent(_Base):
                 raise ValueError("message.role must be user|assistant")
             if not isinstance(text, str) or not text.strip():
                 raise ValueError("message.text must be a non-empty string")
+            has_user = has_user or role == "user"
+        if not has_user:
+            raise ValueError("messages must contain at least one user message")
         return value
 
 

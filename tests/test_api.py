@@ -136,6 +136,13 @@ def test_malformed_422(client):  # 缺 user_ref/ts → intake ValidationError �
     assert r.status_code == 422
 
 
+def test_assistant_only_conversation_422(client):
+    # 入口硬约束：messages 必须含至少一条 user，否则 422（不落库、不进管线）
+    ev = dict(CONV_EVENT, event_id="evt_no_user",
+              messages=[{"role": "assistant", "text": "好的"}])
+    assert client.post("/events", json=ev).status_code == 422
+
+
 def test_profile_after_pipeline(client, fake_llm, wait_for_pipeline):
     fake_llm.by_name["extract_candidates"] = [{"candidates": [dict(EXPLICIT_CAND)]}]
     client.post("/events", json=CONV_EVENT)
@@ -264,8 +271,8 @@ def test_trigger_grading_plain_message_skips_llm(client, conn, fake_llm):
     assert "extract_candidates" not in fake_llm.calls
 
 
-def test_trigger_grading_explicit_and_feedback_extract(client, conn, fake_llm):
-    # I-4：explicit 关键词与 feedback 非空 → 直通抽取
+def test_trigger_grading_explicit_and_forced_extract(client, conn, fake_llm):
+    # I-4：explicit 关键词与 force_extract → 直通抽取
     _seed_entry(conn, "preference", "lang", "global", "active", "主语言 Python",
                 "主语言Python", 0.9)
     explicit_ev = dict(CONV_EVENT, event_id="evt_g2",
@@ -274,22 +281,39 @@ def test_trigger_grading_explicit_and_feedback_extract(client, conn, fake_llm):
     assert "extract_candidates" in fake_llm.calls
     fb_ev = dict(CONV_EVENT, event_id="evt_g3",
                  messages=[{"role": "user", "text": "就这样吧"}],
-                 feedback=[{"kind": "dislike", "turn": 1, "detail": "太啰嗦"}])
+                 force_extract=True)
     client.post("/events", json=fb_ev)
     assert fake_llm.calls.count("extract_candidates") == 2
 
 
 def test_trigger_grading_rules():
-    # 规则表逐项钉死：(a)explicit (b)feedback (c)首查 (d)长度突变 (e)无变化
+    # 规则表逐项钉死：(a)explicit (b)long_message (c)force_extract (d)首查 (e)无变化
     short = [{"role": "user", "text": "嗯"}]
     assert should_extract({"messages": short}, False) == (True, "first_query")
     assert should_extract({"messages": short}, True) == (False, "no_change")
     assert should_extract({"messages": [{"role": "user", "text": "别再给我推广告"}]},
                           True) == (True, "explicit")
-    assert should_extract({"messages": short, "feedback": [{"kind": "edit"}]},
-                          True) == (True, "feedback")
+    assert should_extract({"messages": short, "force_extract": True},
+                          True) == (True, "forced")
     assert should_extract({"messages": [{"role": "user", "text": "长" * 301}]},
                           True) == (True, "long_message")
+
+
+def test_trigger_grading_force_extract_needs_user_text():
+    # 防御性单测（绕过 intake 直调）：API 入口已由 schema 422 拦截 assistant-only
+    assert should_extract({"messages": [{"role": "assistant", "text": "好的"}],
+                           "force_extract": True}, True) == (False, "no_change")
+
+
+def test_force_extract_string_false_does_not_trigger(client, conn, fake_llm):
+    # lax 校验 "False" → False，intake 归一化回写；管线不得把原始字符串当 truthy
+    _seed_entry(conn, "preference", "lang", "global", "active", "主语言 Python",
+                "主语言Python", 0.9)
+    ev = dict(CONV_EVENT, event_id="evt_false",
+              messages=[{"role": "user", "text": "就这样吧"}],
+              force_extract="False")
+    client.post("/events", json=ev)
+    assert "extract_candidates" not in fake_llm.calls
 
 
 def test_trigger_explicit_keywords_english_default():

@@ -1,6 +1,6 @@
 """触发分级（spec §10 成本控制核心，仅作用于 conversation）：
 
-explicit 声明与反馈事件零阈值直通；普通消息先过规则版变化检测，无变化仅批内
+explicit 声明与显式 force_extract 零阈值直通；普通消息先过规则版变化检测，无变化仅批内
 累加 reinforcement，不调 LLM。text 事件是显式提交的素材，直通抽取（spec §10）。
 """
 import re
@@ -35,9 +35,9 @@ def should_extract(event: dict, has_history: bool, *, long_message: int = 300,
     """规则版变化检测：返回 (是否抽取, 命中规则)。
 
     (a) explicit 声明关键词命中（词表可配，settings.pipeline.trigger_explicit_keywords）；
-    (b) feedback 非空；(c) 会话首查（has_history=False，管线以"用户已有画像条目"
-    近似 session 首查，冷启动用户每条必抽）；
-    (d) 消息长度突变（任一 user 消息 >long_message 字符，settings.pipeline 可配）；
+    (b) 消息长度突变（任一 user 消息 >long_message 字符，settings.pipeline 可配）；
+    (c) force_extract 为真（入口 schema 已保证存在 user 文本，正常调用不会走到 no-op）；
+    (d) 会话首查（has_history=False，管线以"用户已有画像条目"近似，冷启动用户每条必抽）；
     其余 (e) False（不调抽取 LLM）。
     """
     ere = explicit_re or _EXPLICIT_RE
@@ -49,8 +49,13 @@ def should_extract(event: dict, has_history: bool, *, long_message: int = 300,
             return True, "explicit"
         if len(text) > long_message:
             return True, "long_message"
-    if event.get("feedback"):
-        return True, "feedback"
+    if event.get("force_extract") and _has_user_text(event):
+        return True, "forced"
     if not has_history:
         return True, "first_query"
     return False, "no_change"
+
+
+def _has_user_text(event: dict) -> bool:
+    return any(m.get("role") == "user" and (m.get("text") or "").strip()
+               for m in event.get("messages") or [])

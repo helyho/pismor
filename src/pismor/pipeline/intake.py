@@ -3,7 +3,7 @@ import sqlite3
 from typing import Annotated
 
 from pydantic import Field, TypeAdapter, ValidationError
-from pismor.core.schemas import EventIn, resolve_event_id
+from pismor.core.schemas import ConversationEvent, EventIn, resolve_event_id
 
 adapter = TypeAdapter(EventIn)
 
@@ -14,6 +14,11 @@ class ContentTooLong(ValueError):
 def intake_event(conn, event: dict, *, max_content_chars: int = 8192) -> tuple[bool, dict]:
     # 畸形输入抛 pydantic.ValidationError（校验先于落库，不写 events_seen）
     ev = adapter.validate_python(event)
+    # 归一化回写：管线消费的是原始 dict，不能依赖 pydantic 的 lax 转换与默认值。
+    # 否则 "False" 这类字符串在 trigger 里是 truthy，event_type 缺省会被当成 text。
+    event["event_type"] = ev.event_type
+    if isinstance(ev, ConversationEvent):
+        event["force_extract"] = ev.force_extract is True
     content = getattr(ev, "content", None)
     if content is not None:
         # text 事件 content 上限可配（settings.intake.max_content_chars）；复用 pydantic 校验保证 422 语义

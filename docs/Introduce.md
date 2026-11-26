@@ -8,7 +8,7 @@
 
 ## 核心特性
 
-- **触发分级省成本**：普通轮次默认不调抽取 LLM，仅 explicit 声明、反馈、首查、长消息突变四类信号触发（见 [触发分级](#触发分级与成本控制)）
+- **触发分级省成本**：普通轮次默认不调抽取 LLM，仅 explicit 声明、force_extract（反馈轮次）、首查、长消息突变四类信号触发（见 [触发分级](#触发分级与成本控制)）
 - **词表硬约束**：LLM 只能在 `taxonomy.yaml` 词表内打标，禁止发明维度与主题词；词表外主题进观察区（orphan），复现达标后自动晋升
 - **证据链强制**：无对话原文 quote 的候选拒绝入库；每条画像可回溯到 session/turn
 - **三层注入防御**：抽取时拒绝指令类内容、注入时"非指令"包装、审计日批扫描隔离
@@ -87,7 +87,7 @@ curl -s -X POST http://127.0.0.1:8300/events -H 'Content-Type: application/json'
     {"role": "assistant", "text": "脚本语言选哪个？"},
     {"role": "user", "text": "以后都用 Python 3.12 写脚本，别再给我生成表格格式的输出"}
   ],
-  "feedback": [],
+  "force_extract": false,
   "ts": "2026-11-24T10:00:00+08:00"
 }'
 # → 202 {"event_id": "..."}；重复上报 → 200 {"deduplicated": true}；校验失败 → 422
@@ -113,14 +113,16 @@ curl -s http://127.0.0.1:8300/review/queue
 
 ### 上报事件
 
-conversation 事件（`messages` 仅 `user`/`assistant`，`user` 消息才是画像证据）：
+conversation 事件（`messages` 仅 `user`/`assistant`，至少一条非空 `user` 消息，否则 422；`user` 消息才是画像证据）：
 
 ```json
 {"source": "chat_demo", "user_ref": "u_001", "event_type": "conversation",
  "session_id": "s_001", "turn": 4,
  "messages": [{"role": "user", "text": "..."}],
- "feedback": [], "ts": "2026-11-24T10:00:00+08:00"}
+ "force_extract": false, "ts": "2026-11-24T10:00:00+08:00"}
 ```
+
+`force_extract`（可选，默认 `false`）：上报方判定本轮值得抽取时置 `true`，跳过关键词/长度/首查判定直通抽取（只影响 conversation）。它只表达"该抽"的意图，证据仍只来自 `messages`；入口已保证存在 user 文本，assistant-only 的 conversation 直接 422。`force_extract` 不参与 canonical hash，只对首次提交生效——事后补抽请换新的 `event_id`（或 `ts`）。
 
 text 事件（显式提交的素材，跳过触发分级直通抽取；`content` 上限 `intake.max_content_chars`）：
 
@@ -243,7 +245,7 @@ stateDiagram-v2
 
 1. **explicit**：任一 user 消息含 `记住|以后|别再|不要|默认|总是|永远`
 2. **long_message**：任一 user 消息长度 > `pipeline.trigger_long_message`（默认 300 字符）
-3. **feedback**：事件带反馈
+3. **force_extract**：上报方显式标记本轮值得抽取（入口已保证存在 user 文本）
 4. **first_query**：库中无该用户存量条目（冷启动每条必抽）
 
 均未命中则跳过抽取（不调 LLM），仅按话题 BM25 词面相关度命中给存量条目累加强化（`_reinforce`，top-k 按 BM25 排序）。

@@ -19,8 +19,7 @@ def event(event_id="e1"):
     return {"source": "webchat", "user_ref": "u1", "event_id": event_id,
             "event_type": "conversation", "session_id": "s1", "turn": 1, "ts": NOW,
             "messages": [{"role": "user", "text": "回答短一点"},
-                         {"role": "assistant", "text": "好的"}],
-            "feedback": []}
+                         {"role": "assistant", "text": "好的"}]}
 
 
 @pytest.fixture

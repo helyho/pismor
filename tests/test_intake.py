@@ -88,3 +88,38 @@ def test_hash_fallback_writes_back_event_id(conn):
     ev = dict(CONV, event_id=None)
     ok, ack = intake_event(conn, ev)
     assert ok and ev["event_id"] == ack["event_id"] and ev["event_id"].startswith("sha256:")
+
+
+def test_conversation_requires_user_message(conn):
+    # 仅 assistant 的对话无画像证据，入口即拒（避免 force_extract 空转）
+    with pytest.raises(ValidationError):
+        intake_event(conn, dict(CONV, event_id="e23",
+                                messages=[{"role": "assistant", "text": "好的"}]))
+    assert conn.execute("SELECT COUNT(*) c FROM events_seen").fetchone()["c"] == 0
+
+
+def test_force_extract_defaults_false(conn):
+    ev = dict(CONV, event_id="e25")
+    ok, _ = intake_event(conn, ev)
+    assert ok and ev["force_extract"] is False
+
+
+def test_force_extract_normalized_to_bool(conn):
+    # lax 校验会把 "False" 转成 False；必须回写原始 dict，否则 trigger 读到 truthy
+    ev = dict(CONV, event_id="e26", force_extract="False")
+    ok, _ = intake_event(conn, ev)
+    assert ok and ev["force_extract"] is False
+
+
+def test_force_extract_accepts_null(conn):
+    # 可选布尔：null 等价未传，不应 422
+    ev = dict(CONV, event_id="e27", force_extract=None)
+    ok, _ = intake_event(conn, ev)
+    assert ok and ev["force_extract"] is False
+
+
+def test_default_event_type_written_back(conn):
+    # 省略 event_type 的 conversation 必须回写，否则 runner 当成 text 跳过触发分级
+    ev = {k: v for k, v in CONV.items() if k != "event_type"} | {"event_id": "e28"}
+    ok, _ = intake_event(conn, ev)
+    assert ok and ev["event_type"] == "conversation"

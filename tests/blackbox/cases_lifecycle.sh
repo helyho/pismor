@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# 域3 生命周期/复核（T13-T16）：矛盾收敛、verdict 流转、复核队列、长消息触发
+# 域3 生命周期/复核（T14-T17）：矛盾收敛、verdict 流转、复核队列、长消息触发
 # event_id 一律经 next_event_id 生成：retry 重跑拿新 id，不撞产品幂等去重
-# T13 矛盾收敛（LLM）：两条 lang 主题矛盾指令，终态生效条目至多 1 条
-t13() {
+# T14 矛盾收敛（LLM）：两条 lang 主题矛盾指令，终态生效条目至多 1 条
+t14() {
   need_llm || return 2
   local e1 e2
   e1=$(next_event_id t13a)
@@ -30,9 +30,9 @@ t13() {
   expect_status 200 || return 1
   case_pass
 }
-# T14 verdict 流转（LLM 建数据，流转本身确定）：approve→旧版本 noop→discard 行消失
+# T15 verdict 流转（LLM 建数据，流转本身确定）：approve→旧版本 noop→discard 行消失
 # user 每次 attempt 唯一（retry 重跑不污染 review_history 计数）
-t14() {
+t15() {
   need_llm || return 2
   local uid="t14u${RANDOM}" ev; ev=$(next_event_id t14e)
   http POST /events "$(bb_event "$uid" "$ev" "记住, 我自己的小脚本默认都用 Python 写")"
@@ -70,8 +70,8 @@ t14() {
   expect_db "SELECT count(*) FROM entries WHERE user_source='bb' AND user_id='${uid}' AND id='${entry_id}'" "0" || return 1
   case_pass
 }
-# T15 复核队列结构：200、items 为数组、非空时键齐全
-t15() {
+# T16 复核队列结构：200、items 为数组、非空时键齐全
+t16() {
   http GET /review/queue
   expect_status 200 || return 1
   expect_json '.items | type' 'array' || return 1
@@ -81,8 +81,8 @@ t15() {
   done
   case_pass
 }
-# T16 长消息触发（LLM）：>300 字符无触发词纯文本，管线后入库（性质级）
-t16() {
+# T17 长消息触发（LLM）：>300 字符无触发词纯文本，管线后入库（性质级）
+t17() {
   need_llm || return 2
   local long ev
   long=$(printf '我们团队的工作流是这样的, 需求评审之后进入开发, 开发完成提交代码评审, 评审通过再合入主干. 日常站会十五分钟, 迭代周期两周. 发布流程走灰度, 先百分之五再全量. 监控告警接企微, 线上问题四小时内响应. 文档随代码一起维护, 接口变更同步更新 openapi 描述. %.0s' $(seq 1 5))
@@ -94,8 +94,8 @@ t16() {
   case_pass
 }
 run_domain_lifecycle() {
-  run_case T13 "矛盾收敛" --retry -- t13
-  run_case T14 "verdict流转" --retry -- t14
-  run_case T15 "复核队列结构" -- t15
-  run_case T16 "长消息触发" --retry -- t16
+  run_case T14 "矛盾收敛" --retry -- t14
+  run_case T15 "verdict流转" --retry -- t15
+  run_case T16 "复核队列结构" -- t16
+  run_case T17 "长消息触发" --retry -- t17
 }

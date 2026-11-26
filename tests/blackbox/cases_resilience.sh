@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# 域6 韧性收尾（T24/T26）：并发装配、损坏库拒启（必须最后跑并自恢复）
+# 域6 韧性收尾（T23/T24）：并发装配、损坏库拒启（必须最后跑并自恢复）
 
-# T24 并发装配：xargs -P8 并发 GET /profile ×16，全部 200 且每个响应可被 jq 解析
-t24() {
+# T23 并发装配：xargs -P8 并发 GET /profile ×16，全部 200 且每个响应可被 jq 解析
+t23() {
   # 并发目标：t17u（域4 已不再预建画像，按空包用户并发；并发正确性口径不变）
   local out n bad base i
   base="http://127.0.0.1:${PORT}/profile/bb/t17u"
@@ -25,11 +25,11 @@ t24() {
   case_pass
 }
 
-# T26 损坏库拒启（收尾用例，不走 run_case——需操纵服务生命周期）
+# T24 损坏库拒启（收尾用例，不走 run_case——需操纵服务生命周期）
 # 停服务 → 写坏 index.db → 重启 → 期望非 0 退出拒启 → 还原备份重启，healthz 恢复 200
 # --keep-data 下跳过（该用例必然写坏库）
-t26_corrupt_db() {
-  local id="T26" name="损坏库拒启+自恢复" ok=1 detail="" bak rc=0 refused=0
+t24_corrupt_db() {
+  local id="T24" name="损坏库拒启+自恢复" ok=1 detail="" bak rc=0 refused=0
   if [[ "${KEEP_DATA:-0}" == "1" ]]; then
     SKIP=$((SKIP + 1))
     RESULTS+=("[SKIP] $id $name — --keep-data 下跳过（会写坏库）")
@@ -41,7 +41,7 @@ t26_corrupt_db() {
     ok=0
     detail="无法备份 data/index.db"
   fi
-  echo "  (T26: 接下来 serve.log 中的 'file is not a database' traceback 是预期产物)"
+  echo "  (T24: 接下来 serve.log 中的 'file is not a database' traceback 是预期产物)"
   kill "$SVC_PID" 2>/dev/null
   wait "$SVC_PID" 2>/dev/null
   echo garbage >data/index.db
@@ -104,6 +104,6 @@ t26_corrupt_db() {
 }
 
 run_domain_resilience() {
-  run_case T24 "并发装配" -- t24
-  t26_corrupt_db
+  run_case T23 "并发装配" -- t23
+  t24_corrupt_db
 }

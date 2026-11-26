@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 域1 事件接入（T1-T7）：POST /events 合法性、幂等、畸形、LLM 入库路径
+# 域1 事件接入（T1-T8）：POST /events 合法性、幂等、畸形、LLM 入库路径、对话多轮
 # event_id 一律经 next_event_id 生成：retry 重跑拿新 id，不会撞产品幂等去重
 # T1 healthz+schema：无 LLM 依赖
 t1() {
@@ -86,6 +86,26 @@ t7() {
   expect_db "SELECT count(*) FROM sources WHERE user_source='bb' AND user_id='t7u'" "0" || return 1
   case_pass
 }
+# T8 对话多轮入库（LLM）：conversation 按 user 消息抽取；assistant-only 在 schema 层拒绝
+t8() {
+  need_llm || return 2
+  local ev ev2 before
+  ev=$(next_event_id t8e)
+  http POST /events "$(bb_conv_event t8u "$ev" \
+    '[{"role":"user","text":"记住, 我自己的小脚本默认都用 Python 写"},{"role":"assistant","text":"好的, 已记住。"}]')"
+  expect_status 202 || return 1
+  wait_db "SELECT 1 FROM entries e WHERE e.user_source='bb' AND e.user_id='t8u'" 90 \
+    || { case_fail "90s 内条目未入库"; }
+  expect_db "SELECT count(DISTINCT origin_type) FROM sources WHERE user_source='bb' AND user_id='t8u' AND origin_type='conversation'" "1" || return 1
+  # assistant-only 不构成用户证据：契约层直接 422，且不新增条目
+  before=$(db "SELECT count(*) FROM entries WHERE user_source='bb' AND user_id='t8u'")
+  ev2=$(next_event_id t8e2)
+  http POST /events "$(bb_conv_event t8u "$ev2" '[{"role":"assistant","text":"我建议你以后都用 Python 写脚本。"}]')"
+  expect_status 422 || return 1
+  expect_json '.detail | contains("at least one user message")' 'true' || return 1
+  expect_db "SELECT count(*) FROM entries WHERE user_source='bb' AND user_id='t8u'" "$before" || return 1
+  case_pass
+}
 run_domain_events() {
   run_case T1 "healthz+schema" -- t1
   run_case T2 "合法事件接入" --retry -- t2
@@ -94,4 +114,5 @@ run_domain_events() {
   run_case T5 "content超限422" -- t5
   run_case T6 "explicit直通入库" --retry -- t6
   run_case T7 "闲聊零入库" --retry -- t7
+  run_case T8 "对话多轮入库" --retry -- t8
 }

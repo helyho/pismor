@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# 域2 装配（T8-T12）：GET /profile 包结构、维度入包、用户隔离、query 召回
+# 域2 装配（T9-T13）：GET /profile 包结构、维度入包、用户隔离、query 召回
 # event_id 一律经 next_event_id 生成：retry 重跑拿新 id，不撞产品幂等去重
-# T8 空包合法：结构五键齐全，永不 5xx
-t8() {
+# T9 空包合法：结构五键齐全，永不 5xx
+t9() {
   http GET /profile/bb/nobody
   expect_status 200 || return 1
   expect_json '.entries' '[]' || return 1
@@ -12,9 +12,9 @@ t8() {
   done
   case_pass
 }
-# T9 taboo 入包（LLM）：taxonomy 回归样例，taboo 排包首位
+# T10 taboo 入包（LLM）：taxonomy 回归样例，taboo 排包首位
 # 响应条目只有 {id,text,confidence,status}，维度经 id 前缀（dimension_topic）识别
-t9() {
+t10() {
   need_llm || return 2
   local ev; ev=$(next_event_id t9e)
   http POST /events "$(bb_event t9u "$ev" "别再给我生成 Excel 公式了, 用 Python")"
@@ -28,8 +28,8 @@ t9() {
   expect_json '.entries[0].id | startswith("taboo")' 'true' || return 1
   case_pass
 }
-# T10 identity 入包（LLM）
-t10() {
+# T11 identity 入包（LLM）
+t11() {
   need_llm || return 2
   local ev; ev=$(next_event_id t10e)
   http POST /events "$(bb_event t10u "$ev" "我是一名后端工程师")"
@@ -42,8 +42,8 @@ t10() {
   expect_json '[.entries[] | select(.id | startswith("identity"))] | length > 0' 'true' || return 1
   case_pass
 }
-# T11 用户隔离：u 有画像后，其他 user / 其他 source 均为空包
-t11() {
+# T12 用户隔离：u 有画像后，其他 user / 其他 source 均为空包
+t12() {
   need_llm || return 2
   local ev; ev=$(next_event_id t11e)
   http POST /events "$(bb_event t11u "$ev" "记住, 我自己的小脚本默认都用 Python 写")"
@@ -62,8 +62,8 @@ t11() {
   expect_json '.entries' '[]' || return 1
   case_pass
 }
-# T12 query 召回（LLM）：相关条目在包内，性质级不断言排序
-t12() {
+# T13 query 召回（LLM）：相关条目在包内，性质级不断言排序
+t13() {
   need_llm || return 2
   local e1 e2
   e1=$(next_event_id t12a)
@@ -93,9 +93,9 @@ t12() {
   case_pass
 }
 run_domain_assemble() {
-  run_case T8 "空包合法" -- t8
-  run_case T9 "taboo入包置顶" --retry -- t9
-  run_case T10 "identity入包" --retry -- t10
-  run_case T11 "用户隔离" --retry -- t11
-  run_case T12 "query召回" --retry -- t12
+  run_case T9 "空包合法" -- t9
+  run_case T10 "taboo入包置顶" --retry -- t10
+  run_case T11 "identity入包" --retry -- t11
+  run_case T12 "用户隔离" --retry -- t12
+  run_case T13 "query召回" --retry -- t13
 }

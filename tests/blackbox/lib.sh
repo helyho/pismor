@@ -77,6 +77,12 @@ bb_event() {
     '{source:"bb", user_ref:$u, event_id:$e, event_type:"text", content:$c, ts:$t, origin_ref:("blackbox:" + $e)}'
 }
 
+# bb_conv_event <user> <event_id> <messages-json>：conversation 事件（消息字段为 text）
+bb_conv_event() {
+  jq -n --arg u "$1" --arg e "$2" --arg t "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --argjson m "$3" \
+    '{source:"bb", user_ref:$u, event_id:$e, event_type:"conversation", session_id:("blackbox:" + $e), turn:1, ts:$t, messages:$m}'
+}
+
 # promote_active <user> <dimension>：条目停在 pending_review 时走 verdict approve
 # 使其生效（产品正常路径：待复核条目不进包）。已是 active/degraded 直接返回 0。
 # user_id 不是唯一键（PK 含 user_source），故查询都带 user_source；scope 一并锁定

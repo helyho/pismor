@@ -17,7 +17,7 @@ while [[ $# -gt 0 ]]; do
     --port) PORT="${2:?--port 需要端口号}"; shift 2 ;;
     --timeout) TIMEOUT="${2:?--timeout 需要秒数}"; shift 2 ;;
     --only) ONLY="${2:?--only 需要域名列表}"; shift 2 ;;
-    *) echo "未知参数: $1（用法: run.sh [--keep-data] [--port N] [--timeout S] [--only events,assemble,lifecycle,export,injection,resilience]）" >&2; exit 2 ;;
+    *) echo "未知参数: $1（用法: run.sh [--keep-data] [--port N] [--timeout S] [--only events,assemble,lifecycle,privacy,injection,resilience]）" >&2; exit 2 ;;
   esac
 done
 
@@ -26,11 +26,11 @@ for t in curl jq sqlite3 lsof; do
 done
 [[ -x .venv/bin/python ]] || { echo "缺少 .venv/bin/python（请先创建 venv）"; exit 2; }
 [[ -f scripts/serve.py ]] || { echo "找不到 scripts/serve.py（需在仓库根运行）"; exit 2; }
-# 预检：测试独占 ./data（清库 + T26 故意写坏库），检测到运行中的服务实例则拒绝
+# 预检：测试独占 ./data（清库 + T24 故意写坏库），检测到运行中的服务实例则拒绝
 if pgrep -f "scripts/serve.py" >/dev/null 2>&1; then
   echo "检测到运行中的 pismor 服务实例：" >&2
   pgrep -fl "scripts/serve.py" >&2
-  echo "测试会清空 ./data 并在 T26 故意写坏 index.db，请先停止服务再跑测试。" >&2
+  echo "测试会清空 ./data 并在 T24 故意写坏 index.db，请先停止服务再跑测试。" >&2
   exit 2
 fi
 # 端口预检：避免就绪探测打到外来服务，随后把事件 POST 给它
@@ -93,7 +93,7 @@ SKIP=0
 RESULTS=()
 
 # 逐域执行（文件存在才 source；--only 过滤）
-for d in events assemble lifecycle export injection resilience; do
+for d in events assemble lifecycle privacy injection resilience; do
   if [[ -n "$ONLY" && ",$ONLY," != *",$d,"* ]]; then continue; fi
   f="tests/blackbox/cases_${d}.sh"
   [[ -f "$f" ]] || continue

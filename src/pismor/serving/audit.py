@@ -14,13 +14,12 @@ violations 每条附 entry 定位（四元组），供 flag_violations 落复核
 run_audit 只读；标记动作由 flag_violations 显式执行（spec §6 审计标记）。
 """
 import json
-import re
 
 from pismor.core.keys import entry_key
 from pismor.llm.prompts import INSTRUCTION_RE
+from pismor.pipeline.safety import quote_is_negated, topics_near
 
 _ALIVE = ("active", "degraded")  # 存活状态（恒胜/并存判定的范围）
-_NEGATION_RE = re.compile(r"不|别|禁|勿|拒绝|无需|避免|没有")
 _ENTRY_FIELDS = ("user_source", "user_id", "dimension", "topic")
 
 
@@ -77,7 +76,7 @@ def _taboo_no_overlap(conn):
         for pf in prefs:
             if (tb["user_source"], tb["user_id"]) != (pf["user_source"], pf["user_id"]):
                 continue
-            if not _topics_near(tb["topic"], pf["topic"]):
+            if not topics_near(tb["topic"], pf["topic"]):
                 continue
             if _adjudicated(tb, pf):
                 continue  # conflict_lost 终态或 conflict_with 互标：已裁决，非违规
@@ -128,20 +127,10 @@ def _taboo_negation(conn):
         " AND s.entry_id = e.id"
         " WHERE e.dimension='taboo' AND e.status IN ('active','degraded')").fetchall()
     for r in rows:
-        if not _NEGATION_RE.search(r["quote"] or ""):
+        if not quote_is_negated(r["quote"]):
             out.append(_violation("taboo_negation", r,
                                   f"{_loc(r)} quote 不含否定词：{r['quote']!r}"))
     return out
-
-
-def _topics_near(a, b):
-    """近似同主题：剥 ~/+ 前缀后相等、一方为另一方子串、或共享词根（分隔符首段）。"""
-    a = a.lstrip("~+")
-    b = b.lstrip("~+")
-    if a == b or a in b or b in a:
-        return True
-    root = lambda t: re.split(r"[\W_]+", t)[0]  # noqa: E731 首段词根
-    return bool(root(a)) and root(a) == root(b)
 
 
 def _quote_required(conn):

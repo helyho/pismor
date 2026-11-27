@@ -1,23 +1,5 @@
 """记忆条目抽取 prompt 模板与安全常量。"""
-import re
-
-# 指令类内容（注入意图）→ 不是记忆条目。按意图分支，收窄泛化动词误杀面：
-# 1) ignore 类：忽略/无视/disregard/ignore + (限定词)*(指令/提示/规则) 宾语
-# 2) reveal 类：泄露/打印/复述... + 你的/系统提示/初始指令 宾语
-# 3) obey 类：执行/follow + (你|系统|收到|上方|上述)*(命令/指令)（"运行 docker 命令"
-#    "执行测试命令"等真实用户表述不命中：触发头只留"执行"，且限定词不含任意名词）
-# 4) rm -rf 仅在"执行/运行"动词后命中；单独出现（如清理习惯）不命中
-INSTRUCTION_RE = re.compile(
-    r"(忽略|无视|disregard|ignore|forget)\s*"
-    r"((之前|以上|上述|先前|以前|above|prior|previous|所有|全部|任何|all|any|the|的)\s*){0,3}"
-    r"(指令|提示|约束|规则|instructions?|prompts?|rules?|constraints?)"
-    r"|(泄露|透露|打印|输出|复述|显示|告诉我|repeat|print|reveal|show|output)"
-    r"\s*(你的|your|the\s+)?\s*(系统提示|system\s*prompt|初始指令|initial\s+instructions?|内部提示|内部指令)"
-    r"|(执行|follow|comply\s+with)\s*(你|系统|收到的|上方|上述|the\s+|this)?\s*"
-    r"(收到|上方|上述)?\s*(的)?\s*(命令|指令|instruction)"
-    r"|(执行|运行)\s+rm\s+-rf"
-    r"|always\s+(output|follow|execute)\s+(the\s+)?(system|commands?)",
-    re.I)
+from pismor.pipeline.safety import INSTRUCTION_RE  # noqa: F401 定义权威在 pipeline/safety.py，此处仅为兼容既有 import 路径
 
 # 条目正文硬顶
 MAX_BODY = 200

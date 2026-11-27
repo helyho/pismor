@@ -86,15 +86,23 @@ def resolve(conn, user_source, user_id, candidates, llm):
     return actions
 
 
-def _neighbor_conflict(conn, user_source, user_id, c, llm):
-    """跨维度/跨 topic 近邻语义互斥检测（spec §11 第八轮）。
+class LlmUnavailable(RuntimeError):
+    """strict 模式下近邻互斥检测无法执行（LLM 缺失或调用失败）。
 
-    返回 None（无近邻或不互斥 → 走 ADD）或对端行 key 元组（互斥 → 走 CONFLICT 双存）。
-    仅 taboo↔preference 配对；对端必须是规范行（排除 ~ / + / ! 变形）。
+    管线内部路径不传 strict、静默容错；admin 手工录入路径（Task 5 create_entry）
+    传 strict=True，以此拒绝创建而非跳过跨维度互斥检查。
     """
-    dims = _NEIGHBOR_PAIRS.get(c["dimension"])
-    if not dims or not llm or not c.get("quote"):
-        return None
+
+
+def neighbor_candidates(conn, user_source: str, user_id: str, dimension: str) -> list[dict]:
+    """近邻互斥检测的候选行：dimension 的对端维度（taboo↔preference）active 规范行。
+
+    查询自 _neighbor_conflict 原样抽出：status='active'、排除 ~/+/! 变形 topic、
+    LIMIT _NEIGHBOR_LIMIT。dimension 无对端（不在 _NEIGHBOR_PAIRS）→ 空列表。
+    """
+    dims = _NEIGHBOR_PAIRS.get(dimension)
+    if not dims:
+        return []
     placeholders = ",".join("?" * len(dims))
     rows = conn.execute(
         f"SELECT dimension, topic, id, body, summary FROM entries"
@@ -102,12 +110,36 @@ def _neighbor_conflict(conn, user_source, user_id, c, llm):
         f" AND status='active' AND topic NOT LIKE '~%'"
         f" AND topic NOT LIKE '+%' AND topic NOT LIKE '!%' LIMIT ?",
         (user_source, user_id, *dims, _NEIGHBOR_LIMIT)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def neighbor_conflict(conn, user_source, user_id, candidate, llm,
+                      *, strict: bool = False) -> tuple[str, str] | None:
+    """跨维度/跨 topic 近邻语义互斥检测（spec §11 第八轮）。
+
+    返回 None（无近邻、不互斥或 LLM 缺失静默跳过）或对端行 key 元组（互斥 → CONFLICT 双存）。
+    仅 taboo↔preference 配对；对端必须是规范行（排除 ~ / + / ! 变形）。
+    strict=True（admin 手工录入路径）：候选行非空但 llm 缺失，或 LLM 调用抛任何异常
+    → raise LlmUnavailable（拒绝创建而非跳过互斥检测）；strict=False 维持管线现状语义。
+    """
+    if not candidate.get("quote"):
+        return None
+    rows = neighbor_candidates(conn, user_source, user_id, candidate["dimension"])
     if not rows:
         return None
+    if llm is None:
+        if strict:
+            raise LlmUnavailable("近邻互斥检测需要 LLM 但未提供")
+        return None
     neighbors = "\n".join(f"- [{r['id']}] {r['body']}" for r in rows)
-    resolution = llm.chat_json(NEIGHBOR_SYSTEM, NEIGHBOR_USER.format(new=c["body"],
-                                                                  neighbors=neighbors),
-                            NEIGHBOR_SCHEMA)
+    try:
+        resolution = llm.chat_json(NEIGHBOR_SYSTEM, NEIGHBOR_USER.format(new=candidate["body"],
+                                                                      neighbors=neighbors),
+                                NEIGHBOR_SCHEMA)
+    except Exception as exc:
+        if strict:
+            raise LlmUnavailable(f"近邻互斥检测 LLM 调用失败：{exc}") from exc
+        raise  # strict=False：维持现状语义，异常原样传播
     if not resolution.get("conflict"):
         return None
     # LLM 指认的对端行键优先；指认不匹配任何近邻时视为模型幻觉——
@@ -117,6 +149,11 @@ def _neighbor_conflict(conn, user_source, user_id, c, llm):
         if accused == r["id"]:
             return (r["dimension"], r["topic"])
     return None
+
+
+def _neighbor_conflict(conn, user_source, user_id, c, llm):
+    """管线内部入口（thin wrapper）：不传 strict，行为与原实现一致。"""
+    return neighbor_conflict(conn, user_source, user_id, c, llm)
 
 
 def _same_topic_taboo(conn, user_source, user_id, c):

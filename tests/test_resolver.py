@@ -1,7 +1,12 @@
 """四路决策器测试：ADD/UPDATE/CONFLICT/NOOP 判定 + ORPHAN 透传 + taboo 恒胜复合场景。"""
 import pytest
 
-from pismor.pipeline.resolver import resolve
+from pismor.pipeline.resolver import (
+    LlmUnavailable,
+    neighbor_candidates,
+    neighbor_conflict,
+    resolve,
+)
 
 
 def cand(dimension, topic, body="新候选正文", **kw):
@@ -162,3 +167,61 @@ def test_neighbor_conflict_with_matching_id(conn, seeded):
     llm = ScriptedLLM({"conflict": True, "conflicting_with": "taboo_style"})
     actions = resolve(conn, "w", "u", [cand("preference", "color")], llm)
     assert actions[0]["op"] == "CONFLICT"
+
+
+class ExplodingLLM:
+    """LLM 调用必抛错的 fake：验证 strict 模式把异常包装为 LlmUnavailable。"""
+
+    def chat_json(self, system, user, schema):
+        raise RuntimeError("llm 服务不可用")
+
+
+def test_neighbor_candidates_queries_peer_dim(conn, taxonomy, seeded):
+    # 候选查询抽出后的过滤口径：对端维度 active 规范行命中；archived / 带前缀变形不命中
+    seeded("taboo", "style")
+    seeded("taboo", "gone")           # 将改为 archived
+    seeded("taboo", "~tilde_deform")  # ~ 变形（矛盾双存行）
+    seeded("taboo", "+plus_deform")   # + 变形
+    seeded("taboo", "!bang_deform")   # ! 变形
+    conn.execute("UPDATE entries SET status='archived',"
+                 " archived_at='2026-11-01T00:00:00+08:00' WHERE topic='gone'")
+    conn.commit()
+    rows = neighbor_candidates(conn, "w", "u", "preference")
+    assert [(r["dimension"], r["topic"]) for r in rows] == [("taboo", "style")]
+    # 反向配对：查 taboo 命中 preference 规范行
+    seeded("preference", "tone")
+    rows = neighbor_candidates(conn, "w", "u", "taboo")
+    assert [(r["dimension"], r["topic"]) for r in rows] == [("preference", "tone")]
+    # LIMIT _NEIGHBOR_LIMIT(5)：6 行规范行只取前 5
+    for i in range(6):
+        seeded("taboo", f"bulk_{i}")
+    assert len(neighbor_candidates(conn, "w", "u", "preference")) == 5
+
+
+def test_strict_raises_when_llm_missing(conn, seeded):
+    # admin 手工录入路径（strict=True）：有候选行但 LLM 缺失 → 拒绝而非静默跳过
+    seeded("taboo", "style")
+    with pytest.raises(LlmUnavailable):
+        neighbor_conflict(conn, "w", "u", cand("preference", "color"), None, strict=True)
+
+
+def test_non_strict_returns_none_when_llm_missing(conn, seeded):
+    # 管线现状不变：llm 缺失时静默跳过近邻检测（容错），返回 None 走 ADD
+    seeded("taboo", "style")
+    assert neighbor_conflict(conn, "w", "u", cand("preference", "color"), None) is None
+
+
+def test_strict_raises_on_llm_error(conn, seeded):
+    # strict=True：LLM 调用抛任何异常都包装为 LlmUnavailable（拒绝创建）
+    seeded("taboo", "style")
+    with pytest.raises(LlmUnavailable):
+        neighbor_conflict(conn, "w", "u", cand("preference", "color"), ExplodingLLM(),
+                          strict=True)
+
+
+def test_no_candidates_skips_llm_even_strict(conn):
+    # 无候选行时 LLM 根本不该被调用——strict=True 也不抛（无需求即无不可用）
+    llm = ScriptedLLM({"conflict": True, "conflicting_with": "x", "reason": "不应被调用"})
+    assert neighbor_conflict(conn, "w", "u", cand("preference", "color"), llm,
+                             strict=True) is None
+    assert llm.calls == []

@@ -13,13 +13,12 @@ import math
 import re
 
 from pismor.llm.prompts import (CLARIFY_EXTRACT_SYSTEM, CLARIFY_EXTRACT_USER,
-                         EXTRACT_CONVERSATION, EXTRACT_TEXT, INSTRUCTION_RE, MAX_BODY)
+                         EXTRACT_CONVERSATION, EXTRACT_TEXT, MAX_BODY)
 from pismor.pipeline.normalize import NormalizedEvent
+from pismor.pipeline.safety import (has_sensitive_detail, normalize_topic,
+                             scan_instruction, sensitive_cap)
 
 logger = logging.getLogger("mem.extractor")
-
-# sensitive topic 概括级校验：含精确位置/医疗细节特征（数字门牌、楼栋、确诊、处方）→ 整条丢弃
-_SENSITIVE_DETAIL_RE = re.compile(r"\d+号|\d+栋|确诊|处方")
 
 _CANDIDATE_ITEM = {
     "type": "object",
@@ -122,13 +121,6 @@ def _enabled_topics(dim) -> list[str]:
     return [topic for topic in (dim.topics or []) if topic not in disabled]
 
 
-def _is_sensitive(taxonomy, dimension: str, topic: str) -> bool:
-    dim = taxonomy.dimensions.get(dimension)
-    if not dim or not dim.topic_overrides:
-        return False
-    return bool(dim.topic_overrides.get(topic, {}).get("sensitive"))
-
-
 def _to_candidate(raw: dict, taxonomy, *, max_body: int = MAX_BODY) -> dict | None:
     dimension = raw.get("dimension")
     topic_new = raw.get("topic_new")
@@ -148,9 +140,10 @@ def _to_candidate(raw: dict, taxonomy, *, max_body: int = MAX_BODY) -> dict | No
         dim = taxonomy.dimensions[dimension]
         # 别名归一先于白名单判定：同一语义的不同说法收敛到 canonical topic，
         # 否则每次换措辞都会新开一行（taboo 词表禁止运行期扩充，只能靠别名收敛）。
-        canonical = (getattr(dim, "topic_aliases", None) or {}).get(topic)
-        if canonical and canonical in (dim.topics or []):
-            topic = canonical
+        try:
+            topic = normalize_topic(taxonomy, dimension, topic)
+        except ValueError:
+            pass  # 词表外 topic 由下方 orphan/taboo 路径承接（归一权威在 safety）
         if topic in (getattr(dim, "disabled_topics", None) or []):
             logger.info("disabled topic %s/%s ignored", dimension, topic)
             return None
@@ -174,16 +167,17 @@ def _to_candidate(raw: dict, taxonomy, *, max_body: int = MAX_BODY) -> dict | No
     quote = str(raw.get("quote") or "")
     summary = str(raw.get("summary") or "")
     # 安全层 1: 指令类内容不是记忆（body/quote/summary 同扫）
-    if INSTRUCTION_RE.search(f"{body}\n{quote}\n{summary}"):
+    if scan_instruction(f"{body}\n{quote}\n{summary}"):
         return None
     confidence = float(raw.get("confidence") or 0)
     if not math.isfinite(confidence):  # F6: NaN 会让下游 `NaN < 阈值` 判定恒 False
         confidence = 0.0
     confidence = min(1.0, max(0.0, confidence))
     # 安全层 2: sensitive topic → 置信上限 0.6 + 概括级校验（含精确位置/医疗细节即丢弃）
-    if _is_sensitive(taxonomy, dimension, topic):
-        confidence = min(confidence, 0.6)
-        if _SENSITIVE_DETAIL_RE.search(f"{body} {quote}"):
+    cap = sensitive_cap(taxonomy, dimension, topic)
+    if cap is not None:
+        confidence = min(confidence, cap)
+        if has_sensitive_detail(f"{body} {quote}"):
             return None
     cand = {
         "dimension": dimension,

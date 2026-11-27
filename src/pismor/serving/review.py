@@ -10,7 +10,14 @@ from pismor.pipeline import writer
 
 
 def utcnow() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+    return datetime.now(timezone.utc).isoformat(timespec="microseconds")
+
+
+def _pending_alias(row, topic, taxonomy) -> dict | None:
+    """归一成功时给调用方的别名补写意图；只描述不落盘，由调用方在事务外处理。"""
+    if taxonomy is None or not topic:
+        return None
+    return {"dim": row["dimension"], "alias": row["topic"], "canonical": topic}
 
 
 def apply_review_decision(
@@ -28,6 +35,8 @@ def apply_review_decision(
     actor: str = "reviewer",
     topic: str | None = None,
     taxonomy=None,
+    vector: list[float] | None = None,
+    vector_requested: bool = False,
 ) -> dict:
     """执行 confirm / remove / fix；先到者生效，后到者版本失配返回 noop。
 
@@ -54,6 +63,14 @@ def apply_review_decision(
             (body, summary, now, user_source, user_id, entry_id, scope, entry_version))
         if cur.rowcount == 0:
             return {"noop": True}
+        writer.sync_entry_vector(
+            conn,
+            user_source=user_source, user_id=user_id,
+            old_dimension=row["dimension"], old_topic=row["topic"], old_scope=row["scope"],
+            new_dimension=row["dimension"], new_topic=row["topic"], new_scope=row["scope"],
+            old_body=row["body"], new_body=body if body is not None else row["body"],
+            vector=vector, vector_requested=vector_requested,
+        )
         conn.execute(
             "INSERT INTO review_history (entry_id, user_source, user_id, decision,"
             " actor, ts, note, entry_version) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
@@ -103,7 +120,11 @@ def apply_review_decision(
                     " actor, ts, note, entry_version) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                     (entry_id, user_source, user_id, "merge", actor, now,
                      note or f"merged_into:{topic}", entry_version))
-                return {"noop": False, "updated": 1, "merged_into": topic}
+                result = {"noop": False, "updated": 1, "merged_into": topic}
+                pending = _pending_alias(row, topic, taxonomy)
+                if pending is not None:
+                    result["_pending_alias"] = pending
+                return result
             new_id = entry_key(row["dimension"], topic, scope)
             cur = conn.execute(
                 "UPDATE entries SET status=?, topic=?, id=?, degraded_reason=NULL,"
@@ -118,6 +139,13 @@ def apply_review_decision(
                 "UPDATE sources SET entry_id=? WHERE user_source=? AND user_id=?"
                 " AND entry_id=?",
                 (new_id, user_source, user_id, row["id"]))
+            writer.sync_entry_vector(
+                conn,
+                user_source=user_source, user_id=user_id,
+                old_dimension=row["dimension"], old_topic=row["topic"], old_scope=scope,
+                new_dimension=row["dimension"], new_topic=topic, new_scope=scope,
+                old_body=row["body"], new_body=row["body"],
+            )
             writer.resolve_conflicts(conn, user_source, user_id, entry_id, scope, now,
                                      revive=True, clear_pending=True)
             conn.execute(
@@ -125,7 +153,11 @@ def apply_review_decision(
                 " actor, ts, note, entry_version) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 (entry_id, user_source, user_id, "rekey", actor, now,
                  note or f"rekeyed_to:{topic}", entry_version))
-            return {"noop": False, "updated": 1, "rekeyed_to": topic}
+            result = {"noop": False, "updated": 1, "rekeyed_to": topic}
+            pending = _pending_alias(row, topic, taxonomy)
+            if pending is not None:
+                result["_pending_alias"] = pending
+            return result
         new_topic, new_id = row["topic"], row["id"]
         fix_body = body if decision == "fix" else None
         fix_summary = summary if decision == "fix" else None
@@ -172,6 +204,15 @@ def apply_review_decision(
                 "UPDATE sources SET entry_id=? WHERE user_source=? AND user_id=?"
                 " AND entry_id=?",
                 (new_id, user_source, user_id, row["id"]))
+        writer.sync_entry_vector(
+            conn,
+            user_source=user_source, user_id=user_id,
+            old_dimension=row["dimension"], old_topic=row["topic"], old_scope=scope,
+            new_dimension=row["dimension"], new_topic=new_topic, new_scope=scope,
+            old_body=row["body"],
+            new_body=fix_body if fix_body is not None else row["body"],
+            vector=vector, vector_requested=vector_requested,
+        )
         # 矛盾收尾（C-1）：按 (id,scope) 清对方行标记、conflict_lost 恢复 active
         writer.resolve_conflicts(conn, user_source, user_id,
                                  entry_id, scope, now,

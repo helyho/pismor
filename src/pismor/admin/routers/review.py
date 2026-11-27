@@ -116,6 +116,7 @@ def decide(
                 taxonomy=get_taxonomy(request),
                 vector=vector,
                 vector_requested=embedder is not None,
+                taboo_merge_threshold=settings.assembler.taboo_merge_threshold,
             )
             record_admin_audit(
                 conn, principal, "review.decision",

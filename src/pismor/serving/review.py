@@ -35,6 +35,7 @@ def apply_review_decision(
     taxonomy=None,
     vector: list[float] | None = None,
     vector_requested: bool = False,
+    taboo_merge_threshold: int | None = None,
 ) -> dict:
     """执行 confirm / remove / fix；先到者生效，后到者版本失配返回 noop。
 
@@ -73,20 +74,23 @@ def apply_review_decision(
         return {"noop": False, "updated": 1}
 
     if decision == "remove":
-        # CAS：删除同样以 updated_at 为条件，行数 0 即判定作废
-        cur = conn.execute(
-            "DELETE FROM entries WHERE user_source=? AND user_id=? AND id=?"
-            " AND updated_at=?",
-            (user_source, user_id, entry_id, entry_version))
-        if cur.rowcount == 0:
+        # 复核台 remove 不连带 conflict；保留 updated_at CAS 与原有准入条件。
+        from pismor.serving.purge import purge_entry
+
+        deleted = purge_entry(
+            conn,
+            user_source=user_source,
+            user_id=user_id,
+            entry_id=entry_id,
+            cascade_conflicts=False,
+            expected_version=entry_version,
+            require_statuses=("pending_review", "active", "degraded"),
+            forbid_variants=("trace",),
+            taboo_merge_threshold=taboo_merge_threshold,
+        )
+        if not deleted:
             return {"noop": True}
-        conn.execute(
-            "DELETE FROM sources WHERE user_source=? AND user_id=? AND entry_id=?",
-            (user_source, user_id, row["id"]))
-        if conn.execute(
-                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='embeddings'"
-        ).fetchone():
-            conn.execute("DELETE FROM embeddings WHERE entry_id=?", (row["id"],))
+        return {"noop": False, "updated": 1}
     else:
         # orphan 候选 confirm → 观察区（spec §8.2 启用链入口），其余 → active
         new_status = "orphan_topic" if row["dimension"] == "orphan" else "active"

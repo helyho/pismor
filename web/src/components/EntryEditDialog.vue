@@ -4,14 +4,17 @@ import { ElMessage } from 'element-plus'
 
 import { api, ApiError } from '@/api/client'
 import type {
+  EntryDeletePreview,
   EntryEditCheck,
   EntryEditPayload,
   EntryFacets,
   EntryStatus,
   ReviewDetail,
 } from '@/api/types'
+import { useAuthStore } from '@/auth'
 import { formatError } from '@/utils/format'
 import ConflictPanel from './ConflictPanel.vue'
+import EntryDeleteConfirmDialog from './EntryDeleteConfirmDialog.vue'
 
 interface Target {
   user_source: string
@@ -28,7 +31,10 @@ const props = defineProps<{
 const emit = defineEmits<{
   'update:modelValue': [value: boolean]
   saved: []
+  deleted: []
 }>()
+
+const auth = useAuthStore()
 
 const visible = computed({
   get: () => props.modelValue,
@@ -40,6 +46,11 @@ const checking = ref(false)
 const saving = ref(false)
 const error = ref('')
 const check = ref<EntryEditCheck | null>(null)
+
+const previewing = ref(false)
+const deleting = ref(false)
+const deleteVisible = ref(false)
+const deletePreview = ref<EntryDeletePreview | null>(null)
 
 const statusLabels: Record<string, string> = {
   pending_review: '待复核',
@@ -159,10 +170,67 @@ async function saveEdit(): Promise<void> {
   }
 }
 
+async function prepareDelete(): Promise<void> {
+  if (!props.target) return
+  previewing.value = true
+  error.value = ''
+  try {
+    const params = new URLSearchParams({
+      user_source: props.target.user_source,
+      user_id: props.target.user_id,
+      entry_id: props.target.entry_id,
+      cascade: 'true',
+    })
+    deletePreview.value = await api<EntryDeletePreview>(
+      `/entries/delete-preview?${params.toString()}`,
+    )
+    deleteVisible.value = true
+  } catch (e) {
+    error.value = formatError(e)
+  } finally {
+    previewing.value = false
+  }
+}
+
+async function confirmDelete(cascade: boolean): Promise<void> {
+  if (!props.target || !deletePreview.value) return
+  deleting.value = true
+  error.value = ''
+  try {
+    const params = new URLSearchParams({
+      user_source: props.target.user_source,
+      user_id: props.target.user_id,
+      entry_id: props.target.entry_id,
+      cascade: String(cascade),
+      expected_version: deletePreview.value.target.updated_at,
+    })
+    const result = await api<{ deleted: string[] }>(`/entries?${params.toString()}`, {
+      method: 'DELETE',
+    })
+    ElMessage.success(`已删除 ${result.deleted.length} 条`)
+    deleteVisible.value = false
+    deletePreview.value = null
+    visible.value = false
+    emit('deleted')
+  } catch (e) {
+    error.value = formatError(e)
+    if (e instanceof ApiError && (e.status === 404 || e.status === 409)) {
+      deleteVisible.value = false
+    }
+  } finally {
+    deleting.value = false
+  }
+}
+
 watch(
   () => [props.modelValue, props.target] as const,
   ([open]) => {
-    if (open) void load()
+    if (open) {
+      void load()
+    } else {
+      deleteVisible.value = false
+      deletePreview.value = null
+    }
   },
   { immediate: true },
 )
@@ -260,7 +328,18 @@ watch(
       </div>
 
       <footer class="edit-footer">
-        <span class="muted">保存前会自动检查目标键冲突</span>
+        <div class="edit-footer-left">
+          <el-button
+            v-if="auth.can('memory.delete')"
+            type="danger"
+            text
+            :loading="previewing"
+            @click="prepareDelete"
+          >
+            删除这条记忆
+          </el-button>
+          <span class="muted">保存前会自动检查目标键冲突</span>
+        </div>
         <div class="edit-footer-actions">
           <el-button @click="visible = false">取消</el-button>
           <el-button :loading="checking" @click="checkEdit">检查冲突</el-button>
@@ -269,6 +348,13 @@ watch(
       </footer>
     </div>
   </el-drawer>
+
+  <EntryDeleteConfirmDialog
+    v-model="deleteVisible"
+    :preview="deletePreview"
+    :loading="deleting"
+    @confirm="confirmDelete"
+  />
 </template>
 
 <style scoped>
@@ -328,6 +414,13 @@ watch(
   border-top: 1px solid var(--app-border);
   background: rgba(255, 255, 255, 0.96);
   backdrop-filter: blur(8px);
+}
+
+.edit-footer-left {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
 }
 
 .edit-footer-actions {

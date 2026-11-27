@@ -350,6 +350,37 @@ class EntryEditOut(BaseModel):
     warnings: list[str] = Field(default_factory=list)
 
 
+class EntryDeleteTarget(BaseModel):
+    id: str
+    dimension: str
+    topic: str
+    variant: str
+    variant_seq: int
+    status: str
+    summary: str
+    updated_at: str
+
+
+class EntryDeleteCascaded(BaseModel):
+    id: str
+    variant: str
+    variant_seq: int
+    status: str
+    summary: str
+    updated_at: str
+
+
+class EntryDeletePreviewOut(BaseModel):
+    target: EntryDeleteTarget
+    cascaded: list[EntryDeleteCascaded] = Field(default_factory=list)
+    total: int
+    warnings: list[str] = Field(default_factory=list)
+
+
+class EntryDeleteOut(BaseModel):
+    deleted: list[str] = Field(default_factory=list)
+
+
 class FieldErrorOut(BaseModel):
     """字段级校验错误（entry_service.FieldError 的出参形状）。"""
     field: str

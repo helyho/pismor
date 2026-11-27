@@ -109,6 +109,13 @@ async function onEditSaved(): Promise<void> {
   queryClient.invalidateQueries({ queryKey: ['overview'] })
 }
 
+async function onEditDeleted(): Promise<void> {
+  drawerVisible.value = false
+  await detailQuery.refetch()
+  queryClient.invalidateQueries({ queryKey: ['users'] })
+  queryClient.invalidateQueries({ queryKey: ['overview'] })
+}
+
 const createVisible = ref(false)
 // 预填当前用户上下文，创建对话框内来源/用户 ID 锁定
 const createTarget = computed(() => ({ user_source: source.value, user_id: userId.value }))
@@ -503,7 +510,12 @@ async function purgeUser(): Promise<void> {
       :editable="auth.can('memory.write') && !detail?.tombstone"
       @edit="editCurrent"
     />
-    <EntryEditDialog v-model="editVisible" :target="editTarget" @saved="onEditSaved" />
+    <EntryEditDialog
+      v-model="editVisible"
+      :target="editTarget"
+      @saved="onEditSaved"
+      @deleted="onEditDeleted"
+    />
     <EntryCreateDialog
       v-model="createVisible"
       :target="createTarget"

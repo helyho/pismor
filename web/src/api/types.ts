@@ -188,6 +188,37 @@ export interface EntryEditResult {
   warnings: string[]
 }
 
+export interface EntryDeleteTarget {
+  id: string
+  dimension: string
+  topic: string
+  variant: string
+  variant_seq: number
+  status: string
+  summary: string
+  updated_at: string
+}
+
+export interface EntryDeleteCascaded {
+  id: string
+  variant: string
+  variant_seq: number
+  status: string
+  summary: string
+  updated_at: string
+}
+
+export interface EntryDeletePreview {
+  target: EntryDeleteTarget
+  cascaded: EntryDeleteCascaded[]
+  total: number
+  warnings: string[]
+}
+
+export interface EntryDeleteResult {
+  deleted: string[]
+}
+
 export interface FieldError {
   field: string
   code: string

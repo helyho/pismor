@@ -156,6 +156,16 @@ async function onEditSaved(): Promise<void> {
   void queryClient.invalidateQueries({ queryKey: ['overview'] })
 }
 
+async function onEditDeleted(): Promise<void> {
+  drawerVisible.value = false
+  await Promise.all([entriesQuery.refetch(), facetsQuery.refetch()])
+  if (page.value > 1 && (entriesQuery.data.value?.items.length ?? 0) === 0) {
+    page.value -= 1
+    await entriesQuery.refetch()
+  }
+  void queryClient.invalidateQueries({ queryKey: ['overview'] })
+}
+
 const createVisible = ref(false)
 
 // 新建成功：回到第一页（新条目按 updated_desc 排最前）并短暂高亮新行
@@ -385,6 +395,7 @@ onBeforeUnmount(() => {
       :target="editTarget"
       :facets="facets"
       @saved="onEditSaved"
+      @deleted="onEditDeleted"
     />
 
     <EntryCreateDialog

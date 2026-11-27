@@ -567,6 +567,9 @@ status='degraded' AND julianday(updated_at) < julianday(now) - 180
 - 硬删除：清空条目、证据、审计、澄清、向量，保留 tombstone 并写 `purged_at`；之后 restore 返回 `purged`。
 - tombstone 生效后：写入管线跳过且不调 LLM；装配返回空包；事件接口 410。
 - 备份中的旧数据最多滞留 30 天（由保留份数控制）。
+- 条目级物理删除：管理端 `GET /admin/api/entries/delete-preview` 预览目标与同维度同主题的全部 conflict 副本，`DELETE /admin/api/entries` 执行；公开 `DELETE /memory/{source}/{user_id}/entries/{entry_id}` 默认同样级联，目标不存在返回 204。
+- 条目级删除不可恢复：清理 entries、sources、embeddings、review_history、pending_clarifications 引用、其他行 `conflict_with` 标记与 `superseded_by` 指针，并刷新 taboo 归并任务；操作写 `admin_audit`（公开 API 的 actor 取 `x-requested-by`）。
+- 复核台 `remove` 复用同一清理逻辑，但不级联 conflict，且保留 `updated_at` 乐观锁。
 
 ### 12.2 审计
 
@@ -629,6 +632,7 @@ status='degraded' AND julianday(updated_at) < julianday(now) - 180
 | 归并任务 | `src/pismor/serving/merge_task.py` | `DbMergeTaskSink`、`upsert_open`、`resolve` |
 | 审计 | `src/pismor/serving/audit.py` | `run_audit`、`flag_violations` |
 | 删除 | `src/pismor/serving/memory.py` | `soft_delete_memory`、`restore_memory`、`hard_delete_memory` |
+| 条目删除 | `src/pismor/serving/purge.py` | `preview_entry_delete`、`purge_entry` |
 | 备份 | `src/pismor/serving/backup.py` | `backup`（`VACUUM INTO` + 滚动保留） |
 | API | `src/pismor/serving/api.py` | `/events`、`/memory`、`/review`、`/healthz` |
 | 词表 | `src/pismor/core/taxonomy.py` | `load_taxonomy`、`priority_order` |

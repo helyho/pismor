@@ -173,6 +173,7 @@ def create_app(settings: Settings, llm=None, embedder=None) -> FastAPI:
                     taxonomy=taxonomy_store.current(),
                     vector=vector,
                     vector_requested=embedder is not None,
+                    taboo_merge_threshold=s.assembler.taboo_merge_threshold,
                 )
             # 别名落盘在事务提交之后：文件写失败不影响已提交的复核结果
             pending = result.pop("_pending_alias", None) if isinstance(result, dict) else None
@@ -196,6 +197,49 @@ def create_app(settings: Settings, llm=None, embedder=None) -> FastAPI:
                 soft_delete_memory(conn, user_source=source, user_id=native_id,
                                     requested_by=requested_by)
         return {"deleted": True, "mode": "soft"}
+
+    @app.delete("/memory/{source}/{native_id}/entries/{entry_id}")
+    def delete_memory_entry(source: str, native_id: str, entry_id: str, request: Request):
+        from fastapi import Response
+
+        from pismor.admin.audit import record_actor_audit
+        from pismor.core.keys import display_key
+        from pismor.serving.purge import purge_entry
+
+        requested_by = request.headers.get("x-requested-by", "api")
+        s = settings_store.current()
+        with closing(get_conn(s.db_path)) as conn:
+            if is_tombstoned(conn, source, native_id):
+                return JSONResponse({"detail": "memory deleted"}, status_code=410)
+            target = conn.execute(
+                "SELECT dimension, topic FROM entries"
+                " WHERE user_source=? AND user_id=? AND id=?",
+                (source, native_id, entry_id),
+            ).fetchone()
+            if target is None:
+                return Response(status_code=204)
+            with conn:
+                deleted = purge_entry(
+                    conn,
+                    user_source=source,
+                    user_id=native_id,
+                    entry_id=entry_id,
+                    cascade_conflicts=True,
+                    taboo_merge_threshold=s.assembler.taboo_merge_threshold,
+                )
+                record_actor_audit(
+                    conn,
+                    requested_by,
+                    "entry.delete.public",
+                    display_key(target["dimension"], target["topic"]),
+                    {
+                        "user_source": source,
+                        "user_id": native_id,
+                        "entry_id": entry_id,
+                        "deleted_ids": deleted,
+                    },
+                )
+        return {"deleted": deleted}
 
     @app.get("/healthz")
     def healthz():

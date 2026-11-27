@@ -207,7 +207,7 @@ def test_confirm_remove_fix_and_noop(tmp_path):
         ).fetchone()
     assert (entry["summary"], entry["body"]) == ("fixed summary", "fixed body")
 
-    # remove：条目与证据链删除，处理历史保留
+    # remove：条目、证据链与其处理历史一并物理删除
     with closing(get_conn(db_path)) as conn:
         current = conn.execute(
             "SELECT updated_at FROM entries WHERE id=?", (entry_id,)
@@ -227,7 +227,7 @@ def test_confirm_remove_fix_and_noop(tmp_path):
         assert conn.execute("SELECT COUNT(*) FROM sources").fetchone()[0] == 0
         decisions = [row[0] for row in conn.execute(
             "SELECT decision FROM review_history ORDER BY rowid")]
-    assert decisions == ["confirm", "fix", "remove"]
+    assert decisions == []
 
 
 def test_detail_404_and_capability(tmp_path):

@@ -70,10 +70,10 @@ def _run(conn, settings: Settings, event, taxonomy, llm, embedder) -> None:
     us, uid = event["source"], event["user_ref"]
     if conn.execute("SELECT 1 FROM tombstones WHERE user_source=? AND user_id=?",
                     (us, uid)).fetchone():
-        # 删除权（spec §16#4）：tombstone 为永久口径——删除后不再收集新画像，也不调 LLM
+        # 删除权（spec §16#4）：tombstone 为永久口径——删除后不再收集新记忆条目，也不调 LLM
         logger.info("pipeline skip for deleted user %s/%s", us, uid)
         return
-    now = event.get("ts") or datetime.now(timezone.utc).isoformat(timespec="seconds")
+    now = event.get("ts") or datetime.now(timezone.utc).isoformat(timespec="microseconds")
     ev = normalize(event)
     origin_type = ev.event_type
     origin_ref = event.get("origin_ref") or event.get("event_id") or canonical_hash(event)
@@ -226,7 +226,7 @@ def _settle_pair(conn, us, uid, pair_rows, applied_keys, now) -> None:
                 continue
             key = (row["dimension"], row["topic"], row["scope"])
             if row["topic"].startswith("+"):
-                # 冲突对方（+ 变形行）不再是活跃画像：归档为轨迹（不物理删除）
+                # 冲突对方（+ 变形行）不再是活跃记忆条目：归档为轨迹（不物理删除）
                 conn.execute(
                     "UPDATE entries SET status='archived', archived_at=?, conflict_with=NULL,"
                     " degraded_reason=NULL, updated_at=? WHERE user_source=? AND user_id=?"

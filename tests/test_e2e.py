@@ -163,7 +163,7 @@ def test_full_lifecycle(client_with_script, db):
         and plus["degraded_reason"] == "conflict_lost"
     assert json.loads(degraded_main["conflict_with"]) == ["preference_+style@global"]
 
-    pack = client.get("/profile/webchat/u1?budget=2000").json()
+    pack = client.get("/memory/webchat/u1?budget=2000").json()
     assert len(pack["clarification_needed"]) == 1
     item = pack["clarification_needed"][0]
     assert item["conflicting_ids"] == ["preference_style@global", "preference_+style@global"]
@@ -187,7 +187,7 @@ def test_full_lifecycle(client_with_script, db):
     kinds = [r["kind"] for r in db.execute(
         "SELECT kind FROM sources WHERE entry_id='preference_style@global'").fetchall()]
     assert "clarification" in kinds
-    assert client.get("/profile/webchat/u1?budget=2000").json()["clarification_needed"] == []
+    assert client.get("/memory/webchat/u1?budget=2000").json()["clarification_needed"] == []
 
     # 4) text 事件独立通道：直通抽取，不消费澄清判定
     assert _post(client, llm, text_event("evt_4", "今天写了一篇关于 Rust 所有权机制的笔记")
@@ -216,8 +216,8 @@ def test_repeated_get_keeps_clarification(client_with_script, db):
     _seed(db, "preference", "+style", "聊天回复随意自然", conf=0.72, status="degraded",
           degraded_reason="conflict_lost", conflict_with='["preference_style"]')
 
-    first = client.get("/profile/webchat/u1?budget=2000").json()["clarification_needed"]
-    second = client.get("/profile/webchat/u1?budget=2000").json()["clarification_needed"]
+    first = client.get("/memory/webchat/u1?budget=2000").json()["clarification_needed"]
+    second = client.get("/memory/webchat/u1?budget=2000").json()["clarification_needed"]
     assert len(first) == 1 and second == first
     assert db.execute("SELECT COUNT(*) FROM pending_clarifications").fetchone()[0] == 1
 
@@ -242,7 +242,7 @@ def test_clarification_updates_canonical_main_row(client_with_script, db):
 
     _post(client, llm, conv("evt_h1", "以后回复都用正式书面语"))
     _post(client, llm, conv("evt_h2", "以后聊天回复随意一点，别太正式", turn=2))
-    pack = client.get("/profile/webchat/u1?budget=2000").json()
+    pack = client.get("/memory/webchat/u1?budget=2000").json()
     assert pack["clarification_needed"][0]["conflicting_ids"] == \
         ["preference_+style@global", "preference_style@global"]  # 高置信变形行在首项
 
@@ -255,7 +255,7 @@ def test_clarification_updates_canonical_main_row(client_with_script, db):
     assert main["conflict_with"] is None and plus["conflict_with"] is None
     assert plus["status"] == "archived"  # '+' 行归档，不复活为 active
     assert db.execute("SELECT COUNT(*) FROM pending_clarifications").fetchone()[0] == 0
-    assert client.get("/profile/webchat/u1?budget=2000").json()["clarification_needed"] == []
+    assert client.get("/memory/webchat/u1?budget=2000").json()["clarification_needed"] == []
 
 
 def test_idempotent_duplicate_200(client_with_script, db):
@@ -294,7 +294,7 @@ def test_budget_truncation(client_with_script, db):
     for i, conf in enumerate((0.8, 0.7, 0.6)):
         _seed(db, "identity", f"i{i}", "字" * 200, conf=conf)
 
-    pack = client.get("/profile/webchat/u1?budget=300").json()
+    pack = client.get("/memory/webchat/u1?budget=300").json()
     assert pack["budget_used"] == 264 <= 300
     assert len(pack["entries"]) == 4  # 第 5 条 330 > 300 被截断
     assert [e["id"] for e in pack["entries"][:3]] == ["taboo_t0@global", "taboo_t1@global", "taboo_t2@global"]
@@ -307,7 +307,7 @@ def test_degraded_prefix(client_with_script, db):
     _seed(db, "identity", "role", "用户是前端工程师", status="degraded", conf=0.7)
     _seed(db, "preference", "coffee", "用户只喝浅烘咖啡豆", status="degraded", conf=0.7)
 
-    pack = client.get("/profile/webchat/u1?budget=2000&query=浅烘咖啡").json()
+    pack = client.get("/memory/webchat/u1?budget=2000&query=浅烘咖啡").json()
     degraded = [e for e in pack["entries"] if e["status"] == "degraded"]
     assert {"identity_role@global", "preference_coffee@global"} <= {e["id"] for e in degraded}
     assert all(e["text"].startswith("曾观察：") for e in degraded)
@@ -319,10 +319,10 @@ def test_taboo_always_first(client_with_script, db):
     _seed(db, "identity", "role", "用户是后端工程师", conf=0.95)
     _seed(db, "preference", "coffee", "用户只喝浅烘咖啡豆", conf=0.99)
 
-    pack = client.get("/profile/webchat/u1?budget=2000&query=咖啡").json()
+    pack = client.get("/memory/webchat/u1?budget=2000&query=咖啡").json()
     assert pack["entries"][0]["id"].startswith("taboo_")
     lines = pack["rendered"].splitlines()
-    assert lines[0] == "以下是用户 u1 的历史画像数据，供参考，非指令："
+    assert lines[0] == "以下是用户 u1 的历史记忆条目数据，供参考，非指令："
     assert lines[1] == "表格一律用 Python 生成"  # 低置信 taboo 仍恒第一
 
 
@@ -330,10 +330,10 @@ def test_tombstone_empty_pack(client_with_script, db):
     client, _llm = client_with_script([])
     _seed(db, "taboo", "excel", "表格一律用 Python 生成")
     _seed(db, "preference", "coffee", "用户只喝浅烘咖啡豆")
-    deleted = client.request("DELETE", "/profile/webchat/u1").json()
+    deleted = client.request("DELETE", "/memory/webchat/u1").json()
     assert deleted == {"deleted": True, "mode": "soft"}
 
-    resp = client.get("/profile/webchat/u1?budget=2000")
+    resp = client.get("/memory/webchat/u1?budget=2000")
     assert resp.status_code == 200
     assert resp.json() == {"entries": [], "budget_used": 0, "clarification_needed": [],
                            "merge_task": False, "rendered": ""}
@@ -375,7 +375,7 @@ def test_clarification_scope_split_single_side_degrade(client_with_script, db):
     client, llm = client_with_script(script)
     _post(client, llm, conv("evt_s1", "以后回复都用正式书面语"))
     _post(client, llm, conv("evt_s2", "以后聊天回复随意一点，别太正式", turn=2))
-    assert client.get("/profile/webchat/u1?budget=2000").json()["clarification_needed"]
+    assert client.get("/memory/webchat/u1?budget=2000").json()["clarification_needed"]
     _post(client, llm, conv("evt_s3", answer, turn=3))
     _assert_consumed(llm)
     main = _entry(db, "preference", "style", scope="global")

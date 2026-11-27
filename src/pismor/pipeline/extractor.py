@@ -1,4 +1,4 @@
-"""事件 → 画像候选：对话/文本双模板抽取 + 指令/敏感安全防线 + 澄清回答规范化。
+"""事件 → 记忆条目候选：对话/文本双模板抽取 + 指令/敏感安全防线 + 澄清回答规范化。
 
 Candidate 键固定：dimension/topic/scope/body/summary/confidence/kind/quote/topic_new，
 orphan 候选额外带 status="orphan_topic"（dimension 占位 "orphan"）。
@@ -8,9 +8,10 @@ orphan 候选额外带 status="orphan_topic"（dimension 占位 "orphan"）。
   topic_new 作观察区键）；taboo 维度词表外候选强制人工队列（force_review），不得自动建桶。
 - summary 在出口截断到 20 字（spec §5）。
 - scope 非法（白名单外自由文本）在出口回落 default_scope 并置信打 8 折，不再由写入器
-  整条丢弃——画像不因 LLM 的格式方差静默消失（黑盒发现⑤的修复）。
+  整条丢弃——记忆不因 LLM 的格式方差静默消失（黑盒发现⑤的修复）。
 """
 import logging
+import math
 import re
 
 from pismor.core.keys import valid_scope
@@ -53,7 +54,7 @@ _CLARIFY_SCHEMA = _schema("clarify_candidates")
 
 def extract(ev: NormalizedEvent, taxonomy, llm, known_ids: list[str], *,
             max_body: int = MAX_BODY) -> list[dict]:
-    """单事件抽取画像候选。dialogue/document 走各自模板；逐条过滤后返回。"""
+    """单事件抽取记忆条目候选。dialogue/document 走各自模板；逐条过滤后返回。"""
     block = _dimension_block(taxonomy)
     ids_line = ", ".join(known_ids) if known_ids else "（无）"
     if ev.mode == "document":
@@ -71,7 +72,7 @@ def extract(ev: NormalizedEvent, taxonomy, llm, known_ids: list[str], *,
 
 def extract_clarification(answer: str, taxonomy, llm, pair_rows, *,
                           max_body: int = MAX_BODY) -> list[dict]:
-    """把澄清回答规范化为画像候选（body/summary 来自抽取，不直接使用用户原句）。
+    """把澄清回答规范化为记忆条目候选（body/summary 来自抽取，不直接使用用户原句）。
 
     pair_rows 为矛盾对现存行（dimension/topic/scope/summary），仅作理解上下文。
     输出候选 kind 统一为 clarification（证据类别，spec §5/§11），scope 可拆分。
@@ -90,7 +91,10 @@ def extract_clarification(answer: str, taxonomy, llm, pair_rows, *,
         if not cand.get("quote"):
             cand["quote"] = answer
         cand["kind"] = "clarification"
-        cand["confidence"] = max(float(cand.get("confidence") or 0), 0.85)
+        _conf = float(cand.get("confidence") or 0)
+        if not math.isfinite(_conf):  # F6: NaN 使 max/比较失效，先归零
+            _conf = 0.0
+        cand["confidence"] = max(_conf, 0.85)
         out.append(cand)
     return out
 
@@ -173,10 +177,13 @@ def _to_candidate(raw: dict, taxonomy, *, max_body: int = MAX_BODY) -> dict | No
     body = str(raw.get("body") or "")
     quote = str(raw.get("quote") or "")
     summary = str(raw.get("summary") or "")
-    # 安全层 1: 指令类内容不是画像（body/quote/summary 同扫）
+    # 安全层 1: 指令类内容不是记忆（body/quote/summary 同扫）
     if INSTRUCTION_RE.search(f"{body}\n{quote}\n{summary}"):
         return None
     confidence = float(raw.get("confidence") or 0)
+    if not math.isfinite(confidence):  # F6: NaN 会让下游 `NaN < 阈值` 判定恒 False
+        confidence = 0.0
+    confidence = min(1.0, max(0.0, confidence))
     # 安全层 2: sensitive topic → 置信上限 0.6 + 概括级校验（含精确位置/医疗细节即丢弃）
     if _is_sensitive(taxonomy, dimension, topic):
         confidence = min(confidence, 0.6)

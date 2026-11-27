@@ -145,3 +145,20 @@ def test_pending_review_taboo_does_not_force_conflict(conn, seeded_taboo_and_pre
     llm = ScriptedLLM({"decision": "UPDATE", "target": [], "reason": "演进"})
     actions = resolve(conn, "w", "u", [cand("preference", "style", "global")], llm)
     assert actions[0]["op"] == "UPDATE"
+
+
+def test_neighbor_conflict_hallucinated_id_falls_back_to_add(conn, seeded):
+    # F4: LLM 指认的 conflicting_with 不匹配任何近邻时是幻觉——
+    # 旧实现回退首行，会把无关 active 行拖进矛盾双存并降级×0.8；改为宁当轮 ADD
+    seeded("taboo", "style", "global")
+    llm = ScriptedLLM({"conflict": True, "conflicting_with": "hallucinated_id"})
+    actions = resolve(conn, "w", "u", [cand("preference", "color", "global")], llm)
+    assert actions[0]["op"] == "ADD"
+
+
+def test_neighbor_conflict_with_matching_id(conn, seeded):
+    # 近邻路径回归：指认匹配现存近邻 id → 照常 CONFLICT
+    seeded("taboo", "style", "global")
+    llm = ScriptedLLM({"conflict": True, "conflicting_with": "taboo_style_global"})
+    actions = resolve(conn, "w", "u", [cand("preference", "color", "global")], llm)
+    assert actions[0]["op"] == "CONFLICT"

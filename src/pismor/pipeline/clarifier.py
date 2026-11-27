@@ -25,7 +25,7 @@ ANSWER_CHECK_SCHEMA = {
 
 
 def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+    return datetime.now(timezone.utc).isoformat(timespec="microseconds")
 
 
 def issue(conn, user_source, user_id, conflicting_ids, summaries,
@@ -39,7 +39,7 @@ def issue_many(conn, user_source, user_id, pairs, ttl_days: int = 7, *,
                commit: bool = True) -> list[str]:
     """批量落 pending_clarifications，返回与 pairs 等长的 question 列表。
 
-    pairs: [(conflicting_ids, summaries)]。全部行在同一事务内写入——GET /profile 装配
+    pairs: [(conflicting_ids, summaries)]。全部行在同一事务内写入——GET /memory 装配
     路径可能一次产出多对，逐对提交会放大 WAL 写锁竞争（审查 #7）；commit=False 供日批
     等外层事务复用，避免提前提交破坏单事务（审查 #19）。
     summaries 以条目关联标记（id@scope）为键；取 conflicting_ids 前两个标记对应摘要

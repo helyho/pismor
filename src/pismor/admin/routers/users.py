@@ -1,4 +1,4 @@
-"""用户列表、删除记录、画像详情、装配预览与删除。"""
+"""用户列表、删除记录、记忆详情、装配预览与删除。"""
 from contextlib import closing
 from typing import Literal
 
@@ -20,10 +20,10 @@ from pismor.core.db import get_conn
 from pismor.core.keys import valid_scope
 from pismor.serving import assembler
 from pismor.serving.merge_task import DbMergeTaskSink
-from pismor.serving.profile import (
-    hard_delete_profile,
-    restore_profile,
-    soft_delete_profile,
+from pismor.serving.memory import (
+    hard_delete_memory,
+    restore_memory,
+    soft_delete_memory,
 )
 
 
@@ -38,7 +38,7 @@ def users(
     q: str | None = None,
     user_source: str | None = None,
     order: Literal["recent", "oldest", "entries"] = "recent",
-    _principal=Depends(require("profile.read")),
+    _principal=Depends(require("memory.read")),
 ):
     settings = get_settings(request)
     with closing(get_conn(settings.db_path)) as conn:
@@ -54,7 +54,7 @@ def tombstones(
     page: int = Query(1, ge=1),
     page_size: int = Query(50, ge=1, le=200),
     q: str | None = None,
-    _principal=Depends(require("profile.read")),
+    _principal=Depends(require("memory.read")),
 ):
     settings = get_settings(request)
     with closing(get_conn(settings.db_path)) as conn:
@@ -66,7 +66,7 @@ def user_detail(
     user_source: str,
     user_id: str,
     request: Request,
-    _principal=Depends(require("profile.read")),
+    _principal=Depends(require("memory.read")),
 ):
     settings = get_settings(request)
     with closing(get_conn(settings.db_path)) as conn:
@@ -83,10 +83,10 @@ def user_assemble(
     request: Request,
     budget: int = Query(2000, ge=1, le=100000),
     dimensions: str | None = None,
-    include_profile: bool = True,
+    include_memory: bool = True,
     query: str | None = None,
     scope: str | None = None,
-    _principal=Depends(require("profile.read")),
+    _principal=Depends(require("memory.read")),
 ):
     settings = get_settings(request)
     dims = [d.strip() for d in dimensions.split(",") if d.strip()] if dimensions else None
@@ -101,7 +101,7 @@ def user_assemble(
             user_id,
             budget=budget,
             dimensions=dims,
-            include_profile=include_profile,
+            include_memory=include_memory,
             query=query,
             current_scope=scope,
             audit_sink=DbMergeTaskSink(settings.db_path, user_source, user_id, scope),
@@ -121,17 +121,17 @@ def delete_user(
     user_source: str,
     user_id: str,
     request: Request,
-    principal: Principal = Depends(require("profile.delete")),
+    principal: Principal = Depends(require("memory.delete")),
 ):
     settings = get_settings(request)
     with closing(get_conn(settings.db_path)) as conn:
         with conn:
-            soft_delete_profile(
+            soft_delete_memory(
                 conn, user_source=user_source, user_id=user_id,
                 requested_by=principal.subject,
             )
             record_admin_audit(
-                conn, principal, "profile.delete", f"{user_source}/{user_id}",
+                conn, principal, "memory.delete", f"{user_source}/{user_id}",
                 {"requested_by": principal.subject, "mode": "soft"},
             )
     return {"deleted": True, "mode": "soft"}
@@ -142,18 +142,18 @@ def restore_user(
     user_source: str,
     user_id: str,
     request: Request,
-    principal: Principal = Depends(require("profile.write")),
+    principal: Principal = Depends(require("memory.write")),
 ):
     settings = get_settings(request)
     with closing(get_conn(settings.db_path)) as conn:
         with conn:
-            result = restore_profile(conn, user_source=user_source, user_id=user_id)
+            result = restore_memory(conn, user_source=user_source, user_id=user_id)
             if result is None:
                 raise HTTPException(status_code=404, detail="delete record not found")
             if result == "purged":
-                raise HTTPException(status_code=409, detail="profile already purged")
+                raise HTTPException(status_code=409, detail="memory already purged")
             record_admin_audit(
-                conn, principal, "profile.restore", f"{user_source}/{user_id}", {},
+                conn, principal, "memory.restore", f"{user_source}/{user_id}", {},
             )
     return {"restored": True}
 
@@ -163,16 +163,16 @@ def purge_user(
     user_source: str,
     user_id: str,
     request: Request,
-    principal: Principal = Depends(require("profile.delete")),
+    principal: Principal = Depends(require("memory.delete")),
 ):
     settings = get_settings(request)
     with closing(get_conn(settings.db_path)) as conn:
         with conn:
-            hard_delete_profile(
+            hard_delete_memory(
                 conn, user_source=user_source, user_id=user_id,
                 requested_by=principal.subject,
             )
             record_admin_audit(
-                conn, principal, "profile.purge", f"{user_source}/{user_id}", {},
+                conn, principal, "memory.purge", f"{user_source}/{user_id}", {},
             )
     return {"purged": True}

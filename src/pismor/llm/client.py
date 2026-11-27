@@ -15,6 +15,13 @@ class LLMClient:
     def __init__(self, settings: LLMSettings):
         self._settings = settings
         self._url = settings.endpoint.rstrip("/") + "/chat/completions"
+        # F19: 实例级连接复用——一次任务内多次 chat_json（resolve 逐 candidate）共享连接池
+        self._client: httpx.Client | None = None
+
+    def _http(self) -> httpx.Client:
+        if self._client is None:
+            self._client = httpx.Client(timeout=self._settings.timeout_seconds)
+        return self._client
 
     def _headers(self) -> dict:
         headers = {"Content-Type": "application/json"}
@@ -49,8 +56,7 @@ class LLMClient:
             if self._settings.structured_output_type == "json_schema":
                 fmt["json_schema"] = schema
             payload[self._settings.structured_output_param] = fmt
-        with httpx.Client(timeout=self._settings.timeout_seconds) as client:
-            return client.post(self._url, headers=self._headers(), json=payload)
+        return self._http().post(self._url, headers=self._headers(), json=payload)
 
     def _backoff(self, attempt: int, response: httpx.Response | None = None) -> float:
         """重试间隔：指数退避；429 若带数值 Retry-After 则取其较大者。"""

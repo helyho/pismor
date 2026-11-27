@@ -18,6 +18,7 @@ from pismor.admin.schemas import (
     ReviewDetailOut,
 )
 from pismor.core.db import get_conn
+from pismor.pipeline import writer
 
 
 router = APIRouter(prefix="/admin/api/entries", tags=["admin-entries"])
@@ -40,7 +41,7 @@ def entries(
     updated_from: str | None = None,
     updated_to: str | None = None,
     order: Literal["updated_desc", "updated_asc", "confidence_desc"] = "updated_desc",
-    _principal=Depends(require("profile.read")),
+    _principal=Depends(require("memory.read")),
 ):
     settings = get_settings(request)
     with closing(get_conn(settings.db_path)) as conn:
@@ -64,7 +65,7 @@ def entries(
 
 
 @router.get("/facets", response_model=EntryFacetsOut)
-def facets(request: Request, _principal=Depends(require("profile.read"))):
+def facets(request: Request, _principal=Depends(require("memory.read"))):
     settings = get_settings(request)
     with closing(get_conn(settings.db_path)) as conn:
         return get_entry_facets(conn)
@@ -77,7 +78,7 @@ def entry_detail(
     user_id: str,
     entry_id: str,
     scope: str,
-    _principal=Depends(require("profile.read")),
+    _principal=Depends(require("memory.read")),
 ):
     settings = get_settings(request)
     with closing(get_conn(settings.db_path)) as conn:
@@ -97,7 +98,7 @@ def entry_detail(
 def validate_edit(
     payload: EntryEditIn,
     request: Request,
-    _principal=Depends(require("profile.write")),
+    _principal=Depends(require("memory.write")),
 ):
     settings = get_settings(request)
     taxonomy = get_taxonomy(request)
@@ -124,11 +125,19 @@ def validate_edit(
 def edit_entry(
     payload: EntryEditIn,
     request: Request,
-    principal=Depends(require("profile.write")),
+    principal=Depends(require("memory.write")),
 ):
     settings = get_settings(request)
     taxonomy = get_taxonomy(request)
+    embedder = getattr(request.app.state, "embedder", None)
     with closing(get_conn(settings.db_path)) as conn:
+        # 向量在写事务外预计算（writer 的既有原则：网络 IO 不持有 WAL 写锁）
+        current = conn.execute(
+            "SELECT body FROM entries WHERE user_source=? AND user_id=? AND id=? AND scope=?",
+            (payload.user_source, payload.user_id, payload.entry_id, payload.scope),
+        ).fetchone()
+        body_changed = current is not None and payload.body.strip() != current["body"]
+        vector = writer.compute_vector(embedder, payload.body) if body_changed else None
         with conn:
             result = apply_entry_edit(
                 conn,
@@ -146,6 +155,8 @@ def edit_entry(
                 summary=payload.summary,
                 body=payload.body,
                 degraded_reason=payload.degraded_reason,
+                vector=vector,
+                vector_requested=embedder is not None,
             )
             if not result["ok"]:
                 status_code = 409 if result.get("stale") or result.get("conflicts") else 422

@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# 域2 装配（T9-T13）：GET /profile 包结构、维度入包、用户隔离、query 召回
+# 域2 装配（T9-T13）：GET /memory 包结构、维度入包、用户隔离、query 召回
 # event_id 一律经 next_event_id 生成：retry 重跑拿新 id，不撞产品幂等去重
 # T9 空包合法：结构五键齐全，永不 5xx
 t9() {
-  http GET /profile/bb/nobody
+  http GET /memory/bb/nobody
   expect_status 200 || return 1
   expect_json '.entries' '[]' || return 1
   local k
@@ -22,7 +22,7 @@ t10() {
   wait_db "SELECT 1 FROM entries e WHERE e.user_id='t9u' AND e.dimension='taboo'" 90 \
     || { case_fail "90s 内 taboo 条目未入库"; }
   activate_entry t9u taboo || return 1
-  http GET /profile/bb/t9u
+  http GET /memory/bb/t9u
   expect_status 200 || return 1
   expect_json '[.entries[] | select(.id | startswith("taboo"))] | length > 0' 'true' || return 1
   expect_json '.entries[0].id | startswith("taboo")' 'true' || return 1
@@ -37,12 +37,12 @@ t11() {
   wait_db "SELECT 1 FROM entries e WHERE e.user_id='t10u' AND e.dimension='identity'" 90 \
     || { case_fail "90s 内 identity 条目未入库"; }
   activate_entry t10u identity || return 1
-  http GET /profile/bb/t10u
+  http GET /memory/bb/t10u
   expect_status 200 || return 1
   expect_json '[.entries[] | select(.id | startswith("identity"))] | length > 0' 'true' || return 1
   case_pass
 }
-# T12 用户隔离：u 有画像后，其他 user / 其他 source 均为空包
+# T12 用户隔离：u 有记忆后，其他 user / 其他 source 均为空包
 t12() {
   need_llm || return 2
   local ev; ev=$(next_event_id t11e)
@@ -51,13 +51,13 @@ t12() {
   wait_db "SELECT 1 FROM entries e WHERE e.user_id='t11u' AND e.dimension='preference'" 90 \
     || { case_fail "90s 内条目未入库"; }
   # 无 query 的包只含必带集(taboo+identity)；preference 经 query 召回验证在包
-  http GET "/profile/bb/t11u?query=python"
+  http GET "/memory/bb/t11u?query=python"
   expect_status 200 || return 1
   expect_json '.entries | length > 0' 'true' || return 1
-  http GET /profile/bb/t11other
+  http GET /memory/bb/t11other
   expect_status 200 || return 1
   expect_json '.entries' '[]' || return 1
-  http GET /profile/app/t11u
+  http GET /memory/app/t11u
   expect_status 200 || return 1
   expect_json '.entries' '[]' || return 1
   case_pass
@@ -84,7 +84,7 @@ t13() {
     wait_db "SELECT 1 FROM entries e WHERE e.user_source='bb' AND e.user_id='t12u' AND e.status='active'" 15 \
       && break
   done
-  http GET "/profile/bb/t12u?query=python"
+  http GET "/memory/bb/t12u?query=python"
   expect_status 200 || return 1
   expect_json '.entries | length > 0' 'true' || return 1
   # 命中条目正文（.text）而非 id——id 形如 preference_lang 会自命中"lang"造成同义反复

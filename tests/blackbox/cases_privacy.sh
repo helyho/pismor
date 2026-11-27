@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # 域4 删除权（T19-T20）：删除全链、tombstone 持续
 # event_id 一律经 next_event_id 生成：retry 重跑拿新 id，不撞产品幂等去重
-# T19 删除权全链（LLM 自建数据）：tombstones 留痕、软删除保留关联表、profile 空包
+# T19 删除权全链（LLM 自建数据）：tombstones 留痕、软删除保留关联表、memory 空包
 t18() {
   need_llm || return 2
   local ev; ev=$(next_event_id t19e)
@@ -12,19 +12,19 @@ t18() {
   local ids
   ids=$(db "SELECT group_concat(id) FROM entries WHERE user_source='bb' AND user_id='t19u'")
   [[ -n "$ids" ]] || { case_fail "未取到条目 id，删除链无数据可验"; }
-  http DELETE /profile/bb/t19u
+  http DELETE /memory/bb/t19u
   expect_status 200 || return 1
   expect_json_true '.deleted' || return 1
   expect_db "SELECT count(*) FROM tombstones WHERE user_source='bb' AND user_id='t19u' AND requested_by='api'" "1" || return 1
   expect_db "SELECT count(*) FROM entries WHERE user_source='bb' AND user_id='t19u'" "1" || return 1
-  expect_db "SELECT count(*) FROM sources WHERE user_source='bb' AND user_id='t19u' > 0" "1" || return 1
+  expect_db "SELECT CASE WHEN count(*)>0 THEN 1 ELSE 0 END FROM sources WHERE user_source='bb' AND user_id='t19u'" "1" || return 1
   expect_db "SELECT count(*) FROM tombstones WHERE user_source='bb' AND user_id='t19u' AND purged_at IS NULL" "1" || return 1
-  http GET /profile/bb/t19u
+  http GET /memory/bb/t19u
   expect_status 200 || return 1
   expect_json '.entries' '[]' || return 1
   case_pass
 }
-# T20 tombstone 持续（LLM）：删后含触发词事件不得复活画像
+# T20 tombstone 持续（LLM）：删后含触发词事件不得复活记忆
 t19() {
   need_llm || return 2
   local e1 e2
@@ -34,15 +34,15 @@ t19() {
   expect_status 202 || return 1
   wait_db "SELECT 1 FROM entries e WHERE e.user_id='t20u'" 90 \
     || { case_fail "90s 内条目未入库"; }
-  http DELETE /profile/bb/t20u
+  http DELETE /memory/bb/t20u
   expect_status 200 || return 1
   expect_json_true '.deleted' || return 1
   http POST /events "$(bb_event t20u "$e2" "记住, 我自己的小脚本默认都用 Python 写")"
   expect_status 410 || return 1
   # 产品语义：tombstone 在 intake 前拦截——新事件不写 events_seen、不调 LLM、不写库
   expect_db "SELECT count(*) FROM entries WHERE user_source='bb' AND user_id='t20u'" "1" || return 1
-  expect_db "SELECT count(*) FROM sources WHERE user_source='bb' AND user_id='t20u' > 0" "1" || return 1
-  http GET /profile/bb/t20u
+  expect_db "SELECT CASE WHEN count(*)>0 THEN 1 ELSE 0 END FROM sources WHERE user_source='bb' AND user_id='t20u'" "1" || return 1
+  http GET /memory/bb/t20u
   expect_status 200 || return 1
   expect_json '.entries' '[]' || return 1
   case_pass

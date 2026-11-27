@@ -1,14 +1,18 @@
 """Task 13 API 测试：FastAPI TestClient + FakeLLM/Embedder 依赖注入（brief Step 1）。"""
+from contextlib import closing
 from pathlib import Path
 import json
+import shutil
 
 import pytest
+import yaml
 from fastapi.testclient import TestClient
 
 from pismor.serving.api import create_app
 from pismor.core.config import EmbeddingSettings, LLMSettings, Settings
 from pismor.serving.backup import backup
 from pismor.core.db import get_conn, init_schema
+from pismor.core.taxonomy import load_taxonomy
 from pismor.pipeline.runner import run_pipeline
 from pismor.pipeline.normalize import normalize
 from pismor.pipeline.trigger import build_explicit_re, should_extract as _should_extract
@@ -143,6 +147,11 @@ def test_malformed_422(client):  # 缺 user_ref/ts → intake ValidationError �
     assert r.status_code == 422
 
 
+def test_control_char_user_ref_422(client):  # F5：键成分含 \x1f 会撞 vec_key，422 拒收
+    ev = dict(CONV_EVENT, user_ref="u\x1fa")
+    assert client.post("/events", json=ev).status_code == 422
+
+
 def test_assistant_only_conversation_422(client):
     # 入口硬约束：messages 必须含至少一条 user，否则 422（不落库、不进管线）
     ev = dict(CONV_EVENT, event_id="evt_no_user",
@@ -150,14 +159,14 @@ def test_assistant_only_conversation_422(client):
     assert client.post("/events", json=ev).status_code == 422
 
 
-def test_profile_after_pipeline(client, fake_llm, wait_for_pipeline):
+def test_memory_after_pipeline(client, fake_llm, wait_for_pipeline):
     fake_llm.by_name["extract_candidates"] = [{"candidates": [dict(EXPLICIT_CAND)]}]
     client.post("/events", json=CONV_EVENT)
     wait_for_pipeline()
     # 无 query → 只回必带集（assembler 设计）；带话题文本 → 词面召回相关集
-    r = client.get("/profile/webchat/u1?budget=2000")
+    r = client.get("/memory/webchat/u1?budget=2000")
     assert r.status_code == 200 and "entries" in r.json()
-    r = client.get("/profile/webchat/u1?budget=2000&query=Python")
+    r = client.get("/memory/webchat/u1?budget=2000&query=Python")
     assert any(e["id"] == "preference_lang@global" for e in r.json()["entries"])
 
 
@@ -190,11 +199,11 @@ def test_decision_version_conflict_noop(client, conn):
 def test_delete_tombstone(client, conn):
     _seed_entry(conn, "taboo", "emoji", "global", "active", "不用 emoji", "禁emoji", 0.95)
     _seed_entry(conn, "preference", "tone", "global", "pending_review", "正式", "正式", 0.7)
-    r = client.request("DELETE", "/profile/webchat/u1")
+    r = client.request("DELETE", "/memory/webchat/u1")
     assert r.status_code == 200 and r.json()["deleted"] is True
-    assert client.get("/profile/webchat/u1").json()["entries"] == []
+    assert client.get("/memory/webchat/u1").json()["entries"] == []
     assert client.get("/review/queue").json()["items"] == []
-    # 软删除：画像数据保留，但公开读取与队列都按删除状态隐藏
+    # 软删除：记忆数据保留，但公开读取与队列都按删除状态隐藏
     assert conn.execute("SELECT COUNT(*) FROM entries").fetchone()[0] == 2
     assert conn.execute("SELECT COUNT(*) FROM sources").fetchone()[0] >= 2
     tomb = conn.execute(
@@ -264,7 +273,7 @@ def test_pipeline_swallows_exceptions(conn, fake_settings, taxonomy, embedder_st
 
 
 def test_trigger_grading_plain_message_skips_llm(client, conn, fake_llm):
-    # I-4：无关键词/短消息/有画像历史 → 不调抽取 LLM，仅批内强化（简化为跳过）
+    # I-4：无关键词/短消息/有记忆历史 → 不调抽取 LLM，仅批内强化（简化为跳过）
     _seed_entry(conn, "preference", "lang", "global", "active", "主语言 Python",
                 "主语言Python", 0.9)  # has_history=True
     plain = dict(CONV_EVENT, event_id="evt_g1",
@@ -383,7 +392,7 @@ def test_clarification_closes_conflict_loop(client, conn, fake_llm):
     main = conn.execute("SELECT body, status FROM entries WHERE topic='style'").fetchone()
     assert main["status"] == "active" and main["body"] == "回复保持正式书面语"
     assert conn.execute("SELECT COUNT(*) FROM pending_clarifications").fetchone()[0] == 0
-    assert client.get("/profile/webchat/u1").json()["clarification_needed"] == []
+    assert client.get("/memory/webchat/u1").json()["clarification_needed"] == []
 
 
 def test_decision_advances_version_and_clears_conflict(client, conn):
@@ -713,7 +722,7 @@ def test_events_from_deleted_user_not_persisted(client, conn, fake_llm):
     fake_llm.by_name["extract_candidates"] = [{"candidates": [dict(EXPLICIT_CAND)]}]
     client.post("/events", json=CONV_EVENT)
     assert conn.execute("SELECT COUNT(*) c FROM entries").fetchone()["c"] == 1
-    deleted = client.request("DELETE", "/profile/webchat/u1").json()
+    deleted = client.request("DELETE", "/memory/webchat/u1").json()
     assert deleted["deleted"] is True and deleted["mode"] == "soft"
 
     calls_before = len(fake_llm.calls)
@@ -725,6 +734,7 @@ def test_events_from_deleted_user_not_persisted(client, conn, fake_llm):
     assert len(fake_llm.calls) == calls_before
 
 
-def test_profile_scope_param_validated(client):
-    assert client.get("/profile/webchat/u1?scope=bad-scope").status_code == 422
-    assert client.get("/profile/webchat/u1?scope=project:work").status_code == 200
+def test_memory_scope_param_validated(client):
+    assert client.get("/memory/webchat/u1?scope=bad-scope").status_code == 422
+    assert client.get("/memory/webchat/u1?scope=project:work").status_code == 200
+

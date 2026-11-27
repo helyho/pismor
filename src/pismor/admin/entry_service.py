@@ -10,7 +10,8 @@ import json
 import sqlite3
 from datetime import datetime, timezone
 
-from pismor.core.keys import entry_key, valid_scope, vec_key
+from pismor.core.keys import entry_key, valid_scope
+from pismor.pipeline import writer
 
 
 STATUSES = frozenset({
@@ -120,12 +121,6 @@ def check_entry_edit(
     }
 
 
-def _has_embeddings_table(conn) -> bool:
-    return conn.execute(
-        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='embeddings'"
-    ).fetchone() is not None
-
-
 def _replace_marks(value: str | None, old_id: str, old_scope: str, new_id: str) -> str | None:
     if not value:
         return value
@@ -208,38 +203,6 @@ def _rename_references(
             )
 
 
-def _sync_embedding(
-    conn,
-    *,
-    user_source: str,
-    user_id: str,
-    old_dimension: str,
-    old_topic: str,
-    old_scope: str,
-    new_dimension: str,
-    new_topic: str,
-    new_scope: str,
-    body_changed: bool,
-) -> None:
-    if not _has_embeddings_table(conn):
-        return
-    old_key = vec_key(user_source, user_id, old_dimension, old_topic, old_scope)
-    new_key = vec_key(user_source, user_id, new_dimension, new_topic, new_scope)
-    if body_changed:
-        # 正文变化后旧向量不再代表条目内容；没有同步重建就删掉，避免脏召回。
-        conn.execute("DELETE FROM embeddings WHERE entry_id=?", (old_key,))
-        return
-    if old_key == new_key:
-        return
-    conn.execute("DELETE FROM embeddings WHERE entry_id=?", (new_key,))
-    conn.execute(
-        "INSERT INTO embeddings (entry_id,user_source,user_id,embedding)"
-        " SELECT ?, user_source, user_id, embedding FROM embeddings WHERE entry_id=?",
-        (new_key, old_key),
-    )
-    conn.execute("DELETE FROM embeddings WHERE entry_id=?", (old_key,))
-
-
 def apply_entry_edit(
     conn,
     taxonomy,
@@ -257,6 +220,8 @@ def apply_entry_edit(
     summary: str,
     body: str,
     degraded_reason: str | None = None,
+    vector: list[float] | None = None,
+    vector_requested: bool = False,
 ) -> dict:
     checked = check_entry_edit(
         conn, taxonomy,
@@ -315,18 +280,29 @@ def apply_entry_edit(
             old_id=entry_id, old_scope=scope, new_id=new_id,
         )
 
-    _sync_embedding(
+    vector_state = writer.sync_entry_vector(
         conn,
         user_source=user_source, user_id=user_id,
         old_dimension=row["dimension"], old_topic=row["topic"], old_scope=row["scope"],
         new_dimension=new_dimension, new_topic=new_topic, new_scope=new_scope,
-        body_changed=body.strip() != row["body"],
+        old_body=row["body"], new_body=body.strip(),
+        vector=vector, vector_requested=vector_requested,
     )
+    warnings = list(checked["warnings"])
+    if vector_state == "replaced":
+        warnings.append("正文已更新，向量已重建")
+    elif vector_state == "moved":
+        warnings.append("向量已随条目键迁移")
+    elif vector_state == "dropped":
+        if vector_requested:
+            warnings.append("正文已更新，嵌入服务不可用，该条目已退出向量召回")
+        else:
+            warnings.append("正文已更新，嵌入未启用，旧向量已移除")
 
     return {
         "ok": True,
         "errors": [],
-        "warnings": checked["warnings"],
+        "warnings": warnings,
         "conflicts": [],
         "stale": False,
         "id": new_id,

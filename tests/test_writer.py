@@ -593,3 +593,74 @@ def test_apply_actions_returns_only_written_actions(conn):
     applied = apply_actions(conn, "w", "u", [silent, bad_scope, written],
                             EmbedderStub(), "text", "e1", NOW)
     assert [a["candidate"]["topic"] for a in applied] == ["format"]
+
+
+def test_nan_confidence_cannot_revive_degraded(conn, embedder_stub):
+    # F6: NaN 使 `NaN < 0.85` 恒 False，修复前任意 NaN 证据可复活降级条目；
+    # 入口钳制后 NaN→0.0，走 revive_rejected
+    _seed_degraded(conn)
+    action = update_action("preference", "lang", "global")
+    action["candidate"]["confidence"] = float("nan")
+    apply_actions(conn, "w", "u", [action], embedder_stub, "conversation", "s1:1", NOW)
+    row = conn.execute("SELECT * FROM entries WHERE topic='lang'").fetchone()
+    assert row["status"] == "degraded" and row["body"] == "旧值"
+    hist = conn.execute(
+        "SELECT * FROM review_history WHERE decision='revive_rejected'").fetchone()
+    assert hist["note"].startswith("confidence=0.00")
+
+
+def test_nan_confidence_clamped_on_add(conn, embedder_stub):
+    # F6: ADD 路径 NaN/超界值同样钳到 [0,1]
+    action = add_action()
+    action["candidate"]["confidence"] = float("nan")
+    apply_actions(conn, "w", "u", [action], embedder_stub, "text", "e1", NOW)
+    assert conn.execute("SELECT confidence FROM entries").fetchone()["confidence"] == 0.0
+    action2 = add_action("preference", "tone", "global")
+    action2["candidate"]["confidence"] = 42.0
+    apply_actions(conn, "w", "u", [action2], embedder_stub, "text", "e2", NOW)
+    row = conn.execute(
+        "SELECT confidence FROM entries WHERE topic='tone'").fetchone()
+    assert row["confidence"] == 1.0
+
+
+def test_revive_restores_confidence_to_max(conn, embedder_stub):
+    # F7: 复活条目的置信取 max(降级残值, 新证据)；0.8ⁿ 循环衰减不再让复活条目沉底
+    conn.execute(
+        "INSERT INTO entries (user_source,user_id,dimension,topic,scope,id,confidence,status,"
+        "body,summary,created_at,updated_at,last_reinforced_at,reinforcements,degraded_reason)"
+        " VALUES ('w','u','preference','lang','global','preference_lang@global',0.41,'degraded',"
+        "'旧值','旧值','2026-01-01','2026-01-01','2026-01-01',2,'conflict_lost')")
+    conn.commit()
+    action = update_action("preference", "lang", "global")
+    action["candidate"]["confidence"] = 0.86
+    apply_actions(conn, "w", "u", [action], embedder_stub, "conversation", "s1:1", NOW)
+    row = conn.execute("SELECT * FROM entries WHERE topic='lang'").fetchone()
+    assert row["status"] == "active"
+    assert row["confidence"] == 0.86  # max(0.41, 0.86)
+
+
+def test_superseded_seq_not_reused_after_merge_deletion(conn, embedder_stub, seeded_active):
+    # F8: 轨迹行被归并物理删除后，COUNT+1 会按剩余数复用现存序号撞主键；
+    # 改取现存键最大序号 +1，删除后新轨迹序号只增不减
+    apply_actions(conn, "w", "u", [update_action("preference", "lang", "global")],
+                  embedder_stub, "conversation", "s1:1", NOW)  # 轨迹 :1
+    apply_actions(conn, "w", "u", [update_action("preference", "lang", "global")],
+                  embedder_stub, "conversation", "s1:2", NOW)  # 轨迹 :2
+    conn.execute("DELETE FROM entries WHERE topic='~lang:20261124T000000:1'")
+    conn.commit()
+    # 剩余轨迹仅 :2；修复前 COUNT=1 → seq=2 撞主键 IntegrityError，修复后 seq=3
+    apply_actions(conn, "w", "u", [update_action("preference", "lang", "global")],
+                  embedder_stub, "conversation", "s1:3", NOW)
+    topics = [r["topic"] for r in conn.execute(
+        "SELECT topic FROM entries WHERE topic LIKE '~lang:%'").fetchall()]
+    assert "~lang:20261124T000000:3" in topics
+    assert "~lang:20261124T000000:2" in topics
+
+
+def test_conflict_degradation_refreshes_reinforced_at(conn, embedder_stub, seeded_active):
+    # F11: 矛盾降级旧行时刷新 last_reinforced_at，刚落败的重要记忆不再提前进入衰减窗口
+    apply_actions(conn, "w", "u", [conflict_action("preference", "lang", "global")],
+                  embedder_stub, "conversation", "s1:1", NOW)
+    row = conn.execute("SELECT * FROM entries WHERE topic='lang'").fetchone()
+    assert row["status"] == "degraded"
+    assert row["last_reinforced_at"] == NOW  # seed 时为 2026-01-01

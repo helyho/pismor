@@ -91,7 +91,7 @@ def test_hash_fallback_writes_back_event_id(conn):
 
 
 def test_conversation_requires_user_message(conn):
-    # 仅 assistant 的对话无画像证据，入口即拒（避免 force_extract 空转）
+    # 仅 assistant 的对话无记忆证据，入口即拒（避免 force_extract 空转）
     with pytest.raises(ValidationError):
         intake_event(conn, dict(CONV, event_id="e23",
                                 messages=[{"role": "assistant", "text": "好的"}]))

@@ -69,3 +69,26 @@ def test_request_payload_and_missing_key():
     payload = json.loads(route.calls.last.request.content)
     assert payload == {"model": "m", "input": ["x"]}
     assert "authorization" not in route.calls.last.request.headers
+
+
+@respx.mock
+def test_out_of_order_index_resorted():
+    # F2: 规范要求 data[i].index 对应输入下标；网关乱序返回时按 index 重排对齐
+    respx.post("https://emb.test/v1/embeddings").respond(
+        json={"data": [
+            {"index": 1, "embedding": [0.2]},
+            {"index": 0, "embedding": [0.1]},
+        ]})
+    emb = Embedder(EmbeddingSettings(True, "https://emb.test/v1", "m", "K", 1, 8))
+    assert emb.embed(["a", "b"]) == [[0.1], [0.2]]
+
+
+@respx.mock
+def test_non_finite_embedding_rejected():
+    # F3: NaN 向量入库后该条目在向量检索中静默消失，按服务不可用降级
+    # （部分服务输出宽松 JSON 字面量 NaN，标准编码器无法构造，故用原始字节）
+    respx.post("https://emb.test/v1/embeddings").respond(
+        200, content=b'{"data": [{"index": 0, "embedding": [NaN]}]}')
+    emb = Embedder(EmbeddingSettings(True, "https://emb.test/v1", "m", "K", 1, 8))
+    with pytest.raises(EmbedUnavailable):
+        emb.embed(["x"])

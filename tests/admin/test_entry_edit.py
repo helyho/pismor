@@ -1,4 +1,5 @@
 import json
+import struct
 from contextlib import closing
 from pathlib import Path
 
@@ -20,20 +21,28 @@ class FakeLLM:
         return {"candidates": []}
 
 
-def _settings(tmp_path: Path) -> Settings:
+class FakeEmbedder:
+    def embed(self, texts):
+        return [[0.1, 0.2, 0.3, 0.4] for _ in texts]
+
+
+def _settings(tmp_path: Path, *, embedding_enabled: bool = False) -> Settings:
     return Settings(
         db_path=tmp_path / "admin.db",
         taxonomy_path=REPO / "config" / "taxonomy.yaml",
         llm=LLMSettings(endpoint="http://llm.test", model="m", api_key_env="LLM_API_KEY"),
         embedding=EmbeddingSettings(
-            enabled=False, endpoint="", model="", api_key_env="",
+            enabled=embedding_enabled, endpoint="", model="", api_key_env="",
             dimensions=4, batch_size=8,
         ),
     )
 
 
-def _make_app(tmp_path: Path):
-    app = create_app(_settings(tmp_path), llm=FakeLLM())
+def _make_app(tmp_path: Path, *, embedder=None, embedding_enabled: bool = False):
+    app = create_app(
+        _settings(tmp_path, embedding_enabled=embedding_enabled),
+        llm=FakeLLM(), embedder=embedder,
+    )
     return app, TestClient(app), tmp_path / "admin.db"
 
 
@@ -217,7 +226,42 @@ def test_edit_stale_version_and_body_invalidates_vector(tmp_path):
         ),
     )
     assert res.status_code == 200
+    assert any("嵌入未启用" in w for w in res.json()["warnings"])
     with closing(get_conn(db_path)) as conn:
         assert conn.execute(
             "SELECT 1 FROM embeddings WHERE entry_id=?", (old_vec,)
         ).fetchone() is None
+
+
+def test_edit_body_reembeds_vector_with_new_text(tmp_path):
+    app, client, db_path = _make_app(
+        tmp_path, embedder=FakeEmbedder(), embedding_enabled=True)
+    with closing(get_conn(db_path)) as conn:
+        entry_id = _insert_entry(conn, topic="style")
+        old_vec = vec_key("webchat", "u1", "preference", "style", "global")
+        conn.execute(
+            "INSERT INTO embeddings (entry_id,user_source,user_id,embedding) VALUES (?,?,?,?)",
+            (old_vec, "webchat", "u1", json.dumps([0.9, 0.9, 0.9, 0.9])),
+        )
+        conn.commit()
+    res = client.patch(
+        "/admin/api/entries",
+        json=_payload(
+            entry_id,
+            new_dimension="preference",
+            new_topic="style",
+            body="changed body",
+        ),
+    )
+    assert res.status_code == 200, res.text
+    assert any("向量已重建" in w for w in res.json()["warnings"])
+    with closing(get_conn(db_path)) as conn:
+        row = conn.execute(
+            "SELECT embedding FROM embeddings WHERE entry_id=?", (old_vec,)
+        ).fetchone()
+    assert row is not None
+    # 旧向量已换成新正文的归一化嵌入，而不是保留旧的 [0.9, 0.9, 0.9, 0.9]
+    raw = struct.unpack("<4f", row["embedding"])
+    expected = [0.1, 0.2, 0.3, 0.4]
+    norm = sum(v * v for v in expected) ** 0.5
+    assert all(abs(a - b / norm) < 1e-6 for a, b in zip(raw, expected))

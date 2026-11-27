@@ -114,7 +114,7 @@ def test_text_prompt_has_rules(taxonomy):
     extractor.extract(_conv_ev(event_type="text", content="周报"), taxonomy, llm,
                       known_ids=["taboo_tone"])
     system = llm.calls[0]["system"]
-    assert "转述他人的内容不得作为用户画像" in system
+    assert "转述他人的内容不得作为用户记忆条目" in system
     assert "一律 inferred" in system
     assert "去重由决策器负责" in system
     assert "taboo_tone" in system
@@ -293,11 +293,12 @@ def test_neighbor_conflict_returns_accused_target(conn, taxonomy):
     assert target == ("preference", "verbosity", "global")  # LLM 指认优先
 
 
-def test_neighbor_conflict_falls_back_to_first_row(conn, taxonomy):
+def test_neighbor_conflict_hallucinated_ref_returns_none(conn, taxonomy):
+    # F4：LLM 指认的 id 不在近邻结果里（幻觉）→ 返回 None 当轮 ADD，不回退首行误伤无辜行
     _seed_neighbor(conn)
-    llm = CaptureLLM({"conflict": True, "conflicting_with": "", "reason": "互斥"})
-    target = resolver._neighbor_conflict(conn, "webchat", "u1", _taboo_candidate(), llm)
-    assert target == ("preference", "style", "global")  # 指认缺失回退首行
+    llm = CaptureLLM({"conflict": True, "conflicting_with": "preference_nonexistent@global",
+                      "reason": "互斥"})
+    assert resolver._neighbor_conflict(conn, "webchat", "u1", _taboo_candidate(), llm) is None
 
 
 def test_neighbor_skipped_for_unpaired_dimension(conn, taxonomy):

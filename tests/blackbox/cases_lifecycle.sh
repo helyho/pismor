@@ -26,7 +26,7 @@ t14() {
     waited=$((waited + 2))
   done
   [[ "$n" -le 1 ]] || { case_fail "lang 主题 active 条目 ${n} 条，矛盾未收敛"; }
-  http GET /profile/bb/t13u
+  http GET /memory/bb/t13u
   expect_status 200 || return 1
   case_pass
 }
@@ -116,7 +116,7 @@ t18_clarify() {
   [[ "$n" -ge 2 ]] || { case_fail "未形成矛盾双存（degraded=${n}）"; }
 
   # 3) 装配触发澄清：响应带问题
-  http GET "/profile/bb/$uid"
+  http GET "/memory/bb/$uid"
   expect_status 200 || return 1
   expect_json_true '.clarification_needed | length > 0' || return 1
 
@@ -137,7 +137,7 @@ t18_clarify() {
   expect_db "SELECT status FROM entries WHERE user_source='bb' AND user_id='$uid' AND id='preference_verbosity@global'" "active" || return 1
   expect_db "SELECT status FROM entries WHERE user_source='bb' AND user_id='$uid' AND id='preference_+verbosity@global'" "archived" || return 1
   expect_db "SELECT count(*) FROM entries WHERE user_source='bb' AND user_id='$uid' AND id IN ('preference_verbosity@global','preference_+verbosity@global') AND conflict_with IS NOT NULL" "0" || return 1
-  http GET "/profile/bb/$uid"
+  http GET "/memory/bb/$uid"
   expect_status 200 || return 1
   expect_json '.clarification_needed | length' '0' || return 1
   case_pass

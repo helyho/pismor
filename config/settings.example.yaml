@@ -1,4 +1,4 @@
-# 画像系统配置示例。复制为 settings.yaml 后按环境修改；
+# 记忆系统配置示例。复制为 settings.yaml 后按环境修改；
 # api_key_env 指向的密钥从环境变量读取，不落配置文件。
 db_path: ./data/index.db          # 主库路径；管理后台只读，修改需重启
 taxonomy_path: ./config/taxonomy.yaml  # 词表路径；配置中心可编辑，保存后热生效

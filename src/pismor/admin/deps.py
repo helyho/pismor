@@ -11,9 +11,9 @@ from fastapi import Depends, HTTPException, Request
 CAPABILITIES = frozenset({
     "review.read",
     "review.decide",
-    "profile.read",
-    "profile.write",
-    "profile.delete",
+    "memory.read",
+    "memory.write",
+    "memory.delete",
     "system.read",
     "taxonomy.read",
     "taxonomy.write",

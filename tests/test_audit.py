@@ -11,7 +11,7 @@ _ENTRY_COLS = ("user_source,user_id,dimension,topic,scope,id,confidence,status,b
 
 
 def seed_entry(conn, us="w", uid="u", dimension="preference", topic="lang", scope="global",
-               status="active", confidence=0.9, body="一句话画像",
+               status="active", confidence=0.9, body="一句话记忆",
                degraded_reason=None, topic_new=None, archived_at=None, kind="explicit",
                conflict_with=None, quote=None):
     """审计测试直接造行：绕过写入器以构造写入器拒绝的非法组合。

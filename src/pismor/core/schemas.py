@@ -3,13 +3,25 @@ from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator
 import hashlib, json
+import re
+
+# source/user_ref 是五元组主键与 vec_key（\x1f 连接）的成分：控制字符会让不同用户
+# 合成同一个键，检索互相串扰（F5）。入库侧只拦新事件，存量数据不受影响。
+_KEY_UNSAFE_CHARS = re.compile(r"[\x00-\x1f\x7f]")
 
 
 class _Base(BaseModel):
-    source: str = Field(min_length=1)
-    user_ref: str = Field(min_length=1)
+    source: str = Field(min_length=1, max_length=128)
+    user_ref: str = Field(min_length=1, max_length=128)
     event_id: str | None = None
     ts: str
+
+    @field_validator("source", "user_ref")
+    @classmethod
+    def _validate_key_safe(cls, value: str) -> str:
+        if _KEY_UNSAFE_CHARS.search(value):
+            raise ValueError("must not contain control characters")
+        return value
 
     @field_validator("ts")
     @classmethod

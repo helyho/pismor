@@ -6,7 +6,7 @@ meta:  # 词表元信息
   auto_activate: true            # orphan_topic 启用时自动写入词表(附自动生成的回归样例); false=进人工队列
 
 scopes:  # 合法 scope 白名单；各维度的 default_scope 必须是这里的 key
-  global: "跨会话、跨项目成立的画像"
+  global: "跨会话、跨项目成立的记忆条目"
   project: "仅在某项目/任务上下文内成立; 需给出 project key"
 
 dimensions:  # 维度定义；key 与 priority 必须唯一

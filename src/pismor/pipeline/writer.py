@@ -21,6 +21,7 @@
 """
 import json
 import logging
+import math
 import sqlite3
 
 from pismor.llm.embedder import EmbedUnavailable, l2_normalize
@@ -75,6 +76,11 @@ def apply_actions(conn, user_source, user_id, actions, embedder, origin_type, or
     applied = []
     with conn:
         for action in ordered:
+            c = action.get("candidate") or {}
+            if "confidence" in c:
+                _conf = float(c.get("confidence") or 0)
+                # F6: 防御层——NaN 使复活门槛 `conf < min` 恒 False，超界值污染装配排序
+                c["confidence"] = min(1.0, max(0.0, _conf)) if math.isfinite(_conf) else 0.0
             if _apply_one(conn, user_source, user_id, action, origin_type, origin_ref, now,
                           vectors, revive_min_confidence):
                 applied.append(action)
@@ -191,8 +197,9 @@ def _update(conn, us, uid, c, target, now, origin_type, origin_ref, vectors,
             vectors.append((vec_key(us, uid, d, t, s), c["body"]))
         return bool(entry_id)
     _check_transition(old["status"], "archived")  # 旧行归档轨迹；archived 再 UPDATE 拒绝
+    new_confidence = float(c.get("confidence") or 0.0)
     if old["status"] == "degraded":
-        conf = float(c.get("confidence") or 0.0)
+        conf = new_confidence
         if conf < revive_min_confidence:
             # 低置信证据不足以复活：只计强化，不覆盖正文、不产生轨迹行（spec §6）
             logger.warning("revive rejected: %s/%s@%s conf=%.2f < %.2f",
@@ -204,6 +211,9 @@ def _update(conn, us, uid, c, target, now, origin_type, origin_ref, vectors,
                  f"confidence={conf:.2f} < {revive_min_confidence}", old["updated_at"]))
             return _noop(conn, us, uid, target, now)
         _check_transition("degraded", "active")  # 新证据演进恢复 active（spec §6）
+        # F7: 复活恢复置信——降级无历史快照可考，取 max(降级残值, 新证据)，
+        # 避免 0.8ⁿ 循环衰减使复活条目永远排不进装配预算
+        new_confidence = max(float(old["confidence"] or 0.0), new_confidence)
     sup_topic, sup_id = _superseded_identity(conn, us, uid, d, t, s, now)
     # 轨迹行：旧行完整内容原样存档，topic 加 "~" 前缀避开主键；
     # 同 key 多次 UPDATE → 时间戳+序号去重（同轮同 now 也唯一）
@@ -223,7 +233,7 @@ def _update(conn, us, uid, c, target, now, origin_type, origin_ref, vectors,
         "UPDATE entries SET body=?,summary=?,confidence=?,status='active',degraded_reason=NULL,"
         "superseded_by=NULL,topic_new=NULL,conflict_with=NULL,updated_at=?,last_reinforced_at=? "
         "WHERE user_source=? AND user_id=? AND dimension=? AND topic=? AND scope=?",
-        (c["body"], c["summary"], c["confidence"], now, now, us, uid, d, t, s))
+        (c["body"], c["summary"], new_confidence, now, now, us, uid, d, t, s))
     if old["conflict_with"]:
         # M-1：普通演进只清标记，不复活矛盾对方；仅澄清（kind=clarification）可复活。
         # 澄清路径的 pending 删除延后到管线写入成功后（I-17）。
@@ -353,9 +363,16 @@ def _superseded_identity(conn, us, uid, d, t, scope, now):
     compact = now.replace("-", "").replace(":", "").split("+")[0]  # 2026-11-24T…+08:00 → 20261124T…
     base = f"~{t}:{compact}:"
     rows = conn.execute(
-        "SELECT COUNT(*) c FROM entries WHERE user_source=? AND user_id=? AND dimension=? AND topic LIKE ?",
-        (us, uid, d, f"{base}%")).fetchone()
-    seq = rows["c"] + 1
+        "SELECT topic FROM entries WHERE user_source=? AND user_id=? AND dimension=? AND topic LIKE ?",
+        (us, uid, d, f"{base}%")).fetchall()
+    # F8: COUNT 在轨迹行被人工归并物理删除后会复用已删序号（撞主键整批失败），
+    # 改取现存键的最大序号 +1
+    top = 0
+    for r in rows:
+        tail = r["topic"].rsplit(":", 1)[-1]
+        if tail.isdigit():
+            top = max(top, int(tail))
+    seq = top + 1
     topic = f"{base}{seq}"
     return topic, entry_key(d, topic, scope)
 
@@ -400,10 +417,10 @@ def _conflict(conn, us, uid, c, target, now, origin_type, origin_ref, vectors) -
             _check_transition(old["status"], "degraded")  # active→degraded；已 degraded 重复落败仅刷字段
         conn.execute(
             "UPDATE entries SET conflict_with=?,confidence=confidence*0.8,status='degraded',"
-            "degraded_reason='conflict_lost',updated_at=? "
+            "degraded_reason='conflict_lost',updated_at=?,last_reinforced_at=? "
             "WHERE user_source=? AND user_id=? AND dimension=? AND topic=? AND scope=?",
             (json.dumps(_merge_conflict(old["conflict_with"], new_mark), ensure_ascii=False),
-             now, us, uid, *target))
+             now, now, us, uid, *target))
     if taboo:
         _append_conflict_mark(conn, taboo, new_mark)
     return bool(entry_id)
@@ -482,6 +499,64 @@ def _append_conflict_mark(conn, taboo_row, other_mark):
 def _has_embeddings_table(conn):
     return conn.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='embeddings'").fetchone() is not None
+
+
+def compute_vector(embedder, text: str) -> list[float] | None:
+    """编辑路径的向量预计算：网络 IO 在写事务外完成，失败返回 None 由调用方降级。"""
+    if embedder is None or not (text or "").strip():
+        return None
+    try:
+        return l2_normalize(embedder.embed([text])[0])
+    except _EMBED_ERRORS:
+        logger.warning("vector recompute failed; edited entry will drop its vector")
+        return None
+
+
+def sync_entry_vector(conn, *, user_source: str, user_id: str,
+                      old_dimension: str, old_topic: str, old_scope: str,
+                      new_dimension: str, new_topic: str, new_scope: str,
+                      old_body: str, new_body: str, vector: list[float] | None = None,
+                      vector_requested: bool = False) -> str:
+    """编辑后的向量对齐：正文未变搬键/保留，正文变化重嵌或删除，绝不保留旧向量。
+
+    vector 由 compute_vector 在事务外预先算好；vector_requested 表示本次编辑
+    本应重嵌（嵌入服务已启用），vector 为 None 即嵌入失败，按删除降级。
+    返回 kept/moved/absent/replaced/dropped/disabled，供调用方拼装提示。
+    """
+    if not _has_embeddings_table(conn):
+        return "disabled"
+    old_key = vec_key(user_source, user_id, old_dimension, old_topic, old_scope)
+    new_key = vec_key(user_source, user_id, new_dimension, new_topic, new_scope)
+    body_changed = (new_body or "").strip() != (old_body or "").strip()
+    if not body_changed:
+        if old_key == new_key:
+            return "kept"
+        if conn.execute("SELECT 1 FROM embeddings WHERE entry_id=?", (old_key,)).fetchone() is None:
+            return "absent"  # 条目从未嵌入（如嵌入服务关闭期创建），键变了也无需搬运
+        conn.execute("DELETE FROM embeddings WHERE entry_id=?", (new_key,))
+        conn.execute(
+            "INSERT INTO embeddings (entry_id,user_source,user_id,embedding)"
+            " SELECT ?, user_source, user_id, embedding FROM embeddings WHERE entry_id=?",
+            (new_key, old_key))
+        conn.execute("DELETE FROM embeddings WHERE entry_id=?", (old_key,))
+        return "moved"
+    # 正文变化：旧向量可能已不代表条目内容，先删再决定能否重建，
+    # 嵌入失败或无嵌入服务时宁可不召回也不返回脏语义。
+    had_old = conn.execute(
+        "SELECT 1 FROM embeddings WHERE entry_id=?", (old_key,)).fetchone() is not None
+    conn.execute("DELETE FROM embeddings WHERE entry_id=?", (old_key,))
+    if new_key != old_key:
+        conn.execute("DELETE FROM embeddings WHERE entry_id=?", (new_key,))
+    if not vector_requested or vector is None:
+        return "dropped" if had_old else "absent"
+    try:
+        conn.execute(
+            "INSERT INTO embeddings (entry_id,user_source,user_id,embedding) VALUES (?,?,?,?)",
+            (new_key, user_source, user_id, json.dumps(l2_normalize(vector))))
+    except sqlite3.Error:  # 维度配置错等：条目行保留，仅跳过向量（spec §20）
+        logger.exception("vector write failed for edited entry %s", new_key)
+        return "dropped"
+    return "replaced"
 
 
 def merge_entries(conn, us, uid, *, src_id, src_scope, dst_id, dst_scope, now) -> dict:

@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # 域6 韧性收尾（T24/T25）：并发装配、损坏库拒启（必须最后跑并自恢复）
 
-# T24 并发装配：xargs -P8 并发 GET /profile ×16，全部 200 且每个响应可被 jq 解析
+# T24 并发装配：xargs -P8 并发 GET /memory ×16，全部 200 且每个响应可被 jq 解析
 t23() {
-  # 并发目标：t17u（域4 已不再预建画像，按空包用户并发；并发正确性口径不变）
+  # 并发目标：t17u（域4 已不再预建记忆，按空包用户并发；并发正确性口径不变）
   local out n bad base i
-  base="http://127.0.0.1:${PORT}/profile/bb/t17u"
+  base="http://127.0.0.1:${PORT}/memory/bb/t17u"
   # 8 路并发 × 16 次：xargs 汇总状态码到 stdout（run_case 在命令替换子 shell 中，不能用 job control）
   out=$(seq 1 16 | xargs -P8 -I{} curl -s --max-time 15 -o /dev/null -w '%{http_code}\n' "$base")
   n=$(printf '%s\n' "$out" | grep -c '^[0-9]')

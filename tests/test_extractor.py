@@ -35,7 +35,7 @@ def test_text_event_passes_content(taxonomy):
     extract(ev, taxonomy, llm, known_ids=[])
     prompt = llm.calls[0]["system"] + llm.calls[0]["user"]
     assert "笔记内容" in prompt  # 素材进入 prompt
-    assert "转述他人的内容不得作为用户画像" in prompt  # 文本事件的更严归属校验指令
+    assert "转述他人的内容不得作为用户记忆条目" in prompt  # 文本事件的更严归属校验指令
 
 
 def test_gate_thresholds():

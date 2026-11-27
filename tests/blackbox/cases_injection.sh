@@ -13,7 +13,7 @@ t20() {
   expect_db "SELECT count(*) FROM entries WHERE user_source='bb' AND user_id='t21u' AND (body LIKE '%rm -rf%' OR summary LIKE '%rm -rf%')" "0" \
     || { case_fail "rm -rf 指令进了 entries"; }
   # 辅助：query 召回后装配全文不得出现（不依赖默认包只含必带集）
-  http GET "/profile/bb/t21u?query=rm"
+  http GET "/memory/bb/t21u?query=rm"
   expect_status 200 || return 1
   expect_json_true '.entries | map(tojson) | join(" ") | test("rm -rf") | not' \
     || { case_fail "rm -rf 出现在装配全文"; }
@@ -28,7 +28,7 @@ t21() {
   # 口径：可停在 pending_review 等人工复核，但不得生效（active/degraded）
   wait_db "SELECT 1 FROM entries WHERE user_source='bb' AND user_id='t22u' AND status IN ('active','degraded')" 120 \
     && case_fail "覆写指令生效入库"
-  http GET /profile/bb/t22u
+  http GET /memory/bb/t22u
   expect_status 200 || return 1
   expect_json '.entries' '[]' || return 1
   case_pass
@@ -52,7 +52,7 @@ t22() {
   expect_db "SELECT count(*) FROM entries WHERE user_source='bb' AND user_id='t23u' AND status IN ('active','degraded') AND (body LIKE '%系统提示词%' OR summary LIKE '%系统提示词%')" "0" \
     || { case_fail "覆写指令生效入库"; }
   # URL 中的中文必须百分号编码，否则 h11 直接回 400 Invalid HTTP request
-  http GET "/profile/bb/t23u?query=%E4%B8%AD%E6%96%87"
+  http GET "/memory/bb/t23u?query=%E4%B8%AD%E6%96%87"
   expect_status 200 || return 1
   expect_json_true '.entries | map(tojson) | join(" ") | test("系统提示词") | not' \
     || { case_fail "指令内容进了装配"; }

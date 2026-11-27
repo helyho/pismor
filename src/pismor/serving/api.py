@@ -6,7 +6,7 @@
   开连接成本可忽略；跨连接并发由 WAL + busy_timeout（get_conn 内置）承担。
 - 幂等：intake 先登记后入队（登记与处理分离保证 202 语义）；重复事件 200 deduplicated。
 - 畸形事件：intake 抛 pydantic.ValidationError → 全局 handler 转 422（Review Focus #5）。
-- GET /profile 永不 5xx：降级链在 assembler 内部（主查询→必带集→空包）。
+- GET /memory 永不 5xx：降级链在 assembler 内部（主查询→必带集→空包）。
 """
 import logging
 from contextlib import closing
@@ -20,7 +20,7 @@ from pismor.admin.deps import LOCAL_ADMIN
 from pismor.admin.router import router as admin_router
 from pismor.pipeline import intake
 from pismor.serving import assembler
-from pismor.serving.profile import is_tombstoned, soft_delete_profile
+from pismor.serving.memory import is_tombstoned, soft_delete_memory
 from pismor.serving.static import mount_admin
 from pismor.core import tokenizer
 from pismor.core.config import Settings
@@ -81,7 +81,7 @@ def create_app(settings: Settings, llm=None, embedder=None) -> FastAPI:
         with closing(get_conn(s.db_path)) as conn:
             if is_tombstoned(conn, str(event.get("source") or ""),
                              str(event.get("user_ref") or "")):
-                return JSONResponse({"detail": "profile deleted"}, status_code=410)
+                return JSONResponse({"detail": "memory deleted"}, status_code=410)
             try:
                 ok, ack = intake.intake_event(
                     conn, event, max_content_chars=s.intake.max_content_chars)
@@ -93,9 +93,9 @@ def create_app(settings: Settings, llm=None, embedder=None) -> FastAPI:
                             event, llm, embedder)
         return JSONResponse({"event_id": ack["event_id"]}, status_code=202)
 
-    @app.get("/profile/{source}/{native_id}")
-    def get_profile(source: str, native_id: str, budget: int = 2000,
-                    dimensions: str | None = None, include_profile: bool = True,
+    @app.get("/memory/{source}/{native_id}")
+    def get_memory(source: str, native_id: str, budget: int = 2000,
+                    dimensions: str | None = None, include_memory: bool = True,
                     query: str | None = None, scope: str | None = None):
         dims = ([d.strip() for d in dimensions.split(",") if d.strip()]
                 if dimensions else None)
@@ -106,7 +106,7 @@ def create_app(settings: Settings, llm=None, embedder=None) -> FastAPI:
             # 降级链（主查询→必带集→空包）在 assembler 内，永不 5xx；tombstone → 空包
             a = s.assembler
             return assembler.assemble(conn, embedder, source, native_id, budget=budget,
-                                      dimensions=dims, include_profile=include_profile,
+                                      dimensions=dims, include_memory=include_memory,
                                       query=query, current_scope=scope,
                                       audit_sink=DbMergeTaskSink(s.db_path, source,
                                                                  native_id, scope),
@@ -148,9 +148,9 @@ def create_app(settings: Settings, llm=None, embedder=None) -> FastAPI:
         s = settings_store.current()
         with closing(get_conn(s.db_path)) as conn:
             if is_tombstoned(conn, user_source, user_id):
-                return JSONResponse({"detail": "profile deleted"}, status_code=410)
+                return JSONResponse({"detail": "memory deleted"}, status_code=410)
             with conn:  # 判定+版本推进+矛盾收尾同事务：先到者生效、后到者版本失配 noop
-                return apply_review_decision(
+                result = apply_review_decision(
                     conn,
                     user_source=user_source,
                     user_id=user_id,
@@ -164,14 +164,15 @@ def create_app(settings: Settings, llm=None, embedder=None) -> FastAPI:
                     topic=payload.topic,
                     taxonomy=taxonomy_store.current(),
                 )
+        return result
 
-    @app.delete("/profile/{source}/{native_id}")
-    def delete_profile(source: str, native_id: str, request: Request):
+    @app.delete("/memory/{source}/{native_id}")
+    def delete_memory(source: str, native_id: str, request: Request):
         requested_by = request.headers.get("x-requested-by", "api")
         s = settings_store.current()
         with closing(get_conn(s.db_path)) as conn:
             with conn:  # 默认软删除：只写 tombstones，条目保留，可通过管理后台恢复
-                soft_delete_profile(conn, user_source=source, user_id=native_id,
+                soft_delete_memory(conn, user_source=source, user_id=native_id,
                                     requested_by=requested_by)
         return {"deleted": True, "mode": "soft"}
 

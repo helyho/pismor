@@ -1,7 +1,7 @@
 """merge_task 闭环：taboo 超载任务的落库、查询与消解（spec §13 归并复审）。
 
 读路径（assemble）只做一次幂等 UPSERT：`uq_merge_tasks_open` 部分唯一索引保证
-同一用户同时只有一条 open 任务，重复装配不重复建单。写失败一律吞掉，绝不影响画像响应。
+同一用户同时只有一条 open 任务，重复装配不重复建单。写失败一律吞掉，绝不影响记忆响应。
 
 日批（pipeline.aggregator.run_daily）用同一张表补建任务并写入 `proposal_json`
 （自由 topic 清单 + 可用白名单 topic），供人工/管理端据此执行 re-key 归并。
@@ -78,7 +78,7 @@ class DbMergeTaskSink:
                 upsert_open(conn, self.user_source, self.user_id,
                             scope_filter=self.current_scope)
         except sqlite3.Error:
-            # 读路径的附加动作：任何写失败都不得影响画像响应
+            # 读路径的附加动作：任何写失败都不得影响记忆响应
             logger.warning("merge_task upsert failed user=%s/%s",
                            self.user_source, self.user_id, exc_info=True)
 

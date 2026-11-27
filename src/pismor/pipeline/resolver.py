@@ -112,13 +112,13 @@ def _neighbor_conflict(conn, user_source, user_id, c, llm):
                             NEIGHBOR_SCHEMA)
     if not resolution.get("conflict"):
         return None
-    # LLM 指认的对端 id@scope 优先；缺失/不匹配时回退首行
+    # LLM 指认的对端 id@scope 优先；指认不匹配任何近邻时视为模型幻觉——
+    # 回退首行会把无关的 active 行拖进矛盾双存并降级×0.8，宁当轮 ADD 不误伤（F4）
     accused = str(resolution.get("conflicting_with") or "").strip()
     for r in rows:
         if accused in (r["id"], f"{r['id']}@{r['scope']}"):
             return (r["dimension"], r["topic"], r["scope"])
-    row = rows[0]
-    return (row["dimension"], row["topic"], row["scope"])
+    return None
 
 
 def _same_topic_taboo(conn, user_source, user_id, c):

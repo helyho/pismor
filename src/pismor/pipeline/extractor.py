@@ -1,20 +1,17 @@
 """事件 → 记忆条目候选：对话/文本双模板抽取 + 指令/敏感安全防线 + 澄清回答规范化。
 
-Candidate 键固定：dimension/topic/scope/body/summary/confidence/kind/quote/topic_new，
+Candidate 键固定：dimension/topic/body/summary/confidence/kind/quote/topic_new，
 orphan 候选额外带 status="orphan_topic"（dimension 占位 "orphan"）。
 
 词表硬约束（spec §7/§8）：
 - dimension 合法但 topic ∉ 该维度 topics → 非 taboo 转 orphan（topic_new 必填，topic 用
   topic_new 作观察区键）；taboo 维度词表外候选强制人工队列（force_review），不得自动建桶。
 - summary 在出口截断到 20 字（spec §5）。
-- scope 非法（白名单外自由文本）在出口回落 default_scope 并置信打 8 折，不再由写入器
-  整条丢弃——记忆不因 LLM 的格式方差静默消失（黑盒发现⑤的修复）。
 """
 import logging
 import math
 import re
 
-from pismor.core.keys import valid_scope
 from pismor.llm.prompts import (CLARIFY_EXTRACT_SYSTEM, CLARIFY_EXTRACT_USER,
                          EXTRACT_CONVERSATION, EXTRACT_TEXT, INSTRUCTION_RE, MAX_BODY)
 from pismor.pipeline.normalize import NormalizedEvent
@@ -29,7 +26,6 @@ _CANDIDATE_ITEM = {
     "properties": {
         "dimension": {"type": ["string", "null"]},
         "topic": {"type": "string"},
-        "scope": {"type": "string", "pattern": "^(global|project:.+)$"},
         "body": {"type": "string"},
         "summary": {"type": "string"},
         "confidence": {"type": "number"},
@@ -74,11 +70,11 @@ def extract_clarification(answer: str, taxonomy, llm, pair_rows, *,
                           max_body: int = MAX_BODY) -> list[dict]:
     """把澄清回答规范化为记忆条目候选（body/summary 来自抽取，不直接使用用户原句）。
 
-    pair_rows 为矛盾对现存行（dimension/topic/scope/summary），仅作理解上下文。
-    输出候选 kind 统一为 clarification（证据类别，spec §5/§11），scope 可拆分。
+    pair_rows 为矛盾对现存行（dimension/topic/summary），仅作理解上下文。
+    输出候选 kind 统一为 clarification（证据类别，spec §5/§11）。
     """
     pairs = "\n".join(
-        f"- {r['dimension']}/{r['topic']}@{r['scope']}：{r['summary']}" for r in pair_rows
+        f"- {r['dimension']}/{r['topic']}：{r['summary']}" for r in pair_rows
     ) or "（无）"
     system = CLARIFY_EXTRACT_SYSTEM.format(dimension_block=_dimension_block(taxonomy), pairs=pairs)
     result = llm.chat_json(system, CLARIFY_EXTRACT_USER.format(answer=answer),
@@ -102,8 +98,8 @@ def extract_clarification(answer: str, taxonomy, llm, pair_rows, *,
 def _dimension_block(taxonomy) -> str:
     """维度词表 + 判定要点（guidance 压缩注入）。
 
-    黑盒发现①的修复：此前只注入 topic 列表，taxonomy 的 guidance（kind/scope/
-    维度边界判定语义）完全没进 prompt，LLM 对 kind/scope/topic 只能靠猜。
+    黑盒发现①的修复：此前只注入 topic 列表，taxonomy 的 guidance（kind/
+    维度边界判定语义）完全没进 prompt，LLM 对 kind/topic 只能靠猜。
     """
     lines = []
     for d in taxonomy.dimensions.values():
@@ -189,19 +185,9 @@ def _to_candidate(raw: dict, taxonomy, *, max_body: int = MAX_BODY) -> dict | No
         confidence = min(confidence, 0.6)
         if _SENSITIVE_DETAIL_RE.search(f"{body} {quote}"):
             return None
-    dim = taxonomy.dimensions.get(dimension)
-    default_scope = dim.default_scope if dim else "global"
-    scope = str(raw.get("scope") or "").strip()
-    if not valid_scope(scope):
-        # 兜底（替代下游整条丢弃）：非法 scope 回落默认作用域并降置信，日志留痕
-        logger.warning("scope %r out of whitelist; fallback to %s for %s/%s",
-                       raw.get("scope"), default_scope, dimension, topic)
-        scope = default_scope
-        confidence *= 0.8
     cand = {
         "dimension": dimension,
         "topic": topic,
-        "scope": scope,
         "body": body[:max_body],
         "summary": summary[:20],  # spec §5：摘要硬顶 20 字
         "confidence": confidence,

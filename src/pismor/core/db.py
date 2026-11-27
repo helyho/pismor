@@ -33,7 +33,7 @@ def get_conn(path: Path, check_same_thread: bool = True) -> sqlite3.Connection:
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS entries (
   user_source TEXT NOT NULL, user_id TEXT NOT NULL,
-  dimension TEXT NOT NULL, topic TEXT NOT NULL, scope TEXT NOT NULL,
+  dimension TEXT NOT NULL, topic TEXT NOT NULL,
   id TEXT NOT NULL,
   confidence REAL NOT NULL,
   status TEXT NOT NULL CHECK (status IN ('pending_review','orphan_topic','active','degraded','archived')),
@@ -43,7 +43,7 @@ CREATE TABLE IF NOT EXISTS entries (
   last_reinforced_at TEXT NOT NULL,
   degraded_reason TEXT, superseded_by TEXT, topic_new TEXT,
   conflict_with TEXT, reinforcements INTEGER NOT NULL DEFAULT 0, archived_at TEXT,
-  PRIMARY KEY (user_source, user_id, dimension, topic, scope)
+  PRIMARY KEY (user_source, user_id, dimension, topic)
 );
 CREATE TABLE IF NOT EXISTS sources (
   seq INTEGER PRIMARY KEY,
@@ -80,7 +80,6 @@ CREATE TABLE IF NOT EXISTS merge_tasks (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   user_source TEXT NOT NULL, user_id TEXT NOT NULL,
   taboo_count INTEGER NOT NULL DEFAULT 0,
-  scope_filter TEXT,
   status TEXT NOT NULL DEFAULT 'open'
     CHECK (status IN ('open','done','dismissed')),
   proposal_json TEXT, note TEXT,
@@ -134,11 +133,10 @@ def init_schema(conn: sqlite3.Connection, vec_dimensions: int | None) -> None:
         # 旧版本的删除是硬删除，存量 tombstone 的数据已不存在，统一标记为已彻底删除，
         # 避免升级后把它们显示成“可恢复”。
         conn.execute("UPDATE tombstones SET purged_at=deleted_at WHERE purged_at IS NULL")
-    # 行键迁移（旧库升级）：id 曾为裸 {dimension}_{topic}，与 sources.entry_id 的
-    # "{id}@{scope}" 两套格式并存；统一为行键后 entries.id 可直接与 sources JOIN。
+    # 行键自愈：id 必须等于 {dimension}_{topic}，entries.id 才能与 sources.entry_id 直接 JOIN。
     conn.execute(
-        "UPDATE entries SET id = dimension || '_' || topic || '@' || scope"
-        " WHERE id <> dimension || '_' || topic || '@' || scope")
+        "UPDATE entries SET id = dimension || '_' || topic"
+        " WHERE id <> dimension || '_' || topic")
     # mem_fts 分词器一致性：配置与建索引时不符 → 全量重建（切换 jieba/bigram 生效）
     name = _tokenizer.current()
     row = conn.execute("SELECT value FROM fts_meta WHERE key='tokenizer'").fetchone()

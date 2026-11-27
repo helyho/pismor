@@ -2,8 +2,6 @@
 import json
 import sqlite3
 
-from pismor.core.keys import split_mark
-
 
 QUEUE_CONDITION = (
     "NOT EXISTS (SELECT 1 FROM tombstones t"
@@ -64,7 +62,7 @@ def list_queue(
     ).fetchone()[0]
     sort = "DESC" if order == "newest" else "ASC"
     rows = conn.execute(
-        "SELECT id AS entry_id, user_source, user_id, dimension, topic, scope, summary,"
+        "SELECT id AS entry_id, user_source, user_id, dimension, topic, summary,"
         f" confidence, status, updated_at AS entry_version, degraded_reason AS note"
         f" FROM entries WHERE {where}"
         f" ORDER BY updated_at {sort}, rowid {sort} LIMIT ? OFFSET ?",
@@ -113,11 +111,10 @@ def get_entry_detail(
     user_source: str,
     user_id: str,
     entry_id: str,
-    scope: str,
 ) -> dict | None:
     row = conn.execute(
-        "SELECT * FROM entries WHERE user_source=? AND user_id=? AND id=? AND scope=?",
-        (user_source, user_id, entry_id, scope),
+        "SELECT * FROM entries WHERE user_source=? AND user_id=? AND id=?",
+        (user_source, user_id, entry_id),
     ).fetchone()
     if row is None:
         return None
@@ -160,14 +157,12 @@ def get_entry_detail(
         })
     conflicts = []
     for mark in marks:
-        mark_id, mark_scope = split_mark(mark, scope)
-        if mark_id == row["id"] and mark_scope == scope:
+        if mark == row["id"]:
             continue
-        lookup_id = mark if "@" in mark else f"{mark}@{mark_scope}"
         other = conn.execute(
-            "SELECT id, dimension, topic, scope, summary, status FROM entries"
-            " WHERE user_source=? AND user_id=? AND id=? AND scope=?",
-            (user_source, user_id, lookup_id, mark_scope),
+            "SELECT id, dimension, topic, summary, status FROM entries"
+            " WHERE user_source=? AND user_id=? AND id=?",
+            (user_source, user_id, mark),
         ).fetchone()
         if other is not None:
             conflicts.append(dict(other))

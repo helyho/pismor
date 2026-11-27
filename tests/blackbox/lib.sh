@@ -85,34 +85,34 @@ bb_conv_event() {
 
 # activate_entry <user> <dimension>：条目停在 pending_review 时走 decision confirm
 # 使其生效（产品正常路径：待复核条目不进包）。已是 active/degraded 直接返回 0。
-# user_id 不是唯一键（PK 含 user_source），故查询都带 user_source；scope 一并锁定
+# user_id 不是唯一键（PK 含 user_source），故查询都带 user_source
 activate_entry() {
-  local uid="$1" dim="$2" st eid= ver= scope=
+  local uid="$1" dim="$2" st eid= ver=
   st=$(db "SELECT status FROM entries WHERE user_source='bb' AND user_id='${uid}' AND dimension='${dim}' ORDER BY rowid DESC LIMIT 1")
   [[ "$st" == "active" || "$st" == "degraded" ]] && return 0
-  IFS='|' read -r eid scope ver <<<"$(db "SELECT id || '|' || scope || '|' || updated_at FROM entries WHERE user_source='bb' AND user_id='${uid}' AND dimension='${dim}' ORDER BY rowid DESC LIMIT 1")"
-  [[ -n "$eid" && -n "$scope" && -n "$ver" ]] || { printf '    activate_entry: 未找到 %s/%s 条目\n' "$uid" "$dim"; return 1; }
-  http POST "/review/bb/${uid}/${scope}/${eid}/decision" \
+  IFS='|' read -r eid ver <<<"$(db "SELECT id || '|' || updated_at FROM entries WHERE user_source='bb' AND user_id='${uid}' AND dimension='${dim}' ORDER BY rowid DESC LIMIT 1")"
+  [[ -n "$eid" && -n "$ver" ]] || { printf '    activate_entry: 未找到 %s/%s 条目\n' "$uid" "$dim"; return 1; }
+  http POST "/review/bb/${uid}/${eid}/decision" \
     "$(jq -n --arg decision confirm --arg v "$ver" '{decision:$decision, entry_version:$v}')"
   expect_status 200 || return 1
   expect_json '.noop' 'false' || return 1
-  wait_db "SELECT 1 FROM entries WHERE user_source='bb' AND user_id='${uid}' AND id='${eid}' AND scope='${scope}' AND status IN ('active','degraded')" 30
+  wait_db "SELECT 1 FROM entries WHERE user_source='bb' AND user_id='${uid}' AND id='${eid}' AND status IN ('active','degraded')" 30
 }
 
 # activate_all <uid>：把该用户所有非生效条目逐条 confirm。
 # 装配只取 status IN (active,degraded)，而 LLM 置信度会随机落在 pending_review；
 # 用例断言"能被召回"时用它消除随机性（不掩盖问题，只是把前置条件固定）。
 activate_all() {
-  local uid="$1" eid scope ver
-  while IFS='|' read -r eid scope ver; do
+  local uid="$1" eid ver
+  while IFS='|' read -r eid ver; do
     [[ -n "$eid" ]] || continue
-    http POST "/review/bb/${uid}/${scope}/${eid}/decision" \
+    http POST "/review/bb/${uid}/${eid}/decision" \
       "$(jq -n --arg decision confirm --arg v "$ver" '{decision:$decision, entry_version:$v}')"
     if [[ "$STATUS" != 200 ]]; then
       printf '    activate_all: %s 复核返回 %s\n' "$eid" "$STATUS"
       return 1
     fi
-  done < <(db "SELECT id || '|' || scope || '|' || updated_at FROM entries WHERE user_source='bb' AND user_id='${uid}' AND status NOT IN ('active','degraded')")
+  done < <(db "SELECT id || '|' || updated_at FROM entries WHERE user_source='bb' AND user_id='${uid}' AND status NOT IN ('active','degraded')")
   return 0
 }
 
@@ -223,7 +223,7 @@ from pismor.core.db import get_conn
 conn = get_conn(Path("./data/index.db"))
 sql = ("SELECT count(*) FROM embeddings v JOIN entries e"
        " ON v.entry_id = e.user_source || char(31) || e.user_id || char(31)"
-       "    || e.dimension || char(31) || e.topic || char(31) || e.scope"
+       "    || e.dimension || char(31) || e.topic"
        " WHERE e.user_source='bb' AND e.user_id=?")
 print(conn.execute(sql, (sys.argv[1],)).fetchone()[0])
 PY

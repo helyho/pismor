@@ -1,8 +1,8 @@
 """澄清器：矛盾条目发出澄清问题（issue）、用户回话关联判定（match_incoming）、
 TTL 过期清理（expire）与成功后消费（consume）。
 
-pending_clarifications 一行 = 一个待澄清矛盾对；conflicting_ids 存 "{id}@{scope}"
-标记（旧裸 id 兼容），主键 (user_source,user_id,conflicting_ids) 使同秒多对互不冲突。
+pending_clarifications 一行 = 一个待澄清矛盾对；conflicting_ids 存裸行键 id
+标记，主键 (user_source,user_id,conflicting_ids) 使同秒多对互不冲突。
 TTL 默认 7 天（行级 ttl_days），未过期判定与过期删除均按行级 ttl_days 用 SQLite
 julianday 差值计算，issued_at 存 UTC ISO。
 """
@@ -42,7 +42,7 @@ def issue_many(conn, user_source, user_id, pairs, ttl_days: int = 7, *,
     pairs: [(conflicting_ids, summaries)]。全部行在同一事务内写入——GET /memory 装配
     路径可能一次产出多对，逐对提交会放大 WAL 写锁竞争（审查 #7）；commit=False 供日批
     等外层事务复用，避免提前提交破坏单事务（审查 #19）。
-    summaries 以条目关联标记（id@scope）为键；取 conflicting_ids 前两个标记对应摘要
+    summaries 以条目行键 id 为键；取 conflicting_ids 前两个标记对应摘要
     拼模板。幂等去重：同一用户已存在未过期、集合相同的 pending → 直接复用其 question；
     同对过期后重发走 UPSERT 刷新 issued_at 与 ttl_days（TTL 重新计时），不同对同秒各自成行。
     ttl_days 为新建行 TTL（settings.assembler.clarify_ttl_days 配置）。

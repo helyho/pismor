@@ -63,7 +63,6 @@ const drawerTarget = ref<{
   user_source: string
   user_id: string
   entry_id: string
-  scope: string
 } | null>(null)
 
 function openEntry(row: unknown): void {
@@ -73,7 +72,6 @@ function openEntry(row: unknown): void {
     user_source: detail.value.user_source,
     user_id: detail.value.user_id,
     entry_id: entry.id,
-    scope: entry.scope,
   }
   drawerVisible.value = true
 }
@@ -83,7 +81,6 @@ const editTarget = ref<{
   user_source: string
   user_id: string
   entry_id: string
-  scope: string
 } | null>(null)
 
 function openEdit(row: unknown): void {
@@ -93,7 +90,6 @@ function openEdit(row: unknown): void {
     user_source: detail.value.user_source,
     user_id: detail.value.user_id,
     entry_id: entry.id,
-    scope: entry.scope,
   }
   editVisible.value = true
 }
@@ -354,8 +350,7 @@ async function purgeUser(): Promise<void> {
           </h3>
           <el-table :data="entries" size="small" border>
             <el-table-column prop="topic" label="主题" min-width="120" />
-            <el-table-column prop="scope" label="作用域" width="120" show-overflow-tooltip />
-            <el-table-column prop="summary" label="摘要" min-width="240" show-overflow-tooltip />
+                <el-table-column prop="summary" label="摘要" min-width="240" show-overflow-tooltip />
             <el-table-column label="状态" width="90">
               <template #default="{ row }">{{ statusLabel(row.status) }}</template>
             </el-table-column>

@@ -7,7 +7,6 @@ class Dimension:
     key: str
     name: str
     priority: int
-    default_scope: str
     topics: list[str]
     guidance: str
     sensitive: bool | str = False
@@ -39,7 +38,7 @@ def load_taxonomy(path: Path) -> Taxonomy:
     for d in raw["dimensions"]:
         dims[d["key"]] = Dimension(
             key=d["key"], name=d["name"], priority=d["priority"],
-            default_scope=d["default_scope"], topics=d["topics"], guidance=d["guidance"],
+            topics=d["topics"], guidance=d["guidance"],
             sensitive=d.get("sensitive", False), topic_overrides=d.get("topic_overrides"),
             disabled_topics=list(d.get("disabled_topics") or []),
             topic_aliases=dict(d.get("topic_aliases") or {}),

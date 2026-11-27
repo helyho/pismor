@@ -58,20 +58,19 @@ def _insert_entry(
     user_id="u1",
     dimension="preference",
     topic="style",
-    scope="global",
     status="pending_review",
     conflict_with=None,
     summary="summary",
     body="body",
     updated_at=VERSION,
 ):
-    entry_id = f"{dimension}_{topic}@{scope}"
+    entry_id = f"{dimension}_{topic}"
     conn.execute(
-        "INSERT INTO entries (user_source,user_id,dimension,topic,scope,id,confidence,"
+        "INSERT INTO entries (user_source,user_id,dimension,topic,id,confidence,"
         "status,body,summary,created_at,updated_at,last_reinforced_at,degraded_reason,"
         "superseded_by,topic_new,conflict_with,reinforcements,archived_at)"
-        " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-        (user_source, user_id, dimension, topic, scope, entry_id, 0.9, status,
+        " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (user_source, user_id, dimension, topic, entry_id, 0.9, status,
          body, summary, updated_at, updated_at, updated_at, None, None, None,
          conflict_with, 0, None),
     )
@@ -87,7 +86,7 @@ def test_queue_filters_and_pagination(tmp_path):
         _insert_entry(conn, topic="b", dimension="fact", user_id="u2", summary="beta",
                       updated_at="2026-01-02T00:00:00+00:00")
         _insert_entry(conn, topic="+conflict", dimension="preference", status="active",
-                      summary="conflict summary", conflict_with='["preference_a@global"]',
+                      summary="conflict summary", conflict_with='["preference_a"]',
                       updated_at="2026-01-03T00:00:00+00:00")
         _insert_entry(conn, topic="old", dimension="fact", status="archived",
                       summary="archived", updated_at="2026-01-04T00:00:00+00:00")
@@ -121,7 +120,7 @@ def test_entry_detail_returns_evidence_history_and_conflict(tmp_path):
     app, client, db_path = _make_app(tmp_path)
     with closing(get_conn(db_path)) as conn:
         entry_id = _insert_entry(
-            conn, topic="style", conflict_with='["preference_other@global"]')
+            conn, topic="style", conflict_with='["preference_other"]')
         _insert_entry(conn, topic="other", status="active", summary="other summary")
         conn.execute(
             "INSERT INTO sources (entry_id,user_source,user_id,origin_type,origin_ref,quote,kind)"
@@ -146,12 +145,11 @@ def test_entry_detail_returns_evidence_history_and_conflict(tmp_path):
             "user_source": "webchat",
             "user_id": "u1",
             "entry_id": entry_id,
-            "scope": "global",
         },
     )
     assert res.status_code == 200
     body = res.json()
-    assert body["entry"]["conflict_marks"] == ["preference_other@global"]
+    assert body["entry"]["conflict_marks"] == ["preference_other"]
     assert body["sources"][0]["quote"] == "我喜欢简洁"
     assert body["history"][0]["decision"] == "confirm"
     assert body["history"][0]["actor"] == "reviewer"
@@ -167,7 +165,6 @@ def test_confirm_remove_fix_and_noop(tmp_path):
     payload = {
         "user_source": "webchat",
         "user_id": "u1",
-        "scope": "global",
         "entry_id": entry_id,
         "decision": "confirm",
         "entry_version": VERSION,
@@ -230,7 +227,7 @@ def test_detail_404_and_capability(tmp_path):
     app, client, _ = _make_app(tmp_path)
     res = client.get("/admin/api/review/entry", params={
         "user_source": "webchat", "user_id": "u1",
-        "entry_id": "preference_missing@global", "scope": "global",
+        "entry_id": "preference_missing",
     })
     assert res.status_code == 404
 
@@ -251,7 +248,7 @@ def _add_source(conn, entry_id, quote="不要表格"):
 
 def _decide(client, entry_id, topic):
     return client.post("/admin/api/review/decision", json={
-        "user_source": "webchat", "user_id": "u1", "scope": "global",
+        "user_source": "webchat", "user_id": "u1",
         "entry_id": entry_id, "decision": "confirm",
         "entry_version": VERSION, "topic": topic})
 
@@ -267,7 +264,7 @@ def test_confirm_rekeys_free_topic_to_whitelist(tmp_path):
     with closing(get_conn(db_path)) as conn:
         row = conn.execute("SELECT topic,id,status FROM entries").fetchone()
         assert row["topic"] == "output_format"
-        assert row["id"] == "taboo_output_format@global"
+        assert row["id"] == "taboo_output_format"
         assert row["status"] == "active"
         assert conn.execute("SELECT entry_id FROM sources").fetchone()["entry_id"] == row["id"]
 
@@ -284,10 +281,10 @@ def test_confirm_merges_into_existing_topic(tmp_path):
     assert res.json()["merged_into"] == "output_format"
     with closing(get_conn(db_path)) as conn:
         rows = conn.execute("SELECT id,body FROM entries").fetchall()
-        assert [r["id"] for r in rows] == ["taboo_output_format@global"]
+        assert [r["id"] for r in rows] == ["taboo_output_format"]
         assert rows[0]["body"] == "规范条目"  # 保留规范条目正文
         assert conn.execute("SELECT entry_id FROM sources").fetchone()["entry_id"] == \
-            "taboo_output_format@global"
+            "taboo_output_format"
 
 
 def test_confirm_rejects_topic_outside_whitelist(tmp_path):
@@ -328,14 +325,14 @@ def test_fix_body_reembeds_vector(tmp_path):
         tmp_path, embedder=FakeEmbedder(), embedding_enabled=True)
     with closing(get_conn(db_path)) as conn:
         entry_id = _insert_entry(conn, topic="style")
-        key = vec_key("webchat", "u1", "preference", "style", "global")
+        key = vec_key("webchat", "u1", "preference", "style")
         conn.execute(
             "INSERT INTO embeddings (entry_id,user_source,user_id,embedding) VALUES (?,?,?,?)",
             (key, "webchat", "u1", json.dumps([0.9, 0.9, 0.9, 0.9])),
         )
         conn.commit()
     res = client.post("/admin/api/review/decision", json={
-        "user_source": "webchat", "user_id": "u1", "scope": "global",
+        "user_source": "webchat", "user_id": "u1",
         "entry_id": entry_id, "decision": "fix", "entry_version": VERSION,
         "body": "fixed body",
     })
@@ -357,14 +354,14 @@ def test_fix_body_drops_vector_without_embedder(tmp_path):
     with closing(get_conn(db_path)) as conn:
         init_schema(conn, 4)
         entry_id = _insert_entry(conn, topic="style")
-        key = vec_key("webchat", "u1", "preference", "style", "global")
+        key = vec_key("webchat", "u1", "preference", "style")
         conn.execute(
             "INSERT INTO embeddings (entry_id,user_source,user_id,embedding) VALUES (?,?,?,?)",
             (key, "webchat", "u1", json.dumps([0.9, 0.9, 0.9, 0.9])),
         )
         conn.commit()
     res = client.post("/admin/api/review/decision", json={
-        "user_source": "webchat", "user_id": "u1", "scope": "global",
+        "user_source": "webchat", "user_id": "u1",
         "entry_id": entry_id, "decision": "fix", "entry_version": VERSION,
         "body": "fixed body",
     })
@@ -380,7 +377,7 @@ def test_confirm_rekey_moves_vector(tmp_path):
     with closing(get_conn(db_path)) as conn:
         init_schema(conn, 4)
         eid = _insert_entry(conn, dimension="taboo", topic="不要表格", body="不要用表格")
-        old_key = vec_key("webchat", "u1", "taboo", "不要表格", "global")
+        old_key = vec_key("webchat", "u1", "taboo", "不要表格")
         conn.execute(
             "INSERT INTO embeddings (entry_id,user_source,user_id,embedding) VALUES (?,?,?,?)",
             (old_key, "webchat", "u1", json.dumps([0.1, 0.2, 0.3, 0.4])),
@@ -389,7 +386,7 @@ def test_confirm_rekey_moves_vector(tmp_path):
     res = _decide(client, eid, "output_format")
     assert res.status_code == 200, res.text
     assert res.json()["rekeyed_to"] == "output_format"
-    new_key = vec_key("webchat", "u1", "taboo", "output_format", "global")
+    new_key = vec_key("webchat", "u1", "taboo", "output_format")
     with closing(get_conn(db_path)) as conn:
         assert conn.execute(
             "SELECT 1 FROM embeddings WHERE entry_id=?", (old_key,)
@@ -407,7 +404,7 @@ def test_admin_review_writes_alias(tmp_path):
     with closing(get_conn(db_path)) as conn:
         eid = _insert_entry(conn, topic="手工模型", status="pending_review")
     r = client.post("/admin/api/review/decision",
-                    json={"user_source": "webchat", "user_id": "u1", "scope": "global",
+                    json={"user_source": "webchat", "user_id": "u1",
                           "entry_id": eid, "decision": "confirm",
                           "entry_version": VERSION, "topic": canon})
     assert r.status_code == 200

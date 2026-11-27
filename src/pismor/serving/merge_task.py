@@ -18,7 +18,7 @@ logger = logging.getLogger("mem.merge_task")
 
 _COUNT_SQL = ("SELECT COUNT(*) FROM entries WHERE user_source=? AND user_id=?"
               " AND dimension='taboo' AND status IN ('active','degraded')")
-_OPEN_COLS = ("id, user_source, user_id, taboo_count, scope_filter, status,"
+_OPEN_COLS = ("id, user_source, user_id, taboo_count, status,"
               " proposal_json, note, created_at, updated_at")
 
 
@@ -26,35 +26,29 @@ def utcnow() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def taboo_count(conn, user_source: str, user_id: str,
-                current_scope: str | None = None) -> int:
-    """该用户 taboo 存活条数；current_scope 非空时只计 global + 当前项目（与装配同口径）。"""
-    sql, args = _COUNT_SQL, [user_source, user_id]
-    if current_scope:
-        sql += " AND scope IN ('global', ?)"
-        args.append(current_scope)
-    return conn.execute(sql, args).fetchone()[0]
+def taboo_count(conn, user_source: str, user_id: str) -> int:
+    """该用户 taboo 存活条数。"""
+    return conn.execute(_COUNT_SQL, [user_source, user_id]).fetchone()[0]
 
 
 def upsert_open(conn, user_source: str, user_id: str, *, count: int | None = None,
-                scope_filter: str | None = None,
                 proposal: dict | None = None, now: str | None = None) -> None:
     """幂等建单/刷新：已有 open 任务只更新计数与提案，不重置创建时间。"""
     now = now or utcnow()
     if count is None:
-        count = taboo_count(conn, user_source, user_id, scope_filter)
+        count = taboo_count(conn, user_source, user_id)
     proposal_json = json.dumps(proposal, ensure_ascii=False) if proposal is not None else None
     conn.execute(
         "INSERT OR IGNORE INTO merge_tasks"
-        "(user_source, user_id, taboo_count, scope_filter, status, proposal_json,"
-        " created_at, updated_at) VALUES (?, ?, ?, ?, 'open', ?, ?, ?)",
-        (user_source, user_id, count, scope_filter, proposal_json, now, now),
+        "(user_source, user_id, taboo_count, status, proposal_json,"
+        " created_at, updated_at) VALUES (?, ?, ?, 'open', ?, ?, ?)",
+        (user_source, user_id, count, proposal_json, now, now),
     )
     conn.execute(
-        "UPDATE merge_tasks SET taboo_count=?, scope_filter=COALESCE(?, scope_filter),"
+        "UPDATE merge_tasks SET taboo_count=?,"
         " proposal_json=COALESCE(?, proposal_json), updated_at=?"
         " WHERE user_source=? AND user_id=? AND status='open'",
-        (count, scope_filter, proposal_json, now, user_source, user_id),
+        (count, proposal_json, now, user_source, user_id),
     )
 
 
@@ -65,18 +59,15 @@ class DbMergeTaskSink:
     避免读请求与写事务共用同一连接。
     """
 
-    def __init__(self, db_path, user_source: str, user_id: str,
-                 current_scope: str | None = None):
+    def __init__(self, db_path, user_source: str, user_id: str):
         self.db_path = db_path
         self.user_source = user_source
         self.user_id = user_id
-        self.current_scope = current_scope
 
     def record_merge_task(self) -> None:
         try:
             with closing(get_conn(self.db_path)) as conn, conn:
-                upsert_open(conn, self.user_source, self.user_id,
-                            scope_filter=self.current_scope)
+                upsert_open(conn, self.user_source, self.user_id)
         except sqlite3.Error:
             # 读路径的附加动作：任何写失败都不得影响记忆响应
             logger.warning("merge_task upsert failed user=%s/%s",

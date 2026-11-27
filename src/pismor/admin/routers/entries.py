@@ -33,7 +33,6 @@ def entries(
     status: str | None = None,
     user_source: str | None = None,
     user_id: str | None = None,
-    scope: str | None = None,
     topic: str | None = None,
     q: str | None = None,
     confidence_min: float | None = None,
@@ -53,7 +52,6 @@ def entries(
             status=status,
             user_source=user_source,
             user_id=user_id,
-            scope=scope,
             topic=topic,
             q=q,
             confidence_min=confidence_min,
@@ -77,7 +75,6 @@ def entry_detail(
     user_source: str,
     user_id: str,
     entry_id: str,
-    scope: str,
     _principal=Depends(require("memory.read")),
 ):
     settings = get_settings(request)
@@ -87,7 +84,6 @@ def entry_detail(
             user_source=user_source,
             user_id=user_id,
             entry_id=entry_id,
-            scope=scope,
         )
     if detail is None:
         raise HTTPException(status_code=404, detail="entry not found")
@@ -109,10 +105,8 @@ def validate_edit(
             user_source=payload.user_source,
             user_id=payload.user_id,
             entry_id=payload.entry_id,
-            scope=payload.scope,
             new_dimension=payload.new_dimension,
             new_topic=payload.new_topic,
-            new_scope=payload.new_scope,
             confidence=payload.confidence,
             status=payload.status,
             summary=payload.summary,
@@ -133,8 +127,8 @@ def edit_entry(
     with closing(get_conn(settings.db_path)) as conn:
         # 向量在写事务外预计算（writer 的既有原则：网络 IO 不持有 WAL 写锁）
         current = conn.execute(
-            "SELECT body FROM entries WHERE user_source=? AND user_id=? AND id=? AND scope=?",
-            (payload.user_source, payload.user_id, payload.entry_id, payload.scope),
+            "SELECT body FROM entries WHERE user_source=? AND user_id=? AND id=?",
+            (payload.user_source, payload.user_id, payload.entry_id),
         ).fetchone()
         body_changed = current is not None and payload.body.strip() != current["body"]
         vector = writer.compute_vector(embedder, payload.body) if body_changed else None
@@ -145,11 +139,9 @@ def edit_entry(
                 user_source=payload.user_source,
                 user_id=payload.user_id,
                 entry_id=payload.entry_id,
-                scope=payload.scope,
                 expected_version=payload.expected_version,
                 new_dimension=payload.new_dimension,
                 new_topic=payload.new_topic,
-                new_scope=payload.new_scope,
                 confidence=payload.confidence,
                 status=payload.status,
                 summary=payload.summary,
@@ -175,9 +167,7 @@ def edit_entry(
                 result["id"],
                 {
                     "old_id": payload.entry_id,
-                    "old_scope": payload.scope,
                     "new_id": result["id"],
-                    "new_scope": payload.new_scope,
                     "status": payload.status,
                     "dimension": payload.new_dimension,
                     "topic": payload.new_topic,

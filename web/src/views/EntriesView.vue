@@ -23,7 +23,6 @@ const dimension = ref('')
 const status = ref('')
 const source = ref('')
 const userId = ref('')
-const scope = ref('')
 const topic = ref('')
 const order = ref<'updated_desc' | 'updated_asc' | 'confidence_desc'>('updated_desc')
 
@@ -42,7 +41,6 @@ const entriesQuery = useQuery<EntryList>({
     status.value,
     source.value,
     userId.value,
-    scope.value,
     topic.value,
     order.value,
   ]),
@@ -57,7 +55,6 @@ const entriesQuery = useQuery<EntryList>({
     if (status.value) params.set('status', status.value)
     if (source.value) params.set('user_source', source.value)
     if (userId.value) params.set('user_id', userId.value)
-    if (scope.value) params.set('scope', scope.value)
     if (topic.value) params.set('topic', topic.value)
     return api<EntryList>(`/entries?${params.toString()}`)
   },
@@ -91,7 +88,6 @@ function reset(): void {
   status.value = ''
   source.value = ''
   userId.value = ''
-  scope.value = ''
   topic.value = ''
   order.value = 'updated_desc'
   page.value = 1
@@ -102,7 +98,6 @@ const drawerTarget = ref<{
   user_source: string
   user_id: string
   entry_id: string
-  scope: string
 } | null>(null)
 
 function openEntry(row: unknown): void {
@@ -111,7 +106,6 @@ function openEntry(row: unknown): void {
     user_source: item.user_source,
     user_id: item.user_id,
     entry_id: item.id,
-    scope: item.scope,
   }
   drawerVisible.value = true
 }
@@ -124,10 +118,9 @@ function openUser(row: unknown): void {
   })
 }
 
-function filterBy(field: 'dimension' | 'topic' | 'scope' | 'source', value: string): void {
+function filterBy(field: 'dimension' | 'topic' | 'source', value: string): void {
   if (field === 'dimension') dimension.value = value
   if (field === 'topic') topic.value = value
-  if (field === 'scope') scope.value = value
   if (field === 'source') source.value = value
   page.value = 1
 }
@@ -137,7 +130,6 @@ const editTarget = ref<{
   user_source: string
   user_id: string
   entry_id: string
-  scope: string
 } | null>(null)
 
 function openEdit(row: unknown): void {
@@ -146,7 +138,6 @@ function openEdit(row: unknown): void {
     user_source: item.user_source,
     user_id: item.user_id,
     entry_id: item.id,
-    scope: item.scope,
   }
   editVisible.value = true
 }
@@ -217,16 +208,6 @@ async function onEditSaved(): Promise<void> {
               @keyup.enter="search"
               @clear="search"
             />
-          </el-form-item>
-          <el-form-item label="作用域">
-            <el-select v-model="scope" clearable placeholder="全部作用域" @change="search">
-              <el-option
-                v-for="item in facets?.scopes ?? []"
-                :key="item.value"
-                :label="item.value"
-                :value="item.value"
-              />
-            </el-select>
           </el-form-item>
           <el-form-item label="状态">
             <el-select v-model="status" clearable placeholder="全部状态" @change="search">
@@ -303,13 +284,6 @@ async function onEditSaved(): Promise<void> {
           <template #default="{ row }">
             <el-button link type="primary" class="cell-link" @click.stop="filterBy('topic', row.topic)">
               {{ row.topic }}
-            </el-button>
-          </template>
-        </el-table-column>
-        <el-table-column label="作用域" width="130" show-overflow-tooltip>
-          <template #default="{ row }">
-            <el-button link type="primary" class="cell-link" @click.stop="filterBy('scope', row.scope)">
-              {{ row.scope }}
             </el-button>
           </template>
         </el-table-column>

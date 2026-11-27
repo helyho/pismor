@@ -3,8 +3,9 @@
 针对用户与 LLM 的对话记录及其他文本素材（文档、笔记、邮件、工单等），自动构建并维护每个用户的记忆（禁忌/身份/偏好/事实/情境五维），以 **SQLite 单文件库为唯一真相源**。对话前通过 API 装配记忆包注入 prompt，提升回复的个性化质量。
 
 - 运行形态：单体管线进程（FastAPI + 后台管线 + 日批调度），实时注入为主，纯增量积累
-- 交付形态：`GET /memory/{source}/{native_id}` 返回按字符预算装配好的记忆包
+- 交付形态：`GET /memory/{source}/{native_id}` 返回按预算（约 token）装配好的记忆包
 - 设计文档：`docs/superpowers/specs/2026-11-23-user-profile-memory-design.md`（v2 瘦身定稿，含全部决策依据）
+- 业务方接入（上报/召回协议、错误码、客户端示例）：[Integration.md](Integration.md)
 
 ## 核心特性
 
@@ -57,19 +58,11 @@ GET /memory ──► assembler（必带集 taboo+identity + 相关集召回 + �
 
 要求 Python ≥ 3.12。依赖：fastapi、uvicorn、httpx、pydantic、pyyaml、jieba（BM25 词法分词，默认分词器）、sqlite-vec（扩展随连接加载；`embedding.enabled=false` 时不构造 Embedder、不建向量表，BM25 词面匹配为默认装配路径）。
 
+安装、依赖服务（LLM 网关 / Embedding）、配置与启动步骤统一见 [README.md](../README.md#部署与启动)，此处不再重复。最小流程：
+
 ```bash
-# 安装（任选其一）
-uv sync                                   # 使用 uv（含 dev 组）
-python -m pip install -e .                # 或 pip 可编辑安装
-
-# 配置：复制示例并按环境修改
-cp config/settings.example.yaml config/settings.yaml
-
-# 密钥走环境变量（api_key_env 指向的名字），不落配置文件
-export LLM_API_KEY=sk-...                 # 抽取/决策/归并所用 LLM 网关密钥
-# export EMBEDDING_API_KEY=...            # 仅 embedding.enabled=true 时需要
-
-# 启动（启动前做 PRAGMA integrity_check，库损坏拒绝启动）
+cp config/settings.example.yaml config/settings.yaml   # 至少改 db_path / llm.endpoint / llm.model
+export LLM_API_KEY=sk-...                              # 密钥只走环境变量，不落配置文件
 python scripts/serve.py --settings config/settings.yaml --host 127.0.0.1 --port 8300
 ```
 
@@ -92,7 +85,7 @@ curl -s -X POST http://127.0.0.1:8300/events -H 'Content-Type: application/json'
 }'
 # → 202 {"event_id": "..."}；重复上报 → 200 {"deduplicated": true}；校验失败 → 422
 
-# 2. 管线是后台任务，稍候装配记忆包（budget 为注入字符预算）
+# 2. 管线是后台任务，稍候装配记忆包（budget 为注入预算，单位约为 token）
 curl -s "http://127.0.0.1:8300/memory/chat_demo/u_001?budget=2000&query=写脚本"
 
 # 3. 低置信候选在复核队列，人工判定
@@ -106,7 +99,7 @@ curl -s http://127.0.0.1:8300/review/queue
 | `POST /events` | 上报 conversation/text 事件，校验去重后 202，管线后台执行 |
 | `GET /memory/{source}/{native_id}` | 装配记忆包，永不 5xx（降级链） |
 | `GET /review/queue` | 复核队列：pending_review 行 + 未消解矛盾双存行 |
-| `POST /review/{user_source}/{user_id}/{scope}/{entry_id}/decision` | 复核处理结果 confirm/remove/fix |
+| `POST /review/{user_source}/{user_id}/{entry_id}/decision` | 复核处理结果 confirm/remove/fix |
 | `DELETE /memory/{source}/{native_id}` | 删除权：软删除，写 tombstone；记忆数据保留，可恢复 |
 | `GET /healthz` | 存活 + SQLite 连通（库错误 → 503） |
 
@@ -139,11 +132,10 @@ text 事件（显式提交的素材，跳过触发分级直通抽取；`content`
 
 | 参数 | 默认 | 说明 |
 |---|---|---|
-| `budget` | 2000 | 注入字符预算，超预算按维度优先级（taboo 恒第一）裁剪 |
+| `budget` | 2000 | 注入预算（单位约为 token，按正文长度 / 3 估算），超预算按维度优先级（taboo 恒第一）裁剪 |
 | `query` | 无 | 当前对话话题文本，驱动相关集召回（向量优先，失败回退 BM25 词面检索） |
 | `dimensions` | 全部 | 逗号分隔维度白名单（只作用于相关集；必带集 taboo+identity 恒在） |
 | `include_memory` | true | false 时 entries 为空，其余照常（A/B 对照用） |
-| `scope` | 无 | 当前作用域（`global` 或 `project:<name>`）；给定时必带集只取全局+该项目，避免跨项目禁忌挤占预算；非法值 422 |
 
 返回 `{entries, budget_used, clarification_needed, merge_task, rendered}`；该用户在 `tombstones` 中则返回空包。
 
@@ -152,13 +144,15 @@ text 事件（显式提交的素材，跳过触发分级直通抽取；`content`
 ### 复核判定
 
 ```bash
-curl -s -X POST http://127.0.0.1:8300/review/chat_demo/u_001/global/preference_tool/decision \
+# entry_id 是行键 dimension_topic
+curl -s -X POST "http://127.0.0.1:8300/review/chat_demo/u_001/preference_tool/decision" \
   -H 'Content-Type: application/json' \
   -d '{"decision": "confirm", "entry_version": "2026-11-24T10:05:00+00:00", "note": "确认"}'
 ```
 
 - `decision`：`confirm`（确认保留，orphan 行转观察区）、`remove`（移除）、`fix`（只覆盖 `body`/`summary`，不自动确认、不改状态、不清冲突）
 - `entry_version` 取条目 `updated_at`，CAS 语义：版本被先到者改写时返回 `{"noop": true}`，判定作废
+- `confirm` 可带 `topic` 把自由主题归一到词表白名单；越界返回 `{"noop": false, "invalid_topic": true}`
 
 ### 删除权
 
@@ -173,7 +167,7 @@ curl -s -X POST http://127.0.0.1:8300/review/chat_demo/u_001/global/preference_t
 | 顶层 | `db_path` / `taxonomy_path` | — | 库、词表 |
 | `llm` | `endpoint` / `model` / `api_key_env` | — | 抽取与决策所用网关；`timeout_seconds` 结构化输出建议 ≥120 |
 | `llm` | `structured_output_param` / `structured_output_type` | `response_format` / `json_schema` | OpenAI 用 `json_schema`；DeepSeek/GLM 用 `json_object`；置空参数名则不带结构化输出 |
-| `embedding` | `enabled` | false | 默认关闭，BM25 词面匹配为默认装配路径；开启后 `dimensions` 须与模型一致，变更触发全量重嵌入 |
+| `embedding` | `enabled` | 示例为 `true` | `enabled: false` 时不建向量表、只走 BM25。该段不能整段省略，`endpoint/model/api_key_env/dimensions/batch_size` 仍需保留；`dimensions` 须与模型一致，变更触发全量重嵌入 |
 | `gate` | `auto_min` / `review_min` / `inferred_cap` | 0.85 / 0.6 / 0.8 | 直通/复核下界/inferred 置信压顶 |
 | `pipeline` | `trigger_long_message` | 300 | 消息长度突变阈值（字符）：任一 user 消息超限即触发抽取 |
 | `pipeline` | `known_ids_limit` / `reinforce_top_k` / `max_body_chars` | 200 / 20 / 200 | 提示词规模 / 强化条数 / 候选正文截断 |
@@ -186,12 +180,11 @@ curl -s -X POST http://127.0.0.1:8300/review/chat_demo/u_001/global/preference_t
 
 ## 数据模型
 
-原子单元是**条目**，存于 SQLite `entries` 表（证据链在 `sources` 表 1:N）。同 key 唯一由 `UNIQUE(user_source, user_id, dimension, topic, scope)` 约束保证，二次写入转 NOOP。
+原子单元是**条目**，存于 SQLite `entries` 表（证据链在 `sources` 表 1:N）。同 key 唯一由 `UNIQUE(user_source, user_id, dimension, topic)` 约束保证，二次写入转 NOOP。
 
 ```yaml
 id: pref_lang                    # {dimension}_{topic}，topic 受词表枚举约束
 dimension: preference            # 五维之一
-scope: global                    # global | project:{name}
 confidence: 0.92                 # 闸门参数，非统计概率
 status: active                   # pending_review | orphan_topic | active | degraded | archived
 body: 主语言 Python 3.12。        # 一句可注入 prompt 的陈述，硬顶 200 字符
@@ -280,6 +273,8 @@ python scripts/run_regression.py --dry                             # FakeLLM 回
 
 ## 文档索引
 
+- 业务接入指南：`docs/Integration.md`（上报/召回协议、字段与错误码、注入方式、客户端示例、排查清单）
+- 部署、依赖服务与启动：`README.md#部署与启动`
 - 约束与生命周期全览：`docs/memory-lifecycle.md`（硬性约束、入库、召回、状态机、降级/归档、复核、观察区晋级、日批、归并任务）
 - 设计定稿：`docs/superpowers/specs/2026-11-23-user-profile-memory-design.md`（背景、非目标、数据模型、状态机、安全、选型）
 - 实施计划：`docs/superpowers/plans/2026-11-24-user-profile-memory.md`

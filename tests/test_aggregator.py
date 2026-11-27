@@ -30,18 +30,18 @@ class FakeLLM:
         return self.reply
 
 
-def _entry(conn, *, us="w", uid="u1", dim="preference", topic="orphan", scope="global",
+def _entry(conn, *, us="w", uid="u1", dim="preference", topic="orphan",
            status="orphan_topic", topic_new=None, confidence=0.9,
            created="2026-12-10T09:00:00+08:00", updated=None, reinforced=None,
            body="偏好简短回复", summary="简短回复"):
     updated = updated or created
     reinforced = reinforced or created
-    entry_id = f"{dim}_{topic}@{scope}"
+    entry_id = f"{dim}_{topic}"
     conn.execute(
-        "INSERT INTO entries (user_source,user_id,dimension,topic,scope,id,confidence,status,"
+        "INSERT INTO entries (user_source,user_id,dimension,topic,id,confidence,status,"
         "body,summary,created_at,updated_at,last_reinforced_at,topic_new,reinforcements)"
-        " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,0)",
-        (us, uid, dim, topic, scope, entry_id, confidence, status, body, summary,
+        " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,0)",
+        (us, uid, dim, topic, entry_id, confidence, status, body, summary,
          created, updated, reinforced, topic_new))
     conn.execute(
         "INSERT INTO sources (entry_id,user_source,user_id,origin_type,origin_ref,quote,kind)"
@@ -165,10 +165,10 @@ def test_orphan_activated_after_threshold(conn, seeded_orphans_3, taxonomy, fake
     assert conn.execute("SELECT status FROM entries WHERE status='orphan_topic'").fetchone() is None
     row = conn.execute("SELECT status, topic, dimension, id, topic_new FROM entries").fetchone()
     assert row["status"] == "active" and row["topic"] == "lang" and row["topic_new"] is None
-    assert row["dimension"] == "preference" and row["id"] == "preference_lang@global"
+    assert row["dimension"] == "preference" and row["id"] == "preference_lang"
     # 证据链 entry_id 跟随 re-key
     src = conn.execute("SELECT entry_id FROM sources").fetchone()
-    assert src["entry_id"] == "preference_lang@global"
+    assert src["entry_id"] == "preference_lang"
 
 
 def test_orphan_new_topic_activated_and_yaml(conn, taxonomy_writable, fake_llm_new_topic):
@@ -542,7 +542,7 @@ def test_alias_converges_next_extraction(conn, taxonomy_writable, fake_llm_merge
     assert pref.topic_aliases["回复要简短"] == "lang"
 
     llm = ExtractLLM([{
-        "dimension": "preference", "topic": "回复要简短", "scope": "global",
+        "dimension": "preference", "topic": "回复要简短",
         "body": "偏好简短回复", "summary": "简短回复", "confidence": 0.9,
         "kind": "explicit", "quote": "回复简短点", "topic_new": None,
     }])

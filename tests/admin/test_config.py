@@ -98,15 +98,15 @@ def test_taxonomy_validate_ignores_topics_outside_vocabulary(tmp_path):
     conn = get_conn(tmp_path / "index.db")
     try:
         conn.executemany(
-            "INSERT INTO entries (user_source,user_id,dimension,topic,scope,id,confidence,status,"
+            "INSERT INTO entries (user_source,user_id,dimension,topic,id,confidence,status,"
             "body,summary,created_at,updated_at,last_reinforced_at)"
-            " VALUES ('webchat','u1',?,?, 'global',?,0.9,?,'正文','摘要',"
+            " VALUES ('webchat','u1',?,?,?,0.9,?,'正文','摘要',"
             "'2026-01-01T00:00:00+00:00','2026-01-01T00:00:00+00:00',"
             "'2026-01-01T00:00:00+00:00')",
             [
-                ("orphan", "周末爬山", "orphan_周末爬山@global", "orphan_topic"),
-                ("preference", "~lang:20260101T000000Z:1", "preference_~lang:20260101T000000Z:1@global", "archived"),
-                ("taboo", "+tool", "taboo_+tool@global", "active"),
+                ("orphan", "周末爬山", "orphan_周末爬山", "orphan_topic"),
+                ("preference", "~lang:20260101T000000Z:1", "preference_~lang:20260101T000000Z:1", "archived"),
+                ("taboo", "+tool", "taboo_+tool", "active"),
             ],
         )
         conn.commit()
@@ -124,9 +124,9 @@ def test_taxonomy_disabled_topic_keeps_stock_but_blocks_hard_delete(tmp_path):
     conn = get_conn(tmp_path / "index.db")
     try:
         conn.execute(
-            "INSERT INTO entries (user_source,user_id,dimension,topic,scope,id,confidence,status,"
+            "INSERT INTO entries (user_source,user_id,dimension,topic,id,confidence,status,"
             "body,summary,created_at,updated_at,last_reinforced_at)"
-            " VALUES ('webchat','u1','preference','lang','global','preference_lang@global',"
+            " VALUES ('webchat','u1','preference','lang','preference_lang',"
             "0.9,'active','主语言 Python','主语言Python','2026-01-01T00:00:00+00:00',"
             "'2026-01-01T00:00:00+00:00','2026-01-01T00:00:00+00:00')"
         )

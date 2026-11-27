@@ -65,7 +65,6 @@ def entry_detail(
     user_source: str,
     user_id: str,
     entry_id: str,
-    scope: str,
     _principal=Depends(require("review.read")),
 ):
     settings = get_settings(request)
@@ -75,7 +74,6 @@ def entry_detail(
             user_source=user_source,
             user_id=user_id,
             entry_id=entry_id,
-            scope=scope,
         )
     if detail is None:
         raise HTTPException(status_code=404, detail="entry not found")
@@ -98,8 +96,8 @@ def decide(
         vector = None
         if payload.decision == "fix" and payload.body is not None and embedder is not None:
             current = conn.execute(
-                "SELECT body FROM entries WHERE user_source=? AND user_id=? AND id=? AND scope=?",
-                (payload.user_source, payload.user_id, payload.entry_id, payload.scope),
+                "SELECT body FROM entries WHERE user_source=? AND user_id=? AND id=?",
+                (payload.user_source, payload.user_id, payload.entry_id),
             ).fetchone()
             if current is not None and payload.body.strip() != current["body"]:
                 vector = writer.compute_vector(embedder, payload.body)
@@ -108,7 +106,6 @@ def decide(
                 conn,
                 user_source=payload.user_source,
                 user_id=payload.user_id,
-                scope=payload.scope,
                 entry_id=payload.entry_id,
                 decision=payload.decision,
                 entry_version=payload.entry_version,

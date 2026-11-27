@@ -39,7 +39,6 @@ class ReviewQueueItem(BaseModel):
     user_id: str
     dimension: str
     topic: str
-    scope: str
     summary: str
     confidence: float
     status: str
@@ -69,7 +68,6 @@ class ReviewEntryOut(BaseModel):
     user_id: str
     dimension: str
     topic: str
-    scope: str
     id: str
     confidence: float
     status: str
@@ -114,7 +112,6 @@ class ReviewConflictOut(BaseModel):
     id: str
     dimension: str
     topic: str
-    scope: str
     summary: str
     status: str
 
@@ -131,7 +128,6 @@ class ReviewDetailOut(BaseModel):
 class ReviewDecisionIn(BaseModel):
     user_source: str
     user_id: str
-    scope: str
     entry_id: str
     decision: Literal["confirm", "remove", "fix"]
     entry_version: str
@@ -184,7 +180,6 @@ class UserEntryOut(BaseModel):
     id: str
     dimension: str
     topic: str
-    scope: str
     status: str
     confidence: float
     summary: str
@@ -253,7 +248,6 @@ class MergeTaskOut(BaseModel):
     user_source: str
     user_id: str
     taboo_count: int
-    scope_filter: str | None = None
     status: Literal["open", "done", "dismissed"]
     proposal_json: str | None = None
     note: str | None = None
@@ -285,7 +279,6 @@ class EntryListItem(BaseModel):
     user_id: str
     dimension: str
     topic: str
-    scope: str
     summary: str
     status: str
     confidence: float
@@ -312,18 +305,15 @@ class EntryFacetsOut(BaseModel):
     dimensions: list[EntryFacetValue]
     statuses: list[EntryFacetValue]
     sources: list[EntryFacetValue]
-    scopes: list[EntryFacetValue]
 
 
 class EntryEditIn(BaseModel):
     user_source: str
     user_id: str
     entry_id: str
-    scope: str
     expected_version: str
     new_dimension: str
     new_topic: str
-    new_scope: str
     confidence: float = Field(ge=0, le=1)
     status: Literal["pending_review", "orphan_topic", "active", "degraded", "archived"]
     summary: str
@@ -335,7 +325,6 @@ class EntryEditConflict(BaseModel):
     id: str
     dimension: str
     topic: str
-    scope: str
     status: str
     summary: str
 

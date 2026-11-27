@@ -53,20 +53,19 @@ def _insert_entry(
     user_id="u1",
     dimension="preference",
     topic="style",
-    scope="global",
     status="active",
     summary="summary",
     body="body",
     conflict_with=None,
     updated_at=VERSION,
 ):
-    entry_id = f"{dimension}_{topic}@{scope}"
+    entry_id = f"{dimension}_{topic}"
     conn.execute(
-        "INSERT INTO entries (user_source,user_id,dimension,topic,scope,id,confidence,"
+        "INSERT INTO entries (user_source,user_id,dimension,topic,id,confidence,"
         "status,body,summary,created_at,updated_at,last_reinforced_at,degraded_reason,"
         "superseded_by,topic_new,conflict_with,reinforcements,archived_at)"
-        " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-        (user_source, user_id, dimension, topic, scope, entry_id, 0.9, status,
+        " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (user_source, user_id, dimension, topic, entry_id, 0.9, status,
          body, summary, updated_at, updated_at, updated_at, None, None, None,
          conflict_with, 0, None),
     )
@@ -74,16 +73,14 @@ def _insert_entry(
     return entry_id
 
 
-def _payload(entry_id="preference_style@global", **overrides):
+def _payload(entry_id="preference_style", **overrides):
     payload = {
         "user_source": "webchat",
         "user_id": "u1",
         "entry_id": entry_id,
-        "scope": "global",
         "expected_version": VERSION,
         "new_dimension": "fact",
         "new_topic": "tone",
-        "new_scope": "global",
         "confidence": 0.8,
         "status": "active",
         "summary": "new summary",
@@ -104,11 +101,11 @@ def test_edit_check_conflict_and_validation(tmp_path):
     assert res.status_code == 200
     body = res.json()
     assert body["ok"] is False
-    assert body["conflicts"][0]["id"] == "fact_tone@global"
+    assert body["conflicts"][0]["id"] == "fact_tone"
 
     res = client.patch("/admin/api/entries", json=_payload())
     assert res.status_code == 409
-    assert res.json()["detail"]["conflicts"][0]["id"] == "fact_tone@global"
+    assert res.json()["detail"]["conflicts"][0]["id"] == "fact_tone"
 
     res = client.patch("/admin/api/entries", json=_payload(new_dimension="missing"))
     assert res.status_code == 422
@@ -144,7 +141,7 @@ def test_edit_renames_entry_and_syncs_references(tmp_path):
             " VALUES (?,?,?,?,?,?)",
             ("webchat", "u1", json.dumps([entry_id], ensure_ascii=False), "哪个更准确？", VERSION, 7),
         )
-        old_vec = vec_key("webchat", "u1", "preference", "style", "global")
+        old_vec = vec_key("webchat", "u1", "preference", "style")
         conn.execute(
             "INSERT INTO embeddings (entry_id,user_source,user_id,embedding) VALUES (?,?,?,?)",
             (old_vec, "webchat", "u1", json.dumps([0.1, 0.2, 0.3, 0.4])),
@@ -155,12 +152,12 @@ def test_edit_renames_entry_and_syncs_references(tmp_path):
     assert res.status_code == 200
     body = res.json()
     assert body["ok"] is True
-    assert body["id"] == "fact_tone@global"
+    assert body["id"] == "fact_tone"
 
     with closing(get_conn(db_path)) as conn:
         entry = conn.execute(
             "SELECT * FROM entries WHERE user_source='webchat' AND user_id='u1' AND id=?",
-            ("fact_tone@global",),
+            ("fact_tone",),
         ).fetchone()
         assert entry["dimension"] == "fact"
         assert entry["topic"] == "tone"
@@ -168,32 +165,32 @@ def test_edit_renames_entry_and_syncs_references(tmp_path):
         assert entry["body"] == "body"
         assert conn.execute(
             "SELECT entry_id FROM sources WHERE origin_ref='m1'"
-        ).fetchone()["entry_id"] == "fact_tone@global"
+        ).fetchone()["entry_id"] == "fact_tone"
         assert conn.execute(
             "SELECT entry_id FROM review_history WHERE entry_id=?",
-            ("fact_tone@global",),
+            ("fact_tone",),
         ).fetchone() is not None
         other = conn.execute(
-            "SELECT conflict_with FROM entries WHERE id='preference_other@global'"
+            "SELECT conflict_with FROM entries WHERE id='preference_other'"
         ).fetchone()
-        assert json.loads(other["conflict_with"]) == ["fact_tone@global"]
+        assert json.loads(other["conflict_with"]) == ["fact_tone"]
         pending = conn.execute(
             "SELECT conflicting_ids FROM pending_clarifications WHERE user_source='webchat' AND user_id='u1'"
         ).fetchone()
-        assert json.loads(pending["conflicting_ids"]) == ["fact_tone@global"]
-        new_vec = vec_key("webchat", "u1", "fact", "tone", "global")
+        assert json.loads(pending["conflicting_ids"]) == ["fact_tone"]
+        new_vec = vec_key("webchat", "u1", "fact", "tone")
         assert conn.execute(
             "SELECT 1 FROM embeddings WHERE entry_id=?", (new_vec,)
         ).fetchone() is not None
         assert conn.execute(
             "SELECT 1 FROM embeddings WHERE entry_id=?",
-            (vec_key("webchat", "u1", "preference", "style", "global"),),
+            (vec_key("webchat", "u1", "preference", "style"),),
         ).fetchone() is None
         audit = conn.execute(
             "SELECT actor, action, target FROM admin_audit ORDER BY id DESC LIMIT 1"
         ).fetchone()
         assert (audit["actor"], audit["action"], audit["target"]) == (
-            "local-admin", "entry.edit", "fact_tone@global",
+            "local-admin", "entry.edit", "fact_tone",
         )
 
 
@@ -202,7 +199,7 @@ def test_edit_stale_version_and_body_invalidates_vector(tmp_path):
     with closing(get_conn(db_path)) as conn:
         init_schema(conn, 4)
         entry_id = _insert_entry(conn, topic="style")
-        old_vec = vec_key("webchat", "u1", "preference", "style", "global")
+        old_vec = vec_key("webchat", "u1", "preference", "style")
         conn.execute(
             "INSERT INTO embeddings (entry_id,user_source,user_id,embedding) VALUES (?,?,?,?)",
             (old_vec, "webchat", "u1", json.dumps([0.1, 0.2, 0.3, 0.4])),
@@ -238,7 +235,7 @@ def test_edit_body_reembeds_vector_with_new_text(tmp_path):
         tmp_path, embedder=FakeEmbedder(), embedding_enabled=True)
     with closing(get_conn(db_path)) as conn:
         entry_id = _insert_entry(conn, topic="style")
-        old_vec = vec_key("webchat", "u1", "preference", "style", "global")
+        old_vec = vec_key("webchat", "u1", "preference", "style")
         conn.execute(
             "INSERT INTO embeddings (entry_id,user_source,user_id,embedding) VALUES (?,?,?,?)",
             (old_vec, "webchat", "u1", json.dumps([0.9, 0.9, 0.9, 0.9])),

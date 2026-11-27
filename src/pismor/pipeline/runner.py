@@ -2,8 +2,8 @@
 
 编排层职责（计划裁决）：
 - dialogue 事件开头查 pending_clarifications（clarifier.match_incoming 命中 →
-  回答先经 extractor.extract_clarification 规范化，再按 UPDATE / scope 拆分 /
-  单侧降级收敛矛盾对；document 事件不参与澄清关联，直通抽取）。
+  回答先经 extractor.extract_clarification 规范化，再按 UPDATE / 单侧降级收敛矛盾对；
+  document 事件不参与澄清关联，直通抽取）。
 - 触发分级（spec §10 成本控制）：dialogue 未命中变化检测 → 不调抽取 LLM，
   按话题词面命中 top-20 条目 reinforcements+1 / last_reinforced_at=now（M-7）。
 - 置信闸门 review 档在本层落 pending_review 行进复核队列。
@@ -24,14 +24,14 @@ from pismor.serving import assembler
 from pismor.core import fts
 from pismor.core.config import Settings
 from pismor.llm.embedder import Embedder
-from pismor.core.keys import entry_key, valid_scope
+from pismor.core.keys import entry_key
 from pismor.llm.client import LLMClient
 from pismor.core.schemas import canonical_hash
 from pismor.core.taxonomy import load_taxonomy
 
 logger = logging.getLogger("mem.pipeline")
 
-_PENDING_COLS = ("user_source,user_id,dimension,topic,scope,id,confidence,status,body,summary,"
+_PENDING_COLS = ("user_source,user_id,dimension,topic,id,confidence,status,body,summary,"
                  "created_at,updated_at,last_reinforced_at,degraded_reason,superseded_by,"
                  "topic_new,conflict_with,reinforcements,archived_at")
 
@@ -133,7 +133,7 @@ def _reinforce(conn, us, uid, text, now, *, top_k: int = 20) -> int:
     if not toks:
         return 0
     rows = conn.execute(
-        "SELECT e.dimension, e.topic, e.scope FROM entries e JOIN mem_fts f"
+        "SELECT e.dimension, e.topic FROM entries e JOIN mem_fts f"
         " ON f.rowid = e.rowid WHERE mem_fts MATCH ?"
         " AND e.user_source=? AND e.user_id=? AND e.status IN ('active','degraded')"
         " ORDER BY bm25(mem_fts) LIMIT ?",
@@ -144,21 +144,21 @@ def _reinforce(conn, us, uid, text, now, *, top_k: int = 20) -> int:
         for r in rows:
             conn.execute(
                 "UPDATE entries SET reinforcements=reinforcements+1, last_reinforced_at=?"
-                " WHERE user_source=? AND user_id=? AND dimension=? AND topic=? AND scope=?",
-                (now, us, uid, r["dimension"], r["topic"], r["scope"]))
+                " WHERE user_source=? AND user_id=? AND dimension=? AND topic=?",
+                (now, us, uid, r["dimension"], r["topic"]))
     return len(rows)
 
 
 def _clarify_pair_rows(conn, us, uid, conflicting_ids) -> list:
-    """解析 pending 的矛盾对为存活行；裸 id（旧数据）按现有行补全 scope。"""
+    """解析 pending 的矛盾对为存活行（标记即 entries.id 裸行键）。"""
     rows, seen = [], set()
     for value in conflicting_ids:
-        # 行键即完整标记 {dim}_{topic}@{scope}；旧裸 id 值同样能匹配旧行
+        # 行键即完整标记 {dim}_{topic}；标记直接按 entries.id 匹配
         found = conn.execute(
             "SELECT * FROM entries WHERE user_source=? AND user_id=? AND id=?"
             " AND status IN ('active','degraded')", (us, uid, str(value))).fetchall()
         for r in found:
-            key = (r["dimension"], r["topic"], r["scope"])
+            key = (r["dimension"], r["topic"])
             if key not in seen:
                 seen.add(key)
                 rows.append(r)
@@ -173,7 +173,7 @@ def _clarify_pair_rows(conn, us, uid, conflicting_ids) -> list:
                 "SELECT * FROM entries WHERE user_source=? AND user_id=? AND id=?"
                 " AND status IN ('active','degraded')", (us, uid, str(m))).fetchone()
             if other is not None:
-                key = (other["dimension"], other["topic"], other["scope"])
+                key = (other["dimension"], other["topic"])
                 if key not in seen:
                     seen.add(key)
                     rows.append(other)
@@ -182,7 +182,7 @@ def _clarify_pair_rows(conn, us, uid, conflicting_ids) -> list:
 
 def _apply_clarification(conn, us, uid, hit, taxonomy, llm, embedder,
                          origin_type, origin_ref, now, *, max_body: int = 200) -> None:
-    """澄清回答闭环（C-2）：抽取/规范化 → UPDATE / scope 拆分 / 单侧降级。
+    """澄清回答闭环（C-2）：抽取/规范化 → UPDATE / 单侧降级。
 
     原文祈使句不入库；body/summary 来自 LLM 抽取。写入成功后才删 pending；
     无候选或全部写入失败时保留 pending（I-17）。
@@ -195,12 +195,12 @@ def _apply_clarification(conn, us, uid, hit, taxonomy, llm, embedder,
     for c in candidates:
         existing = conn.execute(
             "SELECT status FROM entries WHERE user_source=? AND user_id=? AND dimension=?"
-            " AND topic=? AND scope=?", (us, uid, c["dimension"], c["topic"], c["scope"])).fetchone()
+            " AND topic=?", (us, uid, c["dimension"], c["topic"])).fetchone()
         if existing is None:
             actions.append({"op": "ADD", "candidate": c})
         elif existing["status"] in ("active", "degraded", "pending_review"):
             actions.append({"op": "UPDATE", "candidate": c,
-                            "target": (c["dimension"], c["topic"], c["scope"])})
+                            "target": (c["dimension"], c["topic"])})
         # archived 同键不可复活（spec §6 非法迁移）：跳过该候选
     # 澄清是用户本人的裁决路径，复活不设置信门槛（不受 auto_min 影响）
     applied = _apply(conn, us, uid, actions, embedder, origin_type, origin_ref, now,
@@ -208,8 +208,8 @@ def _apply_clarification(conn, us, uid, hit, taxonomy, llm, embedder,
     if not applied:
         logger.info("clarification produced no writable candidates; pending kept")
         return
-    applied_keys = {(a["candidate"]["dimension"], a["candidate"]["topic"],
-                     a["candidate"]["scope"]) for a in applied}
+    applied_keys = {(a["candidate"]["dimension"], a["candidate"]["topic"])
+                    for a in applied}
     _settle_pair(conn, us, uid, pair_rows, applied_keys, now)
     clarifier.consume(conn, us, uid, hit["conflicting_ids"])
 
@@ -219,34 +219,34 @@ def _settle_pair(conn, us, uid, pair_rows, applied_keys, now) -> None:
     with conn:
         for old in pair_rows:
             row = conn.execute(
-                "SELECT id, dimension, topic, scope, status FROM entries"
-                " WHERE user_source=? AND user_id=? AND dimension=? AND topic=? AND scope=?",
-                (us, uid, old["dimension"], old["topic"], old["scope"])).fetchone()
+                "SELECT id, dimension, topic, status FROM entries"
+                " WHERE user_source=? AND user_id=? AND dimension=? AND topic=?",
+                (us, uid, old["dimension"], old["topic"])).fetchone()
             if row is None:
                 continue
-            key = (row["dimension"], row["topic"], row["scope"])
+            key = (row["dimension"], row["topic"])
             if row["topic"].startswith("+"):
                 # 冲突对方（+ 变形行）不再是活跃记忆条目：归档为轨迹（不物理删除）
                 conn.execute(
                     "UPDATE entries SET status='archived', archived_at=?, conflict_with=NULL,"
                     " degraded_reason=NULL, updated_at=? WHERE user_source=? AND user_id=?"
-                    " AND dimension=? AND topic=? AND scope=? AND status IN ('active','degraded')",
+                    " AND dimension=? AND topic=? AND status IN ('active','degraded')",
                     (now, now, us, uid, *key))
             elif row["dimension"] != "taboo" and key not in applied_keys:
-                # 单侧降级：回答揭示该作用域不再成立；taboo 恒胜，不因澄清被降级
+                # 单侧降级：回答揭示该条目不再成立；taboo 恒胜，不因澄清被降级
                 conn.execute(
                     "UPDATE entries SET conflict_with=NULL, updated_at=?,"
                     " status='degraded', degraded_reason='conflict_lost'"
-                    " WHERE user_source=? AND user_id=? AND dimension=? AND topic=? AND scope=?"
+                    " WHERE user_source=? AND user_id=? AND dimension=? AND topic=?"
                     " AND status='active'",
                     (now, us, uid, *key))
             # 其余（被回答覆盖/已降级/taboo 侧）只清残留互标
             conn.execute(
                 "UPDATE entries SET conflict_with=NULL, updated_at=? WHERE user_source=?"
-                " AND user_id=? AND dimension=? AND topic=? AND scope=?"
+                " AND user_id=? AND dimension=? AND topic=?"
                 " AND conflict_with IS NOT NULL", (now, us, uid, *key))
-            writer.resolve_conflicts(conn, us, uid, row["id"],
-                                     row["scope"], now, revive=True, clear_pending=False)
+            writer.resolve_conflicts(conn, us, uid, row["id"], now,
+                                     revive=True, clear_pending=False)
 
 
 def _write_pending(conn, us, uid, candidates, origin_type, origin_ref, now) -> int:
@@ -254,23 +254,18 @@ def _write_pending(conn, us, uid, candidates, origin_type, origin_ref, now) -> i
 
     orphan 候选（dimension='orphan'，status='orphan_topic'）经 inferred cap 后恒落
     本桶：复核 confirm 由 API 按 dimension='orphan' 转 orphan_topic 进观察区（spec §8.2）。
-    作用域违规候选丢弃（spec §8 白名单）。
     """
     n = 0
     for c in candidates:
         if not c.get("quote"):
             continue  # 硬约束（spec §5）：无 quote 不落库
-        if not valid_scope(c.get("scope")):
-            logger.warning("drop pending candidate %s/%s: invalid scope %r",
-                           c.get("dimension"), c.get("topic"), c.get("scope"))
-            continue
         try:
             with conn:
-                entry_id = entry_key(c["dimension"], c["topic"], c["scope"])
+                entry_id = entry_key(c["dimension"], c["topic"])
                 conn.execute(
                     f"INSERT INTO entries ({_PENDING_COLS})"
-                    " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                    (us, uid, c["dimension"], c["topic"], c["scope"], entry_id,
+                    " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (us, uid, c["dimension"], c["topic"], entry_id,
                      c["confidence"], "pending_review", c["body"], c["summary"] or "",
                      now, now, now, None, None, c.get("topic_new"), None, 0, None))
                 conn.execute(
@@ -288,7 +283,7 @@ def _apply(conn, us, uid, actions, embedder, origin_type, origin_ref, now,
            revive_min_confidence=writer.REVIVE_MIN_CONFIDENCE) -> list[dict]:
     """整批写入；唯一约束/非法迁移 → 回滚后逐条重放，失败条留痕跳过。
 
-    返回真正落库的动作（由 writer 判定）：无 quote / 非法 scope 等被跳过的候选不计入
+    返回真正落库的动作（由 writer 判定）：无 quote 等被跳过的候选不计入
     "已应用"，避免上层误判澄清已被覆盖（审查 #17）。
     revive_min_confidence 透传 writer：degraded → active 的复活门槛。
     """
@@ -320,6 +315,6 @@ def _record_apply_failure(conn, us, uid, action, exc, now) -> None:
             conn.execute(
                 "INSERT INTO review_history (entry_id, user_source, user_id, decision, actor,"
                 " ts, note, entry_version) VALUES (?, ?, ?, 'apply_failed', 'pipeline', ?, ?, ?)",
-                (f"{c.get('dimension')}_{c.get('topic')}@{c.get('scope')}", us, uid, now, str(exc), ""))
+                (f"{c.get('dimension')}_{c.get('topic')}", us, uid, now, str(exc), ""))
     except sqlite3.Error:  # 留痕失败不得再冒泡
         logger.exception("failed to record apply failure")

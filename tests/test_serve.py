@@ -40,16 +40,16 @@ def _settings(tmp_path, taxonomy_path):
 def _seed(conn, *, us="w", uid="u1", dim="preference", topic="lang", status="active",
           body="一句话", topic_new=None, created=NOW, quote="用户原话"):
     conn.execute(
-        "INSERT INTO entries (user_source,user_id,dimension,topic,scope,id,confidence,status,"
+        "INSERT INTO entries (user_source,user_id,dimension,topic,id,confidence,status,"
         "body,summary,created_at,updated_at,last_reinforced_at,topic_new)"
-        " VALUES (?,?,?,?,'global',?,0.9,?,?,?,?,?,?,?)",
-        (us, uid, dim, topic, f"{dim}_{topic}@global", status, body, body[:20], created, created,
+        " VALUES (?,?,?,?,?,0.9,?,?,?,?,?,?,?)",
+        (us, uid, dim, topic, f"{dim}_{topic}", status, body, body[:20], created, created,
          created, topic_new))
     if not topic.startswith("~"):
         conn.execute(
             "INSERT INTO sources (entry_id,user_source,user_id,origin_type,origin_ref,quote,kind)"
             " VALUES (?,?,?,?,?,?,?)",
-            (f"{dim}_{topic}@global", us, uid, "text", "seed", quote, "explicit"))
+            (f"{dim}_{topic}", us, uid, "text", "seed", quote, "explicit"))
     conn.commit()
 
 

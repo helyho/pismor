@@ -1,7 +1,7 @@
 """管理后台条目编辑：提交前校验、键变更与关联数据同步。
 
-调用方负责开启事务；本模块不 commit。条目五元组
-(user_source,user_id,dimension,topic,scope) 是主键，id 是派生的 mark，
+调用方负责开启事务；本模块不 commit。条目四元组
+(user_source,user_id,dimension,topic) 是主键，id 是派生的 mark，
 编辑键时必须同步 sources / review_history / conflict_with / 澄清与向量。
 """
 from __future__ import annotations
@@ -10,7 +10,7 @@ import json
 import sqlite3
 from datetime import datetime, timezone
 
-from pismor.core.keys import entry_key, valid_scope
+from pismor.core.keys import entry_key
 from pismor.pipeline import writer
 
 
@@ -23,10 +23,10 @@ def utcnow() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="microseconds")
 
 
-def _entry_row(conn, *, user_source: str, user_id: str, entry_id: str, scope: str):
+def _entry_row(conn, *, user_source: str, user_id: str, entry_id: str):
     return conn.execute(
-        "SELECT * FROM entries WHERE user_source=? AND user_id=? AND id=? AND scope=?",
-        (user_source, user_id, entry_id, scope),
+        "SELECT * FROM entries WHERE user_source=? AND user_id=? AND id=?",
+        (user_source, user_id, entry_id),
     ).fetchone()
 
 
@@ -37,10 +37,8 @@ def check_entry_edit(
     user_source: str,
     user_id: str,
     entry_id: str,
-    scope: str,
     new_dimension: str,
     new_topic: str,
-    new_scope: str,
     confidence: float,
     status: str,
     summary: str,
@@ -53,7 +51,7 @@ def check_entry_edit(
 
     row = _entry_row(
         conn, user_source=user_source, user_id=user_id,
-        entry_id=entry_id, scope=scope,
+        entry_id=entry_id,
     )
     if row is None:
         return {
@@ -75,12 +73,9 @@ def check_entry_edit(
 
     new_dimension = (new_dimension or "").strip()
     new_topic = (new_topic or "").strip()
-    new_scope = (new_scope or "").strip()
     summary = (summary or "").strip()
     body = (body or "").strip()
 
-    if not valid_scope(new_scope):
-        errors.append("作用域必须是 global 或 project:<name>")
     if status not in STATUSES:
         errors.append(f"未知状态: {status}")
     if not 0 <= confidence <= 1:
@@ -103,12 +98,11 @@ def check_entry_edit(
 
     if not errors:
         rows = conn.execute(
-            "SELECT id, dimension, topic, scope, status, summary FROM entries"
-            " WHERE user_source=? AND user_id=? AND dimension=? AND topic=? AND scope=?"
-            " AND NOT (id=? AND scope=?)",
+            "SELECT id, dimension, topic, status, summary FROM entries"
+            " WHERE user_source=? AND user_id=? AND dimension=? AND topic=?"
+            " AND id<>?",
             (
-                user_source, user_id, new_dimension, new_topic, new_scope,
-                entry_id, scope,
+                user_source, user_id, new_dimension, new_topic, entry_id,
             ),
         ).fetchall()
         conflicts = [dict(item) for item in rows]
@@ -121,7 +115,7 @@ def check_entry_edit(
     }
 
 
-def _replace_marks(value: str | None, old_id: str, old_scope: str, new_id: str) -> str | None:
+def _replace_marks(value: str | None, old_id: str, new_id: str) -> str | None:
     if not value:
         return value
     try:
@@ -130,12 +124,11 @@ def _replace_marks(value: str | None, old_id: str, old_scope: str, new_id: str) 
         return value
     if not isinstance(items, list):
         return value
-    old_mark = f"{old_id}@{old_scope}"
     changed = False
     out: list = []
     for item in items:
         text = str(item)
-        if text in (old_id, old_mark):
+        if text == old_id:
             out.append(new_id)
             changed = True
         else:
@@ -149,7 +142,6 @@ def _rename_references(
     user_source: str,
     user_id: str,
     old_id: str,
-    old_scope: str,
     new_id: str,
 ) -> None:
     conn.execute(
@@ -160,24 +152,23 @@ def _rename_references(
         "UPDATE review_history SET entry_id=? WHERE user_source=? AND user_id=? AND entry_id=?",
         (new_id, user_source, user_id, old_id),
     )
-    old_mark = f"{old_id}@{old_scope}"
     conn.execute(
         "UPDATE entries SET superseded_by=? WHERE user_source=? AND user_id=?"
-        " AND (superseded_by=? OR superseded_by=?)",
-        (new_id, user_source, user_id, old_mark, old_id),
+        " AND superseded_by=?",
+        (new_id, user_source, user_id, old_id),
     )
 
     for item in conn.execute(
-        "SELECT id, scope, conflict_with FROM entries"
+        "SELECT id, conflict_with FROM entries"
         " WHERE user_source=? AND user_id=? AND conflict_with IS NOT NULL",
         (user_source, user_id),
     ).fetchall():
-        replaced = _replace_marks(item["conflict_with"], old_id, old_scope, new_id)
+        replaced = _replace_marks(item["conflict_with"], old_id, new_id)
         if replaced != item["conflict_with"]:
             conn.execute(
                 "UPDATE entries SET conflict_with=? WHERE user_source=? AND user_id=?"
-                " AND id=? AND scope=?",
-                (replaced, user_source, user_id, item["id"], item["scope"]),
+                " AND id=?",
+                (replaced, user_source, user_id, item["id"]),
             )
 
     for item in conn.execute(
@@ -185,7 +176,7 @@ def _rename_references(
         " WHERE user_source=? AND user_id=?",
         (user_source, user_id),
     ).fetchall():
-        replaced = _replace_marks(item["conflicting_ids"], old_id, old_scope, new_id)
+        replaced = _replace_marks(item["conflicting_ids"], old_id, new_id)
         if replaced == item["conflicting_ids"]:
             continue
         try:
@@ -210,11 +201,9 @@ def apply_entry_edit(
     user_source: str,
     user_id: str,
     entry_id: str,
-    scope: str,
     expected_version: str,
     new_dimension: str,
     new_topic: str,
-    new_scope: str,
     confidence: float,
     status: str,
     summary: str,
@@ -225,8 +214,8 @@ def apply_entry_edit(
 ) -> dict:
     checked = check_entry_edit(
         conn, taxonomy,
-        user_source=user_source, user_id=user_id, entry_id=entry_id, scope=scope,
-        new_dimension=new_dimension, new_topic=new_topic, new_scope=new_scope,
+        user_source=user_source, user_id=user_id, entry_id=entry_id,
+        new_dimension=new_dimension, new_topic=new_topic,
         confidence=confidence, status=status, summary=summary, body=body,
         degraded_reason=degraded_reason,
     )
@@ -235,7 +224,7 @@ def apply_entry_edit(
 
     row = _entry_row(
         conn, user_source=user_source, user_id=user_id,
-        entry_id=entry_id, scope=scope,
+        entry_id=entry_id,
     )
     if row is None:
         return {
@@ -245,8 +234,7 @@ def apply_entry_edit(
 
     new_dimension = (new_dimension or "").strip()
     new_topic = (new_topic or "").strip()
-    new_scope = (new_scope or "").strip()
-    new_id = entry_key(new_dimension, new_topic, new_scope)
+    new_id = entry_key(new_dimension, new_topic)
     now = utcnow()
     archived_at = row["archived_at"]
     if status == "archived":
@@ -256,15 +244,15 @@ def apply_entry_edit(
     superseded_by = row["superseded_by"] if status == "archived" else None
 
     current = conn.execute(
-        "UPDATE entries SET dimension=?, topic=?, scope=?, id=?, confidence=?,"
+        "UPDATE entries SET dimension=?, topic=?, id=?, confidence=?,"
         " status=?, body=?, summary=?, degraded_reason=?, archived_at=?,"
         " superseded_by=?, topic_new=NULL, updated_at=?"
-        " WHERE user_source=? AND user_id=? AND id=? AND scope=? AND updated_at=?",
+        " WHERE user_source=? AND user_id=? AND id=? AND updated_at=?",
         (
-            new_dimension, new_topic, new_scope, new_id, confidence, status,
+            new_dimension, new_topic, new_id, confidence, status,
             body.strip(), summary.strip(), (degraded_reason or "").strip() or None,
             archived_at, superseded_by, now,
-            user_source, user_id, entry_id, scope, expected_version,
+            user_source, user_id, entry_id, expected_version,
         ),
     )
     if current.rowcount == 0:
@@ -277,14 +265,14 @@ def apply_entry_edit(
         _rename_references(
             conn,
             user_source=user_source, user_id=user_id,
-            old_id=entry_id, old_scope=scope, new_id=new_id,
+            old_id=entry_id, new_id=new_id,
         )
 
     vector_state = writer.sync_entry_vector(
         conn,
         user_source=user_source, user_id=user_id,
-        old_dimension=row["dimension"], old_topic=row["topic"], old_scope=row["scope"],
-        new_dimension=new_dimension, new_topic=new_topic, new_scope=new_scope,
+        old_dimension=row["dimension"], old_topic=row["topic"],
+        new_dimension=new_dimension, new_topic=new_topic,
         old_body=row["body"], new_body=body.strip(),
         vector=vector, vector_requested=vector_requested,
     )

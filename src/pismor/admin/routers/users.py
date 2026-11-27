@@ -17,7 +17,6 @@ from pismor.admin.schemas import (
     UserListOut,
 )
 from pismor.core.db import get_conn
-from pismor.core.keys import valid_scope
 from pismor.serving import assembler
 from pismor.serving.merge_task import DbMergeTaskSink
 from pismor.serving.memory import (
@@ -85,13 +84,10 @@ def user_assemble(
     dimensions: str | None = None,
     include_memory: bool = True,
     query: str | None = None,
-    scope: str | None = None,
     _principal=Depends(require("memory.read")),
 ):
     settings = get_settings(request)
     dims = [d.strip() for d in dimensions.split(",") if d.strip()] if dimensions else None
-    if scope is not None and not valid_scope(scope):
-        raise HTTPException(status_code=422, detail="invalid scope")
     a = settings.assembler
     with closing(get_conn(settings.db_path)) as conn:
         return assembler.assemble(
@@ -103,8 +99,7 @@ def user_assemble(
             dimensions=dims,
             include_memory=include_memory,
             query=query,
-            current_scope=scope,
-            audit_sink=DbMergeTaskSink(settings.db_path, user_source, user_id, scope),
+            audit_sink=DbMergeTaskSink(settings.db_path, user_source, user_id),
             dimension_order=get_taxonomy(request).priority_order(),
             taboo_budget_share=a.taboo_budget_share,
             taboo_merge_threshold=a.taboo_merge_threshold,

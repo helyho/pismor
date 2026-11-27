@@ -1,26 +1,27 @@
 """一致性审计（spec §4/§6/§7/§9 invariants SQL 化）：扫描产 violations；标记动作另置。
 
 规则集（spec §7 invariants + §4 指令扫描 + §6 状态机静态校验 + §9 taboo 文件规则）：
-- taboo_no_overlap: 同 user 的 taboo 与 preference 存活行近似同主题（相等/子串/共享词根）
-  且 scope 相容（相等或一方 global），仅报"矛盾未经裁决"：
-  preference 侧 degraded/conflict_lost 或双方 conflict_with 互标 = 已裁决终态，排除。
+- taboo_no_overlap: 同 user 的 taboo 与 preference 存活行近似同主题（相等/子串/共享词根），
+  仅报"矛盾未经裁决"：preference 侧 degraded/conflict_lost 或双方 conflict_with 互标 =
+  已裁决终态，排除。
 - taboo_negation: taboo 条目每条 quote 必须含否定词（spec §9 文件级 invariant）；
 - conflict_with_json: 坏 JSON 行记 violation，绝不中断整次审计（I-12）；
-- quote_required / inferred_cap / unique_key_per_scope / status_consistency /
+- quote_required / inferred_cap / unique_key / status_consistency /
   instruction_pattern 同前。
 
-violations 每条附 entry 定位（五元组），供 flag_violations 落复核队列。
+violations 每条附 entry 定位（四元组），供 flag_violations 落复核队列。
 停用主题仍保留在 topics 中，审计不做词表外判定：存量条目按原状态保留。
 run_audit 只读；标记动作由 flag_violations 显式执行（spec §6 审计标记）。
 """
 import json
 import re
 
+from pismor.core.keys import entry_key
 from pismor.llm.prompts import INSTRUCTION_RE
 
 _ALIVE = ("active", "degraded")  # 存活状态（恒胜/并存判定的范围）
 _NEGATION_RE = re.compile(r"不|别|禁|勿|拒绝|无需|避免|没有")
-_ENTRY_FIELDS = ("user_source", "user_id", "dimension", "topic", "scope")
+_ENTRY_FIELDS = ("user_source", "user_id", "dimension", "topic")
 
 
 def run_audit(conn, taxonomy, *, inferred_cap: float = 0.8) -> list[dict]:
@@ -56,8 +57,8 @@ def _entry(row) -> dict:
 
 
 def _loc(row):
-    """违规行定位前缀：user/user_id dim/topic@scope。"""
-    return f"{row['user_source']}/{row['user_id']} {row['dimension']}/{row['topic']}@{row['scope']}"
+    """违规行定位前缀：user/user_id dim/topic。"""
+    return f"{row['user_source']}/{row['user_id']} {row['dimension']}/{row['topic']}"
 
 
 def _violation(rule, row, detail) -> dict:
@@ -66,7 +67,7 @@ def _violation(rule, row, detail) -> dict:
 
 def _taboo_no_overlap(conn):
     rows = conn.execute(
-        "SELECT user_source, user_id, dimension, topic, scope, id, degraded_reason,"
+        "SELECT user_source, user_id, dimension, topic, id, degraded_reason,"
         " conflict_with FROM entries"
         " WHERE dimension IN ('taboo','preference') AND status IN ('active','degraded')").fetchall()
     taboos = [r for r in rows if r["dimension"] == "taboo"]
@@ -76,15 +77,13 @@ def _taboo_no_overlap(conn):
         for pf in prefs:
             if (tb["user_source"], tb["user_id"]) != (pf["user_source"], pf["user_id"]):
                 continue
-            if not _scope_compatible(tb["scope"], pf["scope"]):
-                continue
             if not _topics_near(tb["topic"], pf["topic"]):
                 continue
             if _adjudicated(tb, pf):
                 continue  # conflict_lost 终态或 conflict_with 互标：已裁决，非违规
             out.append(_violation(
                 "taboo_no_overlap", tb,
-                f"{_loc(tb)} 与 {pf['dimension']}/{pf['topic']}@{pf['scope']}"
+                f"{_loc(tb)} 与 {pf['dimension']}/{pf['topic']}"
                 f" 近似同主题矛盾未经裁决（taboo reason={tb['degraded_reason']},"
                 f" preference reason={pf['degraded_reason']}, 无 conflict_with 互标）"))
     return out
@@ -102,17 +101,13 @@ def _adjudicated(tb, pf):
         pf_marks = set(json.loads(pf["conflict_with"] or "[]"))
     except (TypeError, ValueError):
         return False
-    # 兼容旧库：conflict_with 可能存裸 id（无 @scope），按行键与裸 id 双重匹配
-    tb_bare = tb["id"].rsplit("@", 1)[0]
-    pf_bare = pf["id"].rsplit("@", 1)[0]
-    return (tb["id"] in pf_marks or tb_bare in pf_marks
-            or pf["id"] in tb_marks or pf_bare in tb_marks)
+    return tb["id"] in pf_marks or pf["id"] in tb_marks
 
 
 def _conflict_json(conn):
     out = []
     for r in conn.execute(
-            "SELECT user_source, user_id, dimension, topic, scope, id, conflict_with"
+            "SELECT user_source, user_id, dimension, topic, id, conflict_with"
             " FROM entries WHERE conflict_with IS NOT NULL").fetchall():
         try:
             marks = json.loads(r["conflict_with"])
@@ -127,7 +122,7 @@ def _conflict_json(conn):
 def _taboo_negation(conn):
     out = []
     rows = conn.execute(
-        "SELECT e.user_source, e.user_id, e.dimension, e.topic, e.scope, e.id, s.quote"
+        "SELECT e.user_source, e.user_id, e.dimension, e.topic, e.id, s.quote"
         " FROM entries e JOIN sources s"
         "  ON s.user_source=e.user_source AND s.user_id=e.user_id"
         " AND s.entry_id = e.id"
@@ -137,10 +132,6 @@ def _taboo_negation(conn):
             out.append(_violation("taboo_negation", r,
                                   f"{_loc(r)} quote 不含否定词：{r['quote']!r}"))
     return out
-
-
-def _scope_compatible(a, b):
-    return a == b or a == "global" or b == "global"
 
 
 def _topics_near(a, b):
@@ -155,7 +146,7 @@ def _topics_near(a, b):
 
 def _quote_required(conn):
     return [_violation("quote_required", r, f"{_loc(r)} 无证据行") for r in conn.execute(
-        "SELECT e.user_source, e.user_id, e.dimension, e.topic, e.scope"
+        "SELECT e.user_source, e.user_id, e.dimension, e.topic"
         " FROM entries e LEFT JOIN sources s"
         "  ON s.user_source=e.user_source AND s.user_id=e.user_id"
         " AND s.entry_id = e.id"
@@ -166,7 +157,7 @@ def _inferred_cap(conn, cap: float):
     return [_violation("inferred_cap", r,
                        f"{_loc(r)} inferred confidence {r['confidence']} > {cap}")
             for r in conn.execute(
-        "SELECT DISTINCT e.user_source, e.user_id, e.dimension, e.topic, e.scope, e.confidence"
+        "SELECT DISTINCT e.user_source, e.user_id, e.dimension, e.topic, e.confidence"
         " FROM entries e JOIN sources s"
         "  ON s.user_source=e.user_source AND s.user_id=e.user_id"
         " AND s.entry_id = e.id"
@@ -174,10 +165,10 @@ def _inferred_cap(conn, cap: float):
 
 
 def _unique_key(conn):
-    return [_violation("unique_key_per_scope", r, f"{_loc(r)} 五元组重复 {r['c']} 行")
+    return [_violation("unique_key", r, f"{_loc(r)} 四元组重复 {r['c']} 行")
             for r in conn.execute(
-        "SELECT user_source, user_id, dimension, topic, scope, COUNT(*) c FROM entries"
-        " GROUP BY user_source, user_id, dimension, topic, scope HAVING c > 1").fetchall()]
+        "SELECT user_source, user_id, dimension, topic, COUNT(*) c FROM entries"
+        " GROUP BY user_source, user_id, dimension, topic HAVING c > 1").fetchall()]
 
 
 def _status_consistency(conn):
@@ -197,7 +188,7 @@ def _status_consistency(conn):
     out = []
     for cond, problem in checks:
         rows = conn.execute(
-            f"SELECT user_source, user_id, dimension, topic, scope FROM entries WHERE {cond}"
+            f"SELECT user_source, user_id, dimension, topic FROM entries WHERE {cond}"
         ).fetchall()
         out += [_violation("status_consistency", r, f"{_loc(r)} {problem}") for r in rows]
     return out
@@ -206,7 +197,7 @@ def _status_consistency(conn):
 def _instruction_pattern(conn):
     out = []
     for r in conn.execute(
-            "SELECT user_source, user_id, dimension, topic, scope, body FROM entries").fetchall():
+            "SELECT user_source, user_id, dimension, topic, body FROM entries").fetchall():
         if INSTRUCTION_RE.search(r["body"]):
             out.append(_violation("instruction_pattern", r, f"{_loc(r)} 正文命中指令模式"))
     return out
@@ -230,13 +221,13 @@ def flag_violations(conn, violations: list[dict], now: str) -> int:
                 continue
             row = conn.execute(
                 "SELECT status, updated_at FROM entries WHERE user_source=? AND user_id=?"
-                " AND dimension=? AND topic=? AND scope=?", tuple(e[k] for k in _ENTRY_FIELDS)
+                " AND dimension=? AND topic=?", tuple(e[k] for k in _ENTRY_FIELDS)
             ).fetchone()
             if row is None or row["status"] != "active":
                 continue
             cur = conn.execute(
                 "UPDATE entries SET status='pending_review', updated_at=?"
-                " WHERE user_source=? AND user_id=? AND dimension=? AND topic=? AND scope=?"
+                " WHERE user_source=? AND user_id=? AND dimension=? AND topic=?"
                 " AND status='active' AND updated_at=?",
                 (now, *[e[k] for k in _ENTRY_FIELDS], row["updated_at"]))
             if cur.rowcount == 0:
@@ -244,7 +235,7 @@ def flag_violations(conn, violations: list[dict], now: str) -> int:
             conn.execute(
                 "INSERT INTO review_history (entry_id, user_source, user_id, decision, actor,"
                 " ts, note, entry_version) VALUES (?, ?, ?, 'flagged', 'audit', ?, ?, ?)",
-                (e.get("id") or f"{e['dimension']}_{e['topic']}@{e['scope']}", e["user_source"], e["user_id"], now,
+                (e.get("id") or entry_key(e["dimension"], e["topic"]), e["user_source"], e["user_id"], now,
                  v["rule"], row["updated_at"]))
             flagged += 1
     return flagged

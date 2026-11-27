@@ -13,7 +13,6 @@ interface Target {
   user_source: string
   user_id: string
   entry_id: string
-  scope: string
 }
 
 const props = defineProps<{
@@ -38,7 +37,6 @@ const query = useQuery<ReviewDetail>({
     props.target?.user_source,
     props.target?.user_id,
     props.target?.entry_id,
-    props.target?.scope,
   ]),
   queryFn: () => {
     if (!props.target) throw new Error('no target')
@@ -46,7 +44,6 @@ const query = useQuery<ReviewDetail>({
       user_source: props.target.user_source,
       user_id: props.target.user_id,
       entry_id: props.target.entry_id,
-      scope: props.target.scope,
     })
     return api<ReviewDetail>(`/review/entry?${params.toString()}`)
   },
@@ -132,7 +129,6 @@ function goUser(): void {
         </el-descriptions-item>
         <el-descriptions-item label="维度">{{ detail.entry.dimension }}</el-descriptions-item>
         <el-descriptions-item label="主题">{{ detail.entry.topic }}</el-descriptions-item>
-        <el-descriptions-item label="作用域">{{ detail.entry.scope }}</el-descriptions-item>
         <el-descriptions-item label="状态">{{ statusLabel(detail.entry.status) }}</el-descriptions-item>
         <el-descriptions-item label="置信度">{{ detail.entry.confidence.toFixed(2) }}</el-descriptions-item>
         <el-descriptions-item label="强化次数">{{ detail.entry.reinforcements }}</el-descriptions-item>

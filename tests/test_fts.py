@@ -8,12 +8,12 @@ from pismor.core.db import get_conn, init_schema
 from pismor.serving import assembler
 
 
-def _entry(conn, topic, summary, *, dim="preference", uid="u1", scope="global"):
+def _entry(conn, topic, summary, *, dim="preference", uid="u1"):
     conn.execute(
-        "INSERT INTO entries (user_source,user_id,dimension,topic,scope,id,confidence,status,"
+        "INSERT INTO entries (user_source,user_id,dimension,topic,id,confidence,status,"
         "body,summary,created_at,updated_at,last_reinforced_at,reinforcements)"
-        " VALUES ('w',?,?,?,?,?,0.9,'active',?,?,?,?,?,0)",
-        (uid, dim, topic, scope, f"{dim}_{topic}", summary, summary,
+        " VALUES ('w',?,?,?,?,0.9,'active',?,?,?,?,?,0)",
+        (uid, dim, topic, f"{dim}_{topic}", summary, summary,
          "2026-01-01", "2026-01-01", "2026-01-01"))
 
 
@@ -81,9 +81,9 @@ def test_init_schema_rebuilds_on_tokenizer_switch(tmp_path):
     tokenizer.set_tokenizer("bigram")
     init_schema(c1, None)
     c1.execute(
-        "INSERT INTO entries (user_source,user_id,dimension,topic,scope,id,confidence,status,"
+        "INSERT INTO entries (user_source,user_id,dimension,topic,id,confidence,status,"
         "body,summary,created_at,updated_at,last_reinforced_at,reinforcements)"
-        " VALUES ('w','u1','preference','t','global','preference_t',0.9,'active',"
+        " VALUES ('w','u1','preference','t','preference_t',0.9,'active',"
         "'浅烘咖啡豆','浅烘咖啡豆','2026-01-01','2026-01-01','2026-01-01',0)")
     c1.commit()
     c1.close()

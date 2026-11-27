@@ -196,11 +196,6 @@ def validate_taxonomy(raw: dict, current, conn) -> dict:
     if not isinstance(raw, dict):
         return {"ok": False, "errors": ["词表顶层必须是 mapping"], "warnings": [], "impact": []}
 
-    scopes = raw.get("scopes")
-    if not isinstance(scopes, dict) or not scopes:
-        errors.append("scopes 必须是非空 mapping")
-        scopes = scopes if isinstance(scopes, dict) else {}
-
     dims = raw.get("dimensions")
     if not isinstance(dims, list) or not dims:
         errors.append("dimensions 必须是非空列表")
@@ -233,11 +228,6 @@ def validate_taxonomy(raw: dict, current, conn) -> dict:
             errors.append(f"{where}.priority 重复: {priority}")
         else:
             priorities.add(priority)
-        scope = dim.get("default_scope")
-        if not isinstance(scope, str) or not scope:
-            errors.append(f"{where}.default_scope 不能为空")
-        elif scopes and scope not in scopes:
-            errors.append(f"{where}.default_scope 不在 scopes: {scope}")
         topics = dim.get("topics")
         if not isinstance(topics, list) or not topics:
             errors.append(f"{where}.topics 必须是非空列表")

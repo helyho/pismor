@@ -233,20 +233,19 @@ def _rekey(conn, rows, dim, topic, now):
     """整组 re-key 转正：dimension/topic 按 LLM 指定，id 与证据键同步跟随；目标键被占的行进人工队列。"""
     activated = 0
     for r in rows:
-        new_id = entry_key(dim, topic, r["scope"])
+        new_id = entry_key(dim, topic)
         exists = conn.execute(
             "SELECT 1 FROM entries WHERE user_source=? AND user_id=? AND dimension=?"
-            " AND topic=? AND scope=?",
-            (r["user_source"], r["user_id"], dim, topic, r["scope"])).fetchone()
+            " AND topic=?",
+            (r["user_source"], r["user_id"], dim, topic)).fetchone()
         if exists:
             _queue_audit(conn, [r], now, note=f"merge_key_conflict: {new_id}")
             continue
         conn.execute(
             "UPDATE entries SET dimension=?, topic=?, id=?, status='active', topic_new=NULL,"
-            " updated_at=? WHERE user_source=? AND user_id=? AND dimension=? AND topic=?"
-            " AND scope=?",
+            " updated_at=? WHERE user_source=? AND user_id=? AND dimension=? AND topic=?",
             (dim, topic, new_id, now, r["user_source"], r["user_id"], r["dimension"],
-             r["topic"], r["scope"]))
+             r["topic"]))
         conn.execute(
             "UPDATE sources SET entry_id=? WHERE user_source=? AND user_id=? AND entry_id=?",
             (new_id, r["user_source"], r["user_id"], r["id"]))
@@ -289,8 +288,8 @@ def _physically_drop(conn, rows):
             (r["user_source"], r["user_id"], r["id"]))
         conn.execute(
             "DELETE FROM entries WHERE user_source=? AND user_id=? AND dimension=?"
-            " AND topic=? AND scope=?",
-            (r["user_source"], r["user_id"], r["dimension"], r["topic"], r["scope"]))
+            " AND topic=?",
+            (r["user_source"], r["user_id"], r["dimension"], r["topic"]))
 
 
 def _bare_topic(topic_new: str, taxonomy) -> str:
@@ -311,8 +310,7 @@ def _stage_taxonomy(taxonomy, dim, topic, topic_new, rows, appends):
         "dim": dim,
         "topics": [topic] if added else [],
         "case": {"quote": rows[0]["body"],
-                 "expect": {"dimension": dim, "topic": topic,
-                            "scope": rows[0]["scope"], "kind": "inferred"}},
+                 "expect": {"dimension": dim, "topic": topic, "kind": "inferred"}},
     }
     alias_edit = plan_topic_alias(taxonomy, dim, _bare_topic(topic_new, taxonomy), topic)
     if alias_edit is not None:
@@ -359,18 +357,18 @@ def _drop_expired_reviews(conn, now):
 def _open_merge_tasks(conn, taxonomy, now, threshold: int) -> int:
     """taboo 存活条数超阈值的用户 → 幂等建 open 归并任务，附自由 topic 提案。
 
-    任务粒度 = 用户（跨 scope 汇总），与装配侧 merge_task 同阈值同语义；
+    任务粒度 = 用户（全量汇总），与装配侧 merge_task 同阈值同语义；
     已存在 open 任务只刷新计数与提案，不重置 created_at。不做任何 entries 改动：
     实际归并走 review.decision(topic=...) 人工确认。
     """
     dim = taxonomy.dimensions.get("taboo")
     allowed = set(getattr(dim, "topics", None) or []) if dim else set()
     rows = conn.execute(
-        "SELECT user_source, user_id, scope, COUNT(*) AS n,"
+        "SELECT user_source, user_id, COUNT(*) AS n,"
         " GROUP_CONCAT(DISTINCT topic) AS topics"
         f" FROM entries WHERE {_ALIVE} AND dimension='taboo'"
         " AND status IN ('active','degraded')"
-        " GROUP BY user_source, user_id, scope").fetchall()
+        " GROUP BY user_source, user_id").fetchall()
     per_user: dict[tuple[str, str], dict] = {}
     for r in rows:
         bucket = per_user.setdefault(
@@ -388,8 +386,8 @@ def _open_merge_tasks(conn, taxonomy, now, threshold: int) -> int:
              "allowed_topics": sorted(allowed)}, ensure_ascii=False)
         conn.execute(
             "INSERT OR IGNORE INTO merge_tasks"
-            "(user_source, user_id, taboo_count, scope_filter, status, proposal_json,"
-            " created_at, updated_at) VALUES (?, ?, ?, NULL, 'open', ?, ?, ?)",
+            "(user_source, user_id, taboo_count, status, proposal_json,"
+            " created_at, updated_at) VALUES (?, ?, ?, 'open', ?, ?, ?)",
             (us, uid, b["count"], proposal, now, now))
         conn.execute(
             "UPDATE merge_tasks SET taboo_count=?, proposal_json=?, updated_at=?"

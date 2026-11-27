@@ -82,7 +82,7 @@ const dimensionOptions = computed(() => facetsQuery.data.value?.dimensions ?? []
 const sourceOptions = computed(() => facetsQuery.data.value?.sources ?? [])
 
 function keyOf(item: ReviewQueueItem): string {
-  return [item.user_source, item.user_id, item.entry_id, item.scope].join('\u0000')
+  return [item.user_source, item.user_id, item.entry_id].join('\u0000')
 }
 
 const selected = computed(
@@ -112,7 +112,6 @@ const detailQuery = useQuery<ReviewDetail>({
       user_source: item.user_source,
       user_id: item.user_id,
       entry_id: item.entry_id,
-      scope: item.scope,
     })
     return api<ReviewDetail>(`/review/entry?${params.toString()}`)
   },
@@ -215,7 +214,6 @@ function payloadFor(
   return {
     user_source: item.user_source,
     user_id: item.user_id,
-    scope: item.scope,
     entry_id: item.entry_id,
     decision,
     entry_version: detailData.value?.entry.updated_at ?? item.entry_version,
@@ -467,7 +465,6 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
           >
             <div class="queue-item-head">
               <el-tag size="small">{{ item.dimension }}</el-tag>
-              <el-tag size="small" type="info" effect="plain">{{ item.scope }}</el-tag>
             </div>
             <div class="user-cell queue-user-cell">
               <span class="source">{{ item.user_source }}</span>
@@ -561,7 +558,6 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
               </el-select>
               <span v-else>{{ detail.entry.topic }}</span>
             </el-descriptions-item>
-            <el-descriptions-item label="作用域">{{ detail.entry.scope }}</el-descriptions-item>
             <el-descriptions-item label="置信度">{{ detail.entry.confidence.toFixed(2) }}</el-descriptions-item>
             <el-descriptions-item label="强化次数">{{ detail.entry.reinforcements }}</el-descriptions-item>
             <el-descriptions-item label="最近强化">

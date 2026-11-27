@@ -39,13 +39,12 @@ t15() {
   expect_status 202 || return 1
   wait_db "SELECT 1 FROM entries e WHERE e.user_source='bb' AND e.user_id='${uid}' AND e.dimension='preference' AND e.topic='lang'" 120 \
     || { case_fail "120s 内条目未入库"; }
-  local entry_id ver ver2 scope
+  local entry_id ver ver2
   entry_id=$(db "SELECT id FROM entries WHERE user_source='bb' AND user_id='${uid}' AND topic='lang' ORDER BY rowid DESC LIMIT 1")
   [[ -n "$entry_id" ]] || { case_fail "未取到 entry_id"; }
-  scope=$(db "SELECT scope FROM entries WHERE user_source='bb' AND user_id='${uid}' AND id='${entry_id}' ORDER BY rowid DESC LIMIT 1")
-  ver=$(db "SELECT updated_at FROM entries WHERE user_source='bb' AND user_id='${uid}' AND id='${entry_id}' AND scope='${scope}' ORDER BY rowid DESC LIMIT 1")
-  [[ -n "$scope" && -n "$ver" ]] || { case_fail "未取到 scope/updated_at"; }
-  local vpath="/review/bb/${uid}/${scope}/${entry_id}/decision"
+  ver=$(db "SELECT updated_at FROM entries WHERE user_source='bb' AND user_id='${uid}' AND id='${entry_id}' ORDER BY rowid DESC LIMIT 1")
+  [[ -n "$ver" ]] || { case_fail "未取到 updated_at"; }
+  local vpath="/review/bb/${uid}/${entry_id}/decision"
   # updated_at 是秒级：confirm 前跨一秒，保证版本推进，"旧版本重发"才有 noop 语义
   sleep 1
   http POST "$vpath" "$(jq -n --arg decision confirm --arg v "$ver" '{decision:$decision, entry_version:$v}')"
@@ -57,11 +56,11 @@ t15() {
   expect_status 200 || return 1
   expect_json_true '.noop' || return 1
   # 新版本 remove → 该条目消失
-  ver2=$(db "SELECT updated_at FROM entries WHERE user_source='bb' AND user_id='${uid}' AND id='${entry_id}' AND scope='${scope}' ORDER BY rowid DESC LIMIT 1")
+  ver2=$(db "SELECT updated_at FROM entries WHERE user_source='bb' AND user_id='${uid}' AND id='${entry_id}' ORDER BY rowid DESC LIMIT 1")
   [[ -n "$ver2" ]] || { case_fail "remove 前 entry 已消失"; }
   if [[ "$ver2" == "$ver" ]]; then
     sleep 1
-    ver2=$(db "SELECT updated_at FROM entries WHERE user_source='bb' AND user_id='${uid}' AND id='${entry_id}' AND scope='${scope}' ORDER BY rowid DESC LIMIT 1")
+    ver2=$(db "SELECT updated_at FROM entries WHERE user_source='bb' AND user_id='${uid}' AND id='${entry_id}' ORDER BY rowid DESC LIMIT 1")
   fi
   [[ "$ver2" != "$ver" ]] || { case_fail "confirm 后 updated_at 未推进（版本轮转失效）"; }
   http POST "$vpath" "$(jq -n --arg decision remove --arg v "$ver2" '{decision:$decision, entry_version:$v}')"
@@ -134,9 +133,9 @@ t18_clarify() {
   [[ "$n" == "0" ]] || { case_fail "回答后 pending 未消费（120s）"; }
 
   # 6) 收敛：规范行生效、+ 变形行归档、互标清除、装配不再提问
-  expect_db "SELECT status FROM entries WHERE user_source='bb' AND user_id='$uid' AND id='preference_verbosity@global'" "active" || return 1
-  expect_db "SELECT status FROM entries WHERE user_source='bb' AND user_id='$uid' AND id='preference_+verbosity@global'" "archived" || return 1
-  expect_db "SELECT count(*) FROM entries WHERE user_source='bb' AND user_id='$uid' AND id IN ('preference_verbosity@global','preference_+verbosity@global') AND conflict_with IS NOT NULL" "0" || return 1
+  expect_db "SELECT status FROM entries WHERE user_source='bb' AND user_id='$uid' AND id='preference_verbosity'" "active" || return 1
+  expect_db "SELECT status FROM entries WHERE user_source='bb' AND user_id='$uid' AND id='preference_+verbosity'" "archived" || return 1
+  expect_db "SELECT count(*) FROM entries WHERE user_source='bb' AND user_id='$uid' AND id IN ('preference_verbosity','preference_+verbosity') AND conflict_with IS NOT NULL" "0" || return 1
   http GET "/memory/bb/$uid"
   expect_status 200 || return 1
   expect_json '.clarification_needed | length' '0' || return 1

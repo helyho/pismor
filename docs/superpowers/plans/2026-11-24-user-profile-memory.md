@@ -1,5 +1,7 @@
 # 用户画像记忆系统实现计划
 
+> **已废弃（2026-11-27）**：`scope` 作用域机制已从实现中物理移除。条目主键现为 `(user_source, user_id, dimension, topic)`，行键为 `dimension_topic`。本文仅作历史设计/计划记录保留，代码片段不可直接照用。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** 实现 spec 定义的画像记忆系统：统一事件入口 → 抽取管线 → SQLite 存储 → 装配 API，实时注入画像包。

@@ -8,7 +8,7 @@
 
 1. **SQLite 是唯一真相源**：条目、证据、审计、任务、已见事件全部落库；YAML 只是可热更新的配置词表。
 2. **taboo 恒第一**：排序、必带、预算、冲突裁决、衰减豁免、词表冻结六个环节都单独硬编码，不依赖配置。
-3. **一条记忆 = 五元组 + 证据链**：`(user_source, user_id, dimension, topic, scope)` 唯一；`entries.id = sources.entry_id = dimension_topic@scope`。
+3. **一条记忆 = 四元组 + 证据链**：`(user_source, user_id, dimension, topic)` 唯一；`entries.id = sources.entry_id = dimension_topic`。
 4. **无 quote 不入库**：写入器与审计双重把关；quote 是用户原话，不是模型摘要。
 5. **词表即边界**：维度/主题/作用域必须来自 taxonomy；词表外的话题只能进观察区或人工复核，不能静默落库。
 6. **显式才直通**：`confidence ≥ gate.auto_min` 且 `kind == explicit` 才是 auto；`inferred` 置信压顶 0.8；低于 `review_min` 直接丢。
@@ -47,7 +47,7 @@
 
 ### 1.3 键与命名
 
-- 规范条目：`topic` 就是词表主题；`id = entry_key(dimension, topic, scope)`。
+- 规范条目：`topic` 就是词表主题；`id = entry_key(dimension, topic)`。
 - 冲突变形行：`topic = "+{topic}"`，只能处于 `active/degraded`。
 - 历史轨迹行：`topic = "~{topic}:{紧凑时间}:{序号}"`，必须 `archived`。
 - 待复核快照：`topic = "!{topic}"`（冲突时 `!topic:2`…），仍为 `pending_review`。
@@ -95,7 +95,7 @@
 | # | 位置 | 行为 |
 |---|---|---|
 | 1 | `writer.apply_actions` | 同批动作按 `candidate.dimension == 'taboo'` 稳定排序，taboo 先落库；同批新增 preference 时能查到已存在的 taboo |
-| 2 | `writer._add` | 同 user/topic/scope 已有存活 taboo → 新行直接 `degraded/conflict_lost`，置信 ×0.8，并给 taboo 补 `conflict_with` |
+| 2 | `writer._add` | 同 user/topic 已有存活 taboo → 新行直接 `degraded/conflict_lost`，置信 ×0.8，并给 taboo 补 `conflict_with` |
 | 3 | `writer._conflict` | 新候选是 taboo，或目标主题已有存活 taboo → taboo 侧保持/落为 `active`，对方降级；旧行是 taboo 时只补标记，不降状态、不降置信 |
 | 4 | `resolver.resolve` | preference 候选存在同 topic 存活 taboo → 强制 `CONFLICT`，不给 LLM 选择空间 |
 | 5 | `assembler._must_have` | taboo 与 identity 无条件进入必带集，不受 `query`、`dimensions` 白名单影响 |
@@ -122,11 +122,10 @@
 - **敏感主题**：只认 `dimension.topic_overrides[topic].sensitive`（不认维度级 `sensitive`）；置信压到 ≤0.6，正文/原话命中 `\d+号|\d+栋|确诊|处方` 直接丢弃。
 - **敏感新主题**：观察区晋级时若目标主题敏感，只入人工队列，不自动建桶。
 - **inferred 压顶**：`kind == inferred` 先压到 ≤0.8，因此永远无法 auto 直通。
-- **作用域白名单**：非法 scope 在抽取时回落到维度默认 scope 并 ×0.8；写入器遇到非法 scope 直接丢弃该动作。
 
 ### 3.4 主键、状态与一致性
 
-- 五元组唯一；同一主题同一 scope 不允许两条规范行。
+- 四元组唯一；同一主题不允许两条规范行。
 - `id` 与 `sources.entry_id` 必须同步；改键/合并必须迁移证据链。
 - 状态必须属于五态；迁移必须走合法边（见 §5），非法迁移抛 `IllegalTransition`，由写入器逐条隔离。
 - `~` 前缀行必须 `archived`；`+` 前缀行只能 `active/degraded`；`!` 前缀行是 `pending_review` 快照。
@@ -136,7 +135,7 @@
 ### 3.5 幂等、并发与删除权
 
 - 入站以 `(source, event_id)` 幂等；缺 `event_id` 时用规范化内容哈希兜底。
-- 复核使用乐观锁：`id + scope + updated_at == entry_version`，先到者生效，后到返回 `noop`。
+- 复核使用乐观锁：`id + updated_at == entry_version`，先到者生效，后到返回 `noop`。
 - 审计标记同样用 `updated_at` CAS，且只处理 `active` 行。
 - tombstone 是永久口径：写入管线跳过、装配返回空包、`POST /events` 返回 410；软删除可恢复，硬删除保留 tombstone 并记 `purged_at`。
 
@@ -198,8 +197,7 @@ POST /events
    - 非 taboo → 转观察区（`orphan` + `topic_new`）。
 5. `INSTRUCTION_RE` 命中 body/quote/summary → 丢弃。
 6. 敏感主题：置信 `min(conf, 0.6)`；正文或原话命中敏感细节正则 → 丢弃。
-7. 非法 scope → 维度默认 scope，置信 ×0.8。
-8. 截断：`body` 200 字、`summary` 20 字；空 quote 置空（后续写入器会拒绝）。
+7. 截断：`body` 200 字、`summary` 20 字；空 quote 置空（后续写入器会拒绝）。
 
 ### 4.5 置信门槛（`pipeline/gate.py`）
 
@@ -217,7 +215,7 @@ POST /events
 
 - `orphan` 候选：直接输出 `ORPHAN`，不调 LLM。
 - 无同键条目：
-  1. 先做近邻互斥检测：只检查 `taboo ↔ preference`、同 scope、`active`、排除 `~/+/!`、LIMIT 5；
+  1. 先做近邻互斥检测：只检查 `taboo ↔ preference`、`active`、排除 `~/+/!`、LIMIT 5；
   2. LLM 判定互斥 → `CONFLICT`，否则 `ADD`。
 - 同键存在：
   - 旧行 `pending_review` → 直接 `UPDATE`（不再问 LLM，避免队列自我阻塞）；
@@ -288,7 +286,7 @@ POST /events
 - 一方是 taboo：taboo 保持 `active`，对方降级；taboo 行只补 `conflict_with`。
 - 新候选是 taboo：新行 `active`，旧行降级。
 - 冲突行统一放在 `+topic`，避免覆盖规范键。
-- `resolve_conflicts` 只做精确匹配：完整 `id`、`{bare}@{scope}`、历史裸 id 三种写法都兼容；`revive=True` 时只恢复 `degraded_reason == 'conflict_lost'` 的对方。
+- `resolve_conflicts` 只做精确匹配：按完整 `id` 定位；`revive=True` 时只恢复 `degraded_reason == 'conflict_lost'` 的对方。
 
 ### 5.6 合并条目
 
@@ -353,7 +351,6 @@ POST /events
 
 **必带集**：`taboo + identity`，`status IN (active, degraded)`。
 
-- `current_scope` 非空时只取 `global` 与当前 scope；
 - SQL 先按置信降序，Python 再按维度 rank 稳定排序；
 - `dimensions` 白名单不影响必带集。
 
@@ -515,7 +512,7 @@ status='degraded' AND julianday(updated_at) < julianday(now) - 180
 
 ### 10.5 归并任务
 
-按用户统计所有 `active/degraded` 的 taboo 条数（跨 scope）：
+按用户统计所有 `active/degraded` 的 taboo 条数：
 
 - 超过 40 → `INSERT OR IGNORE` 一条 `merge_tasks`（`status='open'`），并刷新已有 open 行的计数、候选空闲主题、更新时间；
 - 不修改任何条目，只创建待办；
@@ -526,7 +523,7 @@ status='degraded' AND julianday(updated_at) < julianday(now) - 180
 
 日批在聚合后运行 8 条只读审计规则，然后只把 `active` 违规行标记为 `pending_review`：
 
-- 规则：`taboo_no_overlap`、`taboo_negation`、`conflict_with_json`、`quote_required`、`inferred_cap`、`unique_key_per_scope`、`status_consistency`、`instruction_pattern`。
+- 规则：`taboo_no_overlap`、`taboo_negation`、`conflict_with_json`、`quote_required`、`inferred_cap`、`unique_key`、`status_consistency`、`instruction_pattern`。
 - 标记使用 `updated_at` CAS；写 `review_history(decision='flagged', note=规则名)`。
 - 归档行、观察区行、已删除用户不在标记范围。
 
@@ -551,7 +548,6 @@ status='degraded' AND julianday(updated_at) < julianday(now) - 180
 | 字段 | 含义 |
 |---|---|
 | `taboo_count` | 当前 taboo 条数 |
-| `scope_filter` | 装配触发时的 scope；日批为 NULL |
 | `proposal_json` | taboo 计数、可自由使用/允许的主题 |
 | `status` | `open / done / dismissed` |
 
@@ -578,12 +574,12 @@ status='degraded' AND julianday(updated_at) < julianday(now) - 180
 
 | 规则 | 口径 |
 |---|---|
-| `taboo_no_overlap` | taboo 与 preference 近似同主题、scope 相容；已裁决（preference `conflict_lost` 或互标）则排除 |
+| `taboo_no_overlap` | taboo 与 preference 近似同主题；已裁决（preference `conflict_lost` 或互标）则排除 |
 | `taboo_negation` | taboo 的每条 quote 必须含否定词（不/别/禁/勿/拒绝/无需/避免/没有） |
 | `conflict_with_json` | 标记必须是合法 JSON 数组；坏 JSON 只报违规，不中断审计 |
 | `quote_required` | 非 `~` 行必须至少有一条证据 |
 | `inferred_cap` | inferred 证据的条目置信不得 > 0.8 |
-| `unique_key_per_scope` | 五元组不得重复 |
+| `unique_key` | 四元组不得重复 |
 | `status_consistency` | 8 条静态断言（原因、归档时间、topic_new、前缀与状态的对应） |
 | `instruction_pattern` | 正文命中指令注入模式 |
 
@@ -593,7 +589,7 @@ status='degraded' AND julianday(updated_at) < julianday(now) - 180
 
 - 当前没有真实认证，`LOCAL_ADMIN` 拥有全部 12 项 capability。
 - 配置热更新：下一请求 / 下一轮日批生效；`db_path`、`taxonomy_path`、`embedding.dimensions` 只读。
-- 词表校验：维度/主题/priority 唯一；默认 scope 合法；`disabled_topics` 必须属于 topics；topic_overrides 的 key 必须存在；回归样例 quote 非空。
+- 词表校验：维度/主题/priority 唯一；`disabled_topics` 必须属于 topics；topic_overrides 的 key 必须存在；回归样例 quote 非空。
 - priority 只影响召回排序；taboo 仍硬钉第一。
 
 ---

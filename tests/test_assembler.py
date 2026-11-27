@@ -46,14 +46,13 @@ def audit_sink():
 
 
 def _entry(conn, dim, topic, body, *, entry_id=None, status="active", conf=0.9,
-           conflict_with=None, scope="global", uid="u1", updated=NOW):
+           conflict_with=None, uid="u1", updated=NOW):
     conn.execute(
-        "INSERT INTO entries (user_source,user_id,dimension,topic,scope,id,confidence,status,"
+        "INSERT INTO entries (user_source,user_id,dimension,topic,id,confidence,status,"
         "body,summary,created_at,updated_at,last_reinforced_at,reinforcements,conflict_with)"
-        " VALUES ('w',?,?,?,?,?,?,?,?,?,?,?,?,0,?)",
-        (uid, dim, topic, scope,
-         entry_id if entry_id and "@" in entry_id else
-         (f"{entry_id}@{scope}" if entry_id else f"{dim}_{topic}@{scope}"),
+        " VALUES ('w',?,?,?,?,?,?,?,?,?,?,?,0,?)",
+        (uid, dim, topic,
+         entry_id if entry_id else f"{dim}_{topic}",
          conf, status,
          body, body[:20], updated, updated, updated, conflict_with))
 
@@ -93,11 +92,11 @@ def seeded_degraded(conn):
 
 @pytest.fixture
 def seeded_conflict_pair(conn):
-    # 矛盾双存：同 scope 变形 topic（writer 约定），对称互标，formal 置信更高
-    _entry(conn, "preference", "style", "写作偏好正式文体", entry_id="pref_style_formal",
-           conf=0.9, conflict_with='["pref_style_casual"]', scope="work")
-    _entry(conn, "preference", "+style", "写作偏好口语化", entry_id="pref_style_casual",
-           status="degraded", conf=0.65, conflict_with='["pref_style_formal"]', scope="work")
+    # 矛盾双存：'+' 变形 topic（writer 约定），对称互标，formal 置信更高
+    _entry(conn, "preference", "style", "写作偏好正式文体",
+           conf=0.9, conflict_with='["preference_+style"]')
+    _entry(conn, "preference", "+style", "写作偏好口语化",
+           status="degraded", conf=0.65, conflict_with='["preference_style"]')
     conn.commit()
 
 
@@ -128,7 +127,7 @@ def broken_db(conn):
 def test_must_have_set_always_included(conn, seeded):
     pack = assemble(conn, None, "w", "u1", budget=200)
     assert pack["entries"][0]["id"].startswith("taboo_")
-    assert {e["id"] for e in pack["entries"]} >= {"taboo_excel@global", "identity_role@global"}
+    assert {e["id"] for e in pack["entries"]} >= {"taboo_excel", "identity_role"}
 
 
 def test_budget_truncates_by_score(conn, seeded_many):
@@ -136,7 +135,7 @@ def test_budget_truncates_by_score(conn, seeded_many):
     total = sum(len(e["text"]) for e in pack["entries"])
     assert total <= 300 * 4  # 粗略 token≈4 字符换算; 断言超预算条目被截
     assert len(pack["entries"]) < 6
-    assert [e["id"] for e in pack["entries"][:3]] == ["taboo_t0@global", "taboo_t1@global", "taboo_t2@global"]
+    assert [e["id"] for e in pack["entries"][:3]] == ["taboo_t0", "taboo_t1", "taboo_t2"]
     assert pack["budget_used"] == 264  # 5 条 × len("字"*200)//3 = 5 × 66
 
 
@@ -161,13 +160,13 @@ def test_degraded_prefixed(conn, seeded_degraded):
 def test_clarification_pair_detected(conn, seeded_conflict_pair):
     pack = assemble(conn, None, "w", "u1", budget=2000)
     assert pack["clarification_needed"][0]["conflicting_ids"] == \
-        ["pref_style_formal@work", "pref_style_casual@work"]
+        ["preference_style", "preference_+style"]
     assert conn.execute("SELECT COUNT(*) c FROM pending_clarifications").fetchone()["c"] == 1
 
 
 def test_asymmetric_conflict_not_reported(conn, seeded_conflict_pair):
     # 单向标记（对方未回标）不是矛盾对，不进澄清
-    conn.execute("UPDATE entries SET conflict_with=NULL WHERE id='pref_style_formal@work'")
+    conn.execute("UPDATE entries SET conflict_with=NULL WHERE id='preference_style'")
     conn.commit()
     pack = assemble(conn, None, "w", "u1", budget=2000)
     assert pack["clarification_needed"] == []
@@ -200,7 +199,7 @@ def test_full_corruption_returns_empty_pack(conn, seeded):
 
 def test_lexical_match(conn, seeded):
     pack = assemble(conn, None, "w", "u1", budget=2000, query="最近只喝浅烘咖啡豆吗")
-    assert "preference_coffee@global" in [e["id"] for e in pack["entries"]]
+    assert "preference_coffee" in [e["id"] for e in pack["entries"]]
 
 
 def test_related_top_k_configurable(conn):
@@ -219,11 +218,11 @@ def test_vector_recall(conn, seeded):
     conn.execute("CREATE VIRTUAL TABLE embeddings USING vec0("
                  "entry_id TEXT PRIMARY KEY, user_source TEXT, user_id TEXT, embedding float[4])")
     conn.execute("INSERT INTO embeddings VALUES (?, 'w','u1', ?)",
-                 (vec_key("w", "u1", "preference", "coffee", "global"),
+                 (vec_key("w", "u1", "preference", "coffee"),
                   json.dumps([0.1, 0.2, 0.3, 0.4])))
     conn.commit()
     pack = assemble(conn, EmbedderStub(), "w", "u1", budget=2000, query="咖啡")
-    assert "preference_coffee@global" in [e["id"] for e in pack["entries"]]
+    assert "preference_coffee" in [e["id"] for e in pack["entries"]]
 
 
 def test_vector_recall_drops_dissimilar(conn, seeded):
@@ -232,11 +231,11 @@ def test_vector_recall_drops_dissimilar(conn, seeded):
     conn.execute("CREATE VIRTUAL TABLE embeddings USING vec0("
                  "entry_id TEXT PRIMARY KEY, user_source TEXT, user_id TEXT, embedding float[4])")
     conn.execute("INSERT INTO embeddings VALUES (?, 'w','u1', ?)",
-                 (vec_key("w", "u1", "preference", "coffee", "global"),
+                 (vec_key("w", "u1", "preference", "coffee"),
                   json.dumps([-0.1, -0.2, -0.3, -0.4])))
     conn.commit()
     pack = assemble(conn, EmbedderStub(), "w", "u1", budget=2000, query="深度学习")
-    assert "preference_coffee@global" not in [e["id"] for e in pack["entries"]]
+    assert "preference_coffee" not in [e["id"] for e in pack["entries"]]
 
 
 def test_vector_recall_threshold_configurable(conn, seeded):
@@ -244,23 +243,23 @@ def test_vector_recall_threshold_configurable(conn, seeded):
     conn.execute("CREATE VIRTUAL TABLE embeddings USING vec0("
                  "entry_id TEXT PRIMARY KEY, user_source TEXT, user_id TEXT, embedding float[4])")
     conn.execute("INSERT INTO embeddings VALUES (?, 'w','u1', ?)",
-                 (vec_key("w", "u1", "preference", "coffee", "global"),
+                 (vec_key("w", "u1", "preference", "coffee"),
                   json.dumps([-0.1, -0.2, -0.3, -0.4])))
     conn.commit()
     pack = assemble(conn, EmbedderStub(), "w", "u1", budget=2000, query="深度学习",
                     min_similarity=-1.0)
-    assert "preference_coffee@global" in [e["id"] for e in pack["entries"]]
+    assert "preference_coffee" in [e["id"] for e in pack["entries"]]
 
 
 def test_embed_down_falls_back_to_lexical(conn, seeded):
     pack = assemble(conn, EmbedderDown(), "w", "u1", budget=2000, query="浅烘咖啡")
-    assert "preference_coffee@global" in [e["id"] for e in pack["entries"]]
+    assert "preference_coffee" in [e["id"] for e in pack["entries"]]
 
 
 def test_embed_keyerror_falls_back_to_lexical(conn, seeded):
     # Task 4 遗留：网关 200 + 坏体 KeyError 同样回退词面
     pack = assemble(conn, EmbedderKeyError(), "w", "u1", budget=2000, query="浅烘咖啡")
-    assert "preference_coffee@global" in [e["id"] for e in pack["entries"]]
+    assert "preference_coffee" in [e["id"] for e in pack["entries"]]
 
 
 def test_rendered_wrapper(conn, seeded):
@@ -279,14 +278,14 @@ def test_include_memory_false_keeps_rest(conn, seeded):
 def test_dimensions_filter(conn, seeded):
     # 无 query 时相关集为空，entries 即必带集全量（白名单不削减）
     pack = assemble(conn, None, "w", "u1", budget=2000, dimensions=["taboo"])
-    assert {e["id"] for e in pack["entries"]} == {"taboo_excel@global", "identity_role@global"}
+    assert {e["id"] for e in pack["entries"]} == {"taboo_excel", "identity_role"}
 
 
 def test_dimensions_keeps_must_have_set(conn, seeded):
     # 必带集恒在：白名单 ["preference"] 不得静默过滤 taboo+identity
     pack = assemble(conn, None, "w", "u1", budget=2000, dimensions=["preference"])
     ids = [e["id"] for e in pack["entries"]]
-    assert "taboo_excel@global" in ids and "identity_role@global" in ids
+    assert "taboo_excel" in ids and "identity_role" in ids
 
 
 def test_dimensions_filters_related_only(conn, seeded):
@@ -295,76 +294,35 @@ def test_dimensions_filters_related_only(conn, seeded):
     conn.commit()
     pack = assemble(conn, None, "w", "u1", budget=2000, query="海淀区咖啡", dimensions=["preference"])
     ids = [e["id"] for e in pack["entries"]]
-    assert "preference_coffee@global" in ids          # 白名单内的相关集条目入选
+    assert "preference_coffee" in ids          # 白名单内的相关集条目入选
     assert "context_city" not in ids           # 白名单外的相关维度被筛掉
-    assert "taboo_excel@global" in ids and "identity_role@global" in ids  # 必带集不受影响
+    assert "taboo_excel" in ids and "identity_role" in ids  # 必带集不受影响
 
 
-# ---- fix wave 新增：跨 scope 复合键 / 多矛盾对同秒 ----
-
-def test_cross_scope_same_id_both_injected(conn):
-    # C-1：同 id 跨 scope 是两条独立条目，装配不得按裸 id 去重
-    _entry(conn, "preference", "lang", "语言使用 Python 写脚本", scope="global")
-    _entry(conn, "preference", "lang", "语言项目内使用 Go 写服务", scope="project:x")
-    conn.commit()
-    pack = assemble(conn, None, "w", "u1", budget=2000, query="语言")
-    bodies = [e["text"] for e in pack["entries"] if e["id"].startswith("preference_lang@")]
-    assert "语言使用 Python 写脚本" in bodies and "语言项目内使用 Go 写服务" in bodies
-
-
-def test_cross_scope_conflict_pair_not_collapsed(conn):
-    # 同 id 跨 scope 的矛盾对按 (id,scope) 定位，不塌缩成一条
-    _entry(conn, "preference", "lang", "语言 Python", scope="global",
-           conflict_with='["preference_lang@project:x"]')
-    _entry(conn, "preference", "lang", "语言 Go", scope="project:x",
-           conflict_with='["preference_lang@global"]')
-    conn.commit()
-    pack = assemble(conn, None, "w", "u1", budget=2000)
-    assert pack["clarification_needed"][0]["conflicting_ids"] == \
-        ["preference_lang@global", "preference_lang@project:x"]
-    assert conn.execute("SELECT COUNT(*) c FROM pending_clarifications").fetchone()["c"] == 1
-
+# ---- fix wave 新增：多矛盾对同秒 ----
 
 def test_multiple_pairs_same_second_all_reported(conn):
     # I-3：同秒两个互不相关矛盾对 → 两条澄清 + 两行 pending，互不覆盖
-    _entry(conn, "preference", "style", "正式", entry_id="pref_style", scope="global",
-           conflict_with='["pref_+style@global"]')
-    _entry(conn, "preference", "+style", "随意", entry_id="pref_+style", status="degraded",
-           conflict_with='["pref_style@global"]')
-    _entry(conn, "preference", "lang", "Python", entry_id="pref_lang", scope="global",
-           conflict_with='["pref_+lang@global"]')
-    _entry(conn, "preference", "+lang", "Go", entry_id="pref_+lang", status="degraded",
-           conflict_with='["pref_lang@global"]')
+    _entry(conn, "preference", "style", "正式",
+           conflict_with='["preference_+style"]')
+    _entry(conn, "preference", "+style", "随意", status="degraded",
+           conflict_with='["preference_style"]')
+    _entry(conn, "preference", "lang", "Python",
+           conflict_with='["preference_+lang"]')
+    _entry(conn, "preference", "+lang", "Go", status="degraded",
+           conflict_with='["preference_lang"]')
     conn.commit()
     pack = assemble(conn, None, "w", "u1", budget=2000)
     pairs = {frozenset(item["conflicting_ids"]) for item in pack["clarification_needed"]}
-    assert pairs == {frozenset(("pref_style@global", "pref_+style@global")),
-                     frozenset(("pref_lang@global", "pref_+lang@global"))}
+    assert pairs == {frozenset(("preference_style", "preference_+style")),
+                     frozenset(("preference_lang", "preference_+lang"))}
     assert conn.execute("SELECT COUNT(*) c FROM pending_clarifications").fetchone()["c"] == 2
-
-
-def test_vector_recall_isolates_cross_scope(conn):
-    # I-14：同 id 跨 scope 两个向量行，召回都能命中且不串行
-    conn.execute("CREATE VIRTUAL TABLE embeddings USING vec0("
-                 "entry_id TEXT PRIMARY KEY, user_source TEXT, user_id TEXT, embedding float[4])")
-    _entry(conn, "preference", "lang", "语言使用 Python", scope="global")
-    _entry(conn, "preference", "lang", "语言项目内使用 Go", scope="project:x")
-    conn.execute("INSERT INTO embeddings VALUES (?, 'w','u1', ?)",
-                 (vec_key("w", "u1", "preference", "lang", "global"),
-                  json.dumps([0.1, 0.2, 0.3, 0.4])))
-    conn.execute("INSERT INTO embeddings VALUES (?, 'w','u1', ?)",
-                 (vec_key("w", "u1", "preference", "lang", "project:x"),
-                  json.dumps([0.1, 0.2, 0.3, 0.4])))
-    conn.commit()
-    pack = assemble(conn, EmbedderStub(), "w", "u1", budget=2000, query="语言")
-    bodies = {e["text"] for e in pack["entries"]}
-    assert {"语言使用 Python", "语言项目内使用 Go"} <= bodies
 
 
 # ---- priority 驱动运行时：taxonomy.priority_order() ----
 
 def _row(dimension, topic, body, conf=0.9, status="active"):
-    return {"id": f"{dimension}_{topic}@global", "scope": "global", "dimension": dimension,
+    return {"id": f"{dimension}_{topic}", "dimension": dimension,
             "body": body, "confidence": conf, "status": status,
             "updated_at": NOW, "reinforcements": 0}
 
@@ -398,7 +356,7 @@ def test_taboo_stays_first_despite_priority(conn, seeded):
     # 硬约束：即使配置把 taboo 排在后面，注入顺序也不得翻转
     pack = assemble(conn, None, "w", "u1", budget=2000,
                     dimension_order=("identity", "taboo"))
-    assert [e["id"] for e in pack["entries"]][0] == "taboo_excel@global"
+    assert [e["id"] for e in pack["entries"]][0] == "taboo_excel"
 
 
 class UnitQueryEmbedder:
@@ -414,10 +372,10 @@ def test_vector_recall_normalizes_query(conn):
     conn.execute("CREATE VIRTUAL TABLE embeddings USING vec0("
                  "entry_id TEXT PRIMARY KEY, user_source TEXT, user_id TEXT, embedding float[2])")
     conn.execute("INSERT INTO embeddings VALUES (?, 'w','u1', ?)",
-                 (vec_key("w", "u1", "preference", "deep", "global"), json.dumps([1.0, 0.0])))
+                 (vec_key("w", "u1", "preference", "deep"), json.dumps([1.0, 0.0])))
     conn.commit()
     pack = assemble(conn, UnitQueryEmbedder(), "w", "u1", budget=2000, query="无关主题")
-    assert "preference_deep@global" in [e["id"] for e in pack["entries"]]
+    assert "preference_deep" in [e["id"] for e in pack["entries"]]
 
 
 def test_clarifications_issued_in_single_batch(conn, seeded_conflict_pair, monkeypatch):
@@ -437,17 +395,16 @@ def test_clarifications_issued_in_single_batch(conn, seeded_conflict_pair, monke
     assert pack["clarification_needed"][0]["question"] == "q0"
 
 
-def test_current_scope_limits_must_have(conn):
-    _entry(conn, "taboo", "excel", "全局禁忌", scope="global")
-    _entry(conn, "taboo", "excel", "工作项目禁忌", scope="project:work")
-    _entry(conn, "taboo", "excel", "其他项目禁忌", scope="project:other")
+def test_must_have_is_all_user_entries(conn):
+    # 必带集 = 该用户全部 active/degraded 的 taboo/identity，且不跨用户取数
+    _entry(conn, "taboo", "excel", "用户一禁忌", uid="u1")
+    _entry(conn, "identity", "role", "用户一身份", uid="u1")
+    _entry(conn, "taboo", "excel", "用户二禁忌", uid="u2")
     conn.commit()
-    pack = assemble(conn, None, "w", "u1", budget=2000,
-                    current_scope="project:work")
+    pack = assemble(conn, None, "w", "u1", budget=2000)
     ids = {e["id"] for e in pack["entries"]}
-    assert "taboo_excel@global" in ids
-    assert "taboo_excel@project:work" in ids
-    assert "taboo_excel@project:other" not in ids
+    assert {"taboo_excel", "identity_role"} <= ids
+    assert len(ids) == 2  # 只取该用户的两条
 
 
 def test_merge_task_sink_persists_single_open(conn, tmp_path):
@@ -456,9 +413,8 @@ def test_merge_task_sink_persists_single_open(conn, tmp_path):
         _entry(conn, "taboo", f"t{i}", "字" * 30, conf=0.5)
     _entry(conn, "identity", "role", "用户是后端工程师")
     conn.commit()
-    sink = DbMergeTaskSink(tmp_path / "test.db", "w", "u1", "project:work")
-    pack = assemble(conn, None, "w", "u1", budget=2000,
-                    current_scope="project:work", audit_sink=sink)
+    sink = DbMergeTaskSink(tmp_path / "test.db", "w", "u1")
+    pack = assemble(conn, None, "w", "u1", budget=2000, audit_sink=sink)
     assert pack["merge_task"] is True
     assemble(conn, None, "w", "u1", budget=2000, audit_sink=sink)
     row = conn.execute("SELECT COUNT(*) c, MAX(taboo_count) n FROM merge_tasks"

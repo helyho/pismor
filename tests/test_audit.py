@@ -1,16 +1,16 @@
-"""Task 11 一致性审计测试：brief 四例 + 规则分支钉死（近似主题/scope 相容/非法组合/轨迹行豁免）。"""
+"""Task 11 一致性审计测试：brief 四例 + 规则分支钉死（近似主题/非法组合/轨迹行豁免）。"""
 import pytest
 
 from pismor.serving.audit import run_audit
 
 NOW = "2026-11-24T00:00:00+08:00"
 
-_ENTRY_COLS = ("user_source,user_id,dimension,topic,scope,id,confidence,status,body,summary,"
+_ENTRY_COLS = ("user_source,user_id,dimension,topic,id,confidence,status,body,summary,"
                "created_at,updated_at,last_reinforced_at,degraded_reason,topic_new,"
                "conflict_with,reinforcements,archived_at")
 
 
-def seed_entry(conn, us="w", uid="u", dimension="preference", topic="lang", scope="global",
+def seed_entry(conn, us="w", uid="u", dimension="preference", topic="lang",
                status="active", confidence=0.9, body="一句话记忆",
                degraded_reason=None, topic_new=None, archived_at=None, kind="explicit",
                conflict_with=None, quote=None):
@@ -19,8 +19,8 @@ def seed_entry(conn, us="w", uid="u", dimension="preference", topic="lang", scop
     ~ 前缀轨迹行不插证据行（审计对轨迹行豁免 quote_required）。
     """
     conn.execute(
-        f"INSERT INTO entries ({_ENTRY_COLS}) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-        (us, uid, dimension, topic, scope, f"{dimension}_{topic}@{scope}", confidence, status,
+        f"INSERT INTO entries ({_ENTRY_COLS}) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (us, uid, dimension, topic, f"{dimension}_{topic}", confidence, status,
          body, body[:20], NOW, NOW, NOW, degraded_reason, topic_new, conflict_with, 0,
          archived_at))
     if topic.startswith("~"):
@@ -28,7 +28,7 @@ def seed_entry(conn, us="w", uid="u", dimension="preference", topic="lang", scop
     conn.execute(
         "INSERT INTO sources (entry_id,user_source,user_id,origin_type,origin_ref,quote,kind)"
         " VALUES (?,?,?,?,?,?,?)",
-        (f"{dimension}_{topic}@{scope}", us, uid, "conversation", "s1:1",
+        (f"{dimension}_{topic}", us, uid, "conversation", "s1:1",
          quote or ("不要这样做" if dimension == "taboo" else "用户原话"), kind))
 
 
@@ -105,13 +105,6 @@ def test_shared_word_root_flagged(conn, taxonomy):
     assert "taboo_no_overlap" in rules(run_audit(conn, taxonomy))
 
 
-def test_scope_incompatible_not_flagged(conn, taxonomy):
-    # scope 相容=相等或一方 global；两个不同 project 不相容 → 不报
-    seed_entry(conn, dimension="taboo", topic="tool", scope="project:x")
-    seed_entry(conn, dimension="preference", topic="tool", scope="project:y")
-    assert "taboo_no_overlap" not in rules(run_audit(conn, taxonomy))
-
-
 def test_archived_side_not_flagged(conn, taxonomy):
     # 恒胜只约束存活行（active/degraded）；一方 archived 不构成并存
     seed_entry(conn, dimension="taboo", topic="tool")
@@ -157,8 +150,8 @@ def test_instruction_body_in_superseded_row_flagged(conn, taxonomy):
 def test_missing_quote_flagged(conn, taxonomy):
     # entries 有行 sources 无证据 → quote_required（~ 轨迹行豁免不误报）
     conn.execute(
-        f"INSERT INTO entries ({_ENTRY_COLS}) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-        ("w", "u", "preference", "lang", "global", "preference_lang", 0.9, "active",
+        f"INSERT INTO entries ({_ENTRY_COLS}) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        ("w", "u", "preference", "lang", "preference_lang", 0.9, "active",
          "干净正文", "干净正文", NOW, NOW, NOW, None, None, None, 0, None))
     out = run_audit(conn, taxonomy)
     assert rules(out) == {"quote_required"}

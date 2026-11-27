@@ -10,7 +10,6 @@ def _entries_where(
     status: str | None = None,
     user_source: str | None = None,
     user_id: str | None = None,
-    scope: str | None = None,
     topic: str | None = None,
     q: str | None = None,
     confidence_min: float | None = None,
@@ -35,9 +34,6 @@ def _entries_where(
     if user_id:
         clauses.append("user_id=?")
         params.append(user_id)
-    if scope:
-        clauses.append("scope=?")
-        params.append(scope)
     if topic:
         clauses.append("topic LIKE ? ESCAPE '\\'")
         params.append(like_pattern(topic))
@@ -72,7 +68,6 @@ def list_entries(
     status: str | None = None,
     user_source: str | None = None,
     user_id: str | None = None,
-    scope: str | None = None,
     topic: str | None = None,
     q: str | None = None,
     confidence_min: float | None = None,
@@ -83,7 +78,7 @@ def list_entries(
 ) -> dict:
     where, params = _entries_where(
         dimension=dimension, status=status, user_source=user_source, user_id=user_id,
-        scope=scope, topic=topic, q=q, confidence_min=confidence_min,
+        topic=topic, q=q, confidence_min=confidence_min,
         confidence_max=confidence_max, updated_from=updated_from, updated_to=updated_to,
     )
     total = conn.execute(
@@ -95,7 +90,7 @@ def list_entries(
         "confidence_desc": "confidence DESC, updated_at DESC",
     }.get(order, "updated_at DESC, rowid DESC")
     rows = conn.execute(
-        "SELECT id, user_source, user_id, dimension, topic, scope, summary, status,"
+        "SELECT id, user_source, user_id, dimension, topic, summary, status,"
         " confidence, updated_at, last_reinforced_at, reinforcements, conflict_with,"
         " (SELECT COUNT(*) FROM sources s WHERE s.user_source=entries.user_source"
         "   AND s.user_id=entries.user_id AND s.entry_id=entries.id) AS sources_count"
@@ -124,5 +119,4 @@ def get_entry_facets(conn: sqlite3.Connection) -> dict:
         "dimensions": facet("dimension"),
         "statuses": facet("status"),
         "sources": facet("user_source"),
-        "scopes": facet("scope"),
     }

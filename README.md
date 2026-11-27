@@ -28,7 +28,7 @@ pismor 针对这两点从数据模型层做了防御：记忆只能以**词表�
 
 **双素材接入**。对话事件（`POST /events`，逐轮上报）与任意文本素材（文档、笔记、邮件、工单，`text` 事件直通抽取）都能进管线；`user_ref` 区分用户，多来源（source）天然隔离。
 
-**预算内装配注入**。`GET /memory/{source}/{user}` 返回按字符预算装配好的记忆包：taboo 与 identity 恒在，其余按当前话题召回、按维度优先级裁剪；查询参数 `budget` 控制注入体积，`query` 驱动相关集召回（向量优先，自动回退 BM25 词面检索）。
+**预算内装配注入**。`GET /memory/{source}/{user}` 返回按预算（约 token）装配好的记忆包：taboo 与 identity 恒在，其余按当前话题召回、按维度优先级裁剪；查询参数 `budget` 控制注入体积，`query` 驱动相关集召回（向量优先，自动回退 BM25 词面检索）。
 
 **完整生命周期**。条目有状态机：低置信进复核队列（人工判定 confirm/remove/fix），词表外主题进观察区（复现达标自动启用），无强化的条目按时效与置信衰减，强化可复活；同主题矛盾由 LLM 决策器判定更新/冲突/搁置，taboo 恒胜；矛盾可生成澄清问题，在后续对话中闭环收敛。
 
@@ -85,6 +85,88 @@ pismor 针对这两点从数据模型层做了防御：记忆只能以**词表�
 
 接入方式一致：业务系统向 `/events` 上报对话或素材，对话前调 `/memory` 取记忆包注入 prompt——**对现有 LLM 应用是两处调用点的改造，不是架构重构**。
 
+## 部署与启动
+
+pismor 是单进程服务：FastAPI + 后台管线 + 日批线程，SQLite 单文件即全部状态；不需要 Redis、消息队列或外部数据库。
+
+### 依赖服务
+
+| 组件 | 必需 | 作用 | 配置位置 |
+|---|---|---|---|
+| Python ≥ 3.12 | 是 | 运行时 | — |
+| OpenAI 兼容 LLM 网关 | 是 | 抽取、冲突决策、归并 | `llm.endpoint` / `llm.model` / `llm.api_key_env` |
+| OpenAI 兼容 Embedding 服务 | 否 | 向量召回；不可用时自动回退 BM25 | `embedding.*`（`enabled: false` 只用词面召回） |
+| Node.js 18+ | 否 | 仅构建管理后台 `web/dist` | `scripts/build_web.sh` |
+
+**LLM 网关**需实现 `POST {endpoint}/chat/completions`，并支持 `response_format`（OpenAI 用 `json_schema`，DeepSeek/GLM 用 `json_object`）。密钥只从环境变量读取，不写入配置文件：
+
+```bash
+export LLM_API_KEY=sk-...
+# 连通性自检（endpoint 形如 http://gateway:8080/v1）
+curl -s http://gateway:8080/v1/chat/completions \
+  -H "Authorization: Bearer $LLM_API_KEY" -H 'Content-Type: application/json' \
+  -d '{"model":"auto","messages":[{"role":"user","content":"ping"}]}'
+```
+
+**Embedding 服务**需实现 OpenAI 兼容的 `POST /embeddings`；`dimensions` 必须与模型输出一致（示例 bge-m3 为 1024，变更会触发全量重嵌入）：
+
+```bash
+export EMBEDDING_API_KEY=...
+curl -s http://embedding:8000/v1/embeddings \
+  -H "Authorization: Bearer $EMBEDDING_API_KEY" -H 'Content-Type: application/json' \
+  -d '{"model":"BAAI/bge-m3","input":["ping"]}'
+```
+
+`embedding` 段不能整段省略：即使 `enabled: false`，也要保留 `endpoint/model/api_key_env/dimensions/batch_size`。关闭后不建向量表、不发起请求，装配只走 BM25。
+
+### 安装与配置
+
+```bash
+uv sync                                   # 或 python -m pip install -e .
+cp config/settings.example.yaml config/settings.yaml
+```
+
+最少改三处：`db_path`、`llm.endpoint`、`llm.model`。完整配置项见 [docs/Introduce.md#配置说明](docs/Introduce.md#配置说明)。
+
+### 启动
+
+```bash
+python scripts/serve.py --settings config/settings.yaml --host 127.0.0.1 --port 8300
+```
+
+- 启动前执行 `PRAGMA integrity_check`，库损坏直接拒绝启动。
+- 进程内启动日批线程（衰减、审计、备份，默认 24 小时一次），可用 `serve.daily_interval_seconds` 调整。
+- 后台运行：`nohup python scripts/serve.py --settings config/settings.yaml >> serve.log 2>&1 &`；生产建议用 systemd/supervisor 托管。
+- 管理后台：先 `bash scripts/build_web.sh` 再重启，访问 `http://127.0.0.1:8300/admin`；未构建时该路径返回构建提示。也可用环境变量 `PISMOR_ADMIN_DIST` 指定 `dist` 目录。
+
+### 验证
+
+```bash
+curl -s http://127.0.0.1:8300/healthz
+# {"ok":true,"db":"ok"}
+
+# 上报一轮对话（完整字段与错误码见 docs/Integration.md）
+curl -s -X POST http://127.0.0.1:8300/events -H 'Content-Type: application/json' -d '{
+  "source": "chat_demo", "user_ref": "u_001", "event_type": "conversation",
+  "session_id": "s_001", "turn": 1,
+  "messages": [{"role": "user", "text": "以后都用 Python 3.12 写脚本"}],
+  "ts": "2026-11-24T10:00:00+08:00"}'
+# 202 {"event_id":"..."}；重复上报返回 200 {"deduplicated":true}
+
+curl -s "http://127.0.0.1:8300/memory/chat_demo/u_001?budget=2000&query=写脚本"
+```
+
+### 数据与备份
+
+| 路径 | 内容 |
+|---|---|
+| `data/index.db` | 主库（WAL），首次启动自动建表 |
+| `backups/db/` | 日批 `VACUUM INTO` 快照，保留 `backup.keep` 份 |
+| `backups/config/` | 词表与配置变更历史 |
+| `config/settings.yaml` | 运行配置（gitignored）；`db_path` 变更需重启 |
+
+配置与词表在管理后台保存后对新请求即时生效；LLM / embedding 的连接类字段变更需重启。
+
 ## 快速体验
 
 ```bash
@@ -99,16 +181,16 @@ curl -s -X POST http://127.0.0.1:8300/events -H 'Content-Type: application/json'
   "force_extract": false, "ts": "2026-11-24T10:00:00+08:00"
 }'
 
-# 2. 装配记忆包（budget 为注入字符预算，query 驱动相关集召回）
+# 2. 装配记忆包（budget 为注入预算，单位约为 token；query 驱动相关集召回）
 curl -s "http://127.0.0.1:8300/memory/chat_demo/u_001?budget=2000&query=写脚本"
 
 # 3. 低置信候选进复核队列，人工判定
 curl -s http://127.0.0.1:8300/review/queue
 ```
 
-事件字段（含 `force_extract` 与 `messages` 约束）见 [docs/Introduce.md](docs/Introduce.md#上报事件)。
+事件字段（含 `force_extract` 与 `messages` 约束）见 [docs/Introduce.md](docs/Introduce.md#上报事件)；业务服务接入（字段、错误码、客户端示例）见 [docs/Integration.md](docs/Integration.md)。
 
-安装与配置见 [README.md](../README.md)。
+部署与依赖服务配置见[上文](#部署与启动)。
 
 ## 局限与路线图
 

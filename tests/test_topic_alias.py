@@ -126,14 +126,14 @@ def test_revert_removes_only_new_alias(tax_writable):
     assert dim.topic_aliases["既有"] == dim.topics[0]
 
 
-def _seed_confirmable(conn, topic="手工模型", scope="global",
+def _seed_confirmable(conn, topic="手工模型",
                       version="2026-01-01T00:00:00+00:00"):
-    eid = f"preference_{topic}@{scope}"
+    eid = f"preference_{topic}"
     conn.execute(
-        "INSERT INTO entries (user_source,user_id,dimension,topic,scope,id,confidence,status,"
+        "INSERT INTO entries (user_source,user_id,dimension,topic,id,confidence,status,"
         "body,summary,created_at,updated_at,last_reinforced_at,reinforcements)"
-        " VALUES ('webchat','u1','preference',?,?,?,0.9,'pending_review','b','s',?,?,?,0)",
-        (topic, scope, eid, version, version, version))
+        " VALUES ('webchat','u1','preference',?,?,0.9,'pending_review','b','s',?,?,?,0)",
+        (topic, eid, version, version, version))
     conn.commit()
     return eid
 
@@ -142,7 +142,7 @@ def test_rekey_returns_pending_alias(conn, tax_writable):
     canon = tax_writable.dimensions["preference"].topics[0]
     eid = _seed_confirmable(conn)
     res = apply_review_decision(
-        conn, user_source="webchat", user_id="u1", scope="global", entry_id=eid,
+        conn, user_source="webchat", user_id="u1", entry_id=eid,
         decision="confirm", entry_version="2026-01-01T00:00:00+00:00",
         taxonomy=tax_writable, topic=canon)
     assert res["rekeyed_to"] == canon
@@ -155,10 +155,10 @@ def test_merge_returns_pending_alias(conn, tax_writable):
     eid = _seed_confirmable(conn, topic="手工模型")
     _seed_confirmable(conn, topic=canon)
     conn.execute("UPDATE entries SET status='active' WHERE id=?",
-                 (f"preference_{canon}@global",))
+                 (f"preference_{canon}",))
     conn.commit()
     res = apply_review_decision(
-        conn, user_source="webchat", user_id="u1", scope="global", entry_id=eid,
+        conn, user_source="webchat", user_id="u1", entry_id=eid,
         decision="confirm", entry_version="2026-01-01T00:00:00+00:00",
         taxonomy=tax_writable, topic=canon)
     assert res["merged_into"] == canon
@@ -168,7 +168,7 @@ def test_merge_returns_pending_alias(conn, tax_writable):
 def test_no_pending_alias_without_topic(conn, tax_writable):
     eid = _seed_confirmable(conn)
     res = apply_review_decision(
-        conn, user_source="webchat", user_id="u1", scope="global", entry_id=eid,
+        conn, user_source="webchat", user_id="u1", entry_id=eid,
         decision="confirm", entry_version="2026-01-01T00:00:00+00:00",
         taxonomy=tax_writable)
     assert "_pending_alias" not in res

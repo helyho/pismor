@@ -42,20 +42,19 @@ def _insert_entry(
     user_id="u1",
     dimension="preference",
     topic="style",
-    scope="global",
     status="active",
     conflict_with=None,
     summary="summary",
     body="body",
     updated_at=VERSION,
 ):
-    entry_id = f"{dimension}_{topic}@{scope}"
+    entry_id = f"{dimension}_{topic}"
     conn.execute(
-        "INSERT INTO entries (user_source,user_id,dimension,topic,scope,id,confidence,"
+        "INSERT INTO entries (user_source,user_id,dimension,topic,id,confidence,"
         "status,body,summary,created_at,updated_at,last_reinforced_at,degraded_reason,"
         "superseded_by,topic_new,conflict_with,reinforcements,archived_at)"
-        " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-        (user_source, user_id, dimension, topic, scope, entry_id, 0.9, status,
+        " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (user_source, user_id, dimension, topic, entry_id, 0.9, status,
          body, summary, updated_at, updated_at, updated_at, None, None, None,
          conflict_with, 0, None),
     )
@@ -112,11 +111,11 @@ def test_user_assemble_preview_does_not_write_clarifications(tmp_path):
     app, client, db_path = _make_app(tmp_path)
     with closing(get_conn(db_path)) as conn:
         _insert_entry(
-            conn, topic="a", conflict_with='["preference_b@global"]',
+            conn, topic="a", conflict_with='["preference_b"]',
             summary="喜欢简洁",
         )
         _insert_entry(
-            conn, topic="b", conflict_with='["preference_a@global"]',
+            conn, topic="b", conflict_with='["preference_a"]',
             summary="喜欢详细",
         )
 

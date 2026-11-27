@@ -30,22 +30,22 @@ def _seed(app: TestClient) -> None:
     db_path = app.app.state.settings_store.current().db_path
     with get_conn(db_path) as conn:
         conn.execute(
-            "INSERT INTO entries (user_source,user_id,dimension,topic,scope,id,confidence,status,"
+            "INSERT INTO entries (user_source,user_id,dimension,topic,id,confidence,status,"
             "body,summary,created_at,updated_at,last_reinforced_at)"
-            " VALUES ('webchat','u1','preference','theme','global','preference_theme@global',0.9,"
+            " VALUES ('webchat','u1','preference','theme','preference_theme',0.9,"
             "'active','喜欢深色','喜欢深色','2026-11-20T00:00:00+00:00',"
             "'2026-11-20T00:00:00+00:00','2026-11-20T00:00:00+00:00')"
         )
         conn.execute(
-            "INSERT INTO entries (user_source,user_id,dimension,topic,scope,id,confidence,status,"
+            "INSERT INTO entries (user_source,user_id,dimension,topic,id,confidence,status,"
             "body,summary,created_at,updated_at,last_reinforced_at)"
-            " VALUES ('webchat','u2','fact','city','global','fact_city@global',0.7,"
+            " VALUES ('webchat','u2','fact','city','fact_city',0.7,"
             "'pending_review','上海','上海','2026-11-20T00:00:00+00:00',"
             "'2026-11-20T00:00:00+00:00','2026-11-20T00:00:00+00:00')"
         )
         conn.execute(
             "INSERT INTO review_history (entry_id,user_source,user_id,decision,actor,ts,note,entry_version)"
-            " VALUES ('fact_city@global','webchat','u2','confirm','reviewer',"
+            " VALUES ('fact_city','webchat','u2','confirm','reviewer',"
             "'2026-11-20T12:00:00+00:00',NULL,'2026-11-20T00:00:00+00:00')"
         )
         conn.execute(

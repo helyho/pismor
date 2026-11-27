@@ -12,7 +12,7 @@ import logging
 from contextlib import closing
 from typing import Literal
 
-from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
+from fastapi import BackgroundTasks, FastAPI, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ValidationError
 
@@ -24,7 +24,6 @@ from pismor.serving.memory import is_tombstoned, soft_delete_memory
 from pismor.serving.static import mount_admin
 from pismor.core import tokenizer
 from pismor.core.config import Settings
-from pismor.core.keys import valid_scope
 from pismor.serving.merge_task import DbMergeTaskSink
 from pismor.serving.review import apply_review_decision
 from pismor.core.db import get_conn, init_schema
@@ -98,20 +97,18 @@ def create_app(settings: Settings, llm=None, embedder=None) -> FastAPI:
     @app.get("/memory/{source}/{native_id}")
     def get_memory(source: str, native_id: str, budget: int = 2000,
                     dimensions: str | None = None, include_memory: bool = True,
-                    query: str | None = None, scope: str | None = None):
+                    query: str | None = None):
         dims = ([d.strip() for d in dimensions.split(",") if d.strip()]
                 if dimensions else None)
-        if scope is not None and not valid_scope(scope):
-            raise HTTPException(status_code=422, detail="invalid scope")
         s = settings_store.current()
         with closing(get_conn(s.db_path)) as conn:
             # 降级链（主查询→必带集→空包）在 assembler 内，永不 5xx；tombstone → 空包
             a = s.assembler
             return assembler.assemble(conn, embedder, source, native_id, budget=budget,
                                       dimensions=dims, include_memory=include_memory,
-                                      query=query, current_scope=scope,
+                                      query=query,
                                       audit_sink=DbMergeTaskSink(s.db_path, source,
-                                                                 native_id, scope),
+                                                                 native_id),
                                       dimension_order=taxonomy_store.current().priority_order(),
                                       taboo_budget_share=a.taboo_budget_share,
                                       taboo_merge_threshold=a.taboo_merge_threshold,
@@ -127,7 +124,7 @@ def create_app(settings: Settings, llm=None, embedder=None) -> FastAPI:
         s = settings_store.current()
         with closing(get_conn(s.db_path)) as conn:
             rows = conn.execute(
-                "SELECT id AS entry_id, user_source, user_id, dimension, topic, scope, summary,"
+                "SELECT id AS entry_id, user_source, user_id, dimension, topic, summary,"
                 " confidence, status, updated_at AS entry_version, degraded_reason AS note"
                 " FROM entries WHERE NOT EXISTS (SELECT 1 FROM tombstones t"
                 "   WHERE t.user_source=entries.user_source AND t.user_id=entries.user_id)"
@@ -145,8 +142,8 @@ def create_app(settings: Settings, llm=None, embedder=None) -> FastAPI:
         summary: str | None = None
         topic: str | None = None  # confirm 时归一目标 topic（必须在维度白名单内）
 
-    @app.post("/review/{user_source}/{user_id}/{scope}/{entry_id}/decision")
-    def review_decision(user_source: str, user_id: str, scope: str, entry_id: str, payload: DecisionIn):
+    @app.post("/review/{user_source}/{user_id}/{entry_id}/decision")
+    def review_decision(user_source: str, user_id: str, entry_id: str, payload: DecisionIn):
         s = settings_store.current()
         with closing(get_conn(s.db_path)) as conn:
             if is_tombstoned(conn, user_source, user_id):
@@ -155,8 +152,8 @@ def create_app(settings: Settings, llm=None, embedder=None) -> FastAPI:
             vector = None
             if payload.decision == "fix" and payload.body is not None and embedder is not None:
                 current = conn.execute(
-                    "SELECT body FROM entries WHERE user_source=? AND user_id=? AND id=? AND scope=?",
-                    (user_source, user_id, entry_id, scope),
+                    "SELECT body FROM entries WHERE user_source=? AND user_id=? AND id=?",
+                    (user_source, user_id, entry_id),
                 ).fetchone()
                 if current is not None and payload.body.strip() != current["body"]:
                     vector = writer.compute_vector(embedder, payload.body)
@@ -165,7 +162,6 @@ def create_app(settings: Settings, llm=None, embedder=None) -> FastAPI:
                     conn,
                     user_source=user_source,
                     user_id=user_id,
-                    scope=scope,
                     entry_id=entry_id,
                     decision=payload.decision,
                     entry_version=payload.entry_version,

@@ -291,7 +291,6 @@ function addDimension(): void {
     key,
     name: '新维度',
     priority: Math.max(0, ...priorities) + 10,
-    default_scope: scopeOptions.value[0] || 'global',
     topics: [],
     guidance: '',
     sensitive: false,
@@ -304,7 +303,6 @@ function addDimension(): void {
   message.value = '已新增维度，请填写后校验并保存'
 }
 
-const scopeOptions = computed(() => Object.keys((taxonomyDraft.value.scopes as AnyRecord) ?? {}))
 const dimensions = computed<AnyRecord[]>(() =>
   Array.isArray(taxonomyDraft.value.dimensions) ? taxonomyDraft.value.dimensions : [],
 )
@@ -499,9 +497,6 @@ onMounted(refreshAll)
                 @update:model-value="(value) => (taxonomyDraft.meta.auto_activate = value)"
               />
             </ConfigField>
-            <ConfigField label="scopes" :hint="taxonomyHint('scopes')" readonly>
-              <span class="config-value">{{ Object.keys(taxonomyDraft.scopes ?? {}).join('  /  ') }}</span>
-            </ConfigField>
           </el-card>
 
           <el-tabs v-if="dimensions.length" v-model="activeDimension" class="dimension-tabs">
@@ -554,15 +549,6 @@ onMounted(refreshAll)
                     controls-position="right"
                     @update:model-value="(value) => (dim.priority = value)"
                   />
-                </ConfigField>
-                <ConfigField label="default_scope" :hint="taxonomyHint('dimensions[].default_scope')">
-                  <el-select
-                    :model-value="dimensionField(dim, 'default_scope')"
-                    style="width: 100%"
-                    @update:model-value="(value) => (dim.default_scope = value)"
-                  >
-                    <el-option v-for="scope in scopeOptions" :key="scope" :label="scope" :value="scope" />
-                  </el-select>
                 </ConfigField>
                 <ConfigField label="sensitive" :hint="taxonomyHint('dimensions[].sensitive')">
                   <el-select

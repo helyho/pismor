@@ -4,8 +4,8 @@ import pytest
 from pismor.pipeline.resolver import resolve
 
 
-def cand(dimension, topic, scope, body="新候选正文", **kw):
-    c = {"dimension": dimension, "topic": topic, "scope": scope, "body": body,
+def cand(dimension, topic, body="新候选正文", **kw):
+    c = {"dimension": dimension, "topic": topic, "body": body,
          "summary": "摘要", "confidence": 0.9, "kind": "explicit",
          "quote": "对话原文", "topic_new": None}
     c.update(kw)
@@ -43,21 +43,21 @@ def conn_db(conn):
 
 @pytest.fixture
 def seeded(conn):
-    def _seed(dimension, topic, scope, body="旧条目正文"):
+    def _seed(dimension, topic, body="旧条目正文"):
         ts = "2026-11-01T00:00:00+08:00"
         conn.execute(
-            "INSERT INTO entries (user_source,user_id,dimension,topic,scope,id,confidence,status,"
+            "INSERT INTO entries (user_source,user_id,dimension,topic,id,confidence,status,"
             "body,summary,created_at,updated_at,last_reinforced_at)"
-            " VALUES ('w','u',?,?,?,?,?,'active',?,'旧摘要',?,?,?)",
-            (dimension, topic, scope, f"{dimension}_{topic}_{scope}", 0.8, body, ts, ts, ts))
+            " VALUES ('w','u',?,?,?,?,'active',?,'旧摘要',?,?,?)",
+            (dimension, topic, f"{dimension}_{topic}", 0.8, body, ts, ts, ts))
         conn.commit()
     return _seed
 
 
 @pytest.fixture
 def seeded_taboo_and_pref(conn, seeded):
-    seeded("taboo", "style", "global")
-    seeded("preference", "style", "global")
+    seeded("taboo", "style")
+    seeded("preference", "style")
     return conn
 
 
@@ -69,7 +69,7 @@ def fake_llm_add():
 
 @pytest.fixture
 def fake_llm_update():
-    return ScriptedLLM({"decision": "UPDATE", "target": ["preference", "lang", "global"], "reason": "演进"})
+    return ScriptedLLM({"decision": "UPDATE", "target": ["preference", "lang"], "reason": "演进"})
 
 
 @pytest.fixture
@@ -78,51 +78,51 @@ def fake_llm_conflict():
 
 
 def test_add_when_no_existing(conn, fake_llm_add):
-    actions = resolve(conn, "w", "u", [cand("preference", "lang", "global")], fake_llm_add)
+    actions = resolve(conn, "w", "u", [cand("preference", "lang")], fake_llm_add)
     assert actions[0]["op"] == "ADD"
     assert "target" not in actions[0]
     assert fake_llm_add.calls == []  # ADD 在 existing 判断分流，不进决策 LLM
 
 
 def test_update_when_same_key(conn, seeded, fake_llm_update):
-    seeded("preference", "lang", "global")
-    actions = resolve(conn, "w", "u", [cand("preference", "lang", "global")], fake_llm_update)
-    assert actions[0]["op"] == "UPDATE" and actions[0]["target"] == ("preference", "lang", "global")
+    seeded("preference", "lang")
+    actions = resolve(conn, "w", "u", [cand("preference", "lang")], fake_llm_update)
+    assert actions[0]["op"] == "UPDATE" and actions[0]["target"] == ("preference", "lang")
 
 
 def test_conflict_when_llm_flags(conn, seeded, fake_llm_conflict):
-    seeded("preference", "style", "global")
-    actions = resolve(conn, "w", "u", [cand("preference", "style", "global")], fake_llm_conflict)
+    seeded("preference", "style")
+    actions = resolve(conn, "w", "u", [cand("preference", "style")], fake_llm_conflict)
     assert actions[0]["op"] == "CONFLICT"
 
 
 def test_noop_when_duplicate(conn, seeded):
-    seeded("preference", "lang", "global")
+    seeded("preference", "lang")
     llm = ScriptedLLM({"decision": "NOOP", "target": [], "reason": "重复"})
-    actions = resolve(conn, "w", "u", [cand("preference", "lang", "global")], llm)
-    assert actions[0]["op"] == "NOOP" and actions[0]["target"] == ("preference", "lang", "global")
+    actions = resolve(conn, "w", "u", [cand("preference", "lang")], llm)
+    assert actions[0]["op"] == "NOOP" and actions[0]["target"] == ("preference", "lang")
 
 
 def test_taboo_always_wins(conn, seeded_taboo_and_pref, fake_llm_conflict):
     # taboo 与 preference 同主题互斥: 决策输出必须 UPDATE taboo 侧, preference 侧降级
-    candidates = [cand("taboo", "style", "global", "拒绝输出 style 相关内容"),
-                  cand("preference", "style", "global", "偏好某种 style")]
+    candidates = [cand("taboo", "style", "拒绝输出 style 相关内容"),
+                  cand("preference", "style", "偏好某种 style")]
     actions = resolve(conn, "w", "u", candidates, fake_llm_conflict)
     assert [a["op"] for a in actions] == ["UPDATE", "CONFLICT"]
-    assert actions[0]["target"] == ("taboo", "style", "global")
-    assert actions[1]["target"] == ("preference", "style", "global")
+    assert actions[0]["target"] == ("taboo", "style")
+    assert actions[1]["target"] == ("preference", "style")
 
 
 def test_preference_forced_conflict_even_if_llm_says_update(conn, seeded_taboo_and_pref):
     # taboo 恒胜是代码级硬约束：preference 侧即使 LLM 判 UPDATE 也强制 CONFLICT
     llm = ScriptedLLM({"decision": "UPDATE", "target": [], "reason": "演进"})
-    actions = resolve(conn, "w", "u", [cand("preference", "style", "global")], llm)
+    actions = resolve(conn, "w", "u", [cand("preference", "style")], llm)
     assert actions[0]["op"] == "CONFLICT"
-    assert actions[0]["target"] == ("preference", "style", "global")
+    assert actions[0]["target"] == ("preference", "style")
 
 
 def test_orphan_passthrough_without_llm(conn, fake_llm_add):
-    orphan = cand("orphan", "", "global", status="orphan_topic", topic_new="未归类的主题描述")
+    orphan = cand("orphan", "", status="orphan_topic", topic_new="未归类的主题描述")
     actions = resolve(conn, "w", "u", [orphan], fake_llm_add)
     assert actions[0] == {"op": "ORPHAN", "candidate": orphan}
     assert fake_llm_add.calls == []
@@ -134,7 +134,7 @@ def test_archived_taboo_does_not_force_conflict(conn, seeded_taboo_and_pref):
                  " WHERE dimension='taboo'")
     conn.commit()
     llm = ScriptedLLM({"decision": "UPDATE", "target": [], "reason": "演进"})
-    actions = resolve(conn, "w", "u", [cand("preference", "style", "global")], llm)
+    actions = resolve(conn, "w", "u", [cand("preference", "style")], llm)
     assert actions[0]["op"] == "UPDATE"
 
 
@@ -143,22 +143,22 @@ def test_pending_review_taboo_does_not_force_conflict(conn, seeded_taboo_and_pre
     conn.execute("UPDATE entries SET status='pending_review' WHERE dimension='taboo'")
     conn.commit()
     llm = ScriptedLLM({"decision": "UPDATE", "target": [], "reason": "演进"})
-    actions = resolve(conn, "w", "u", [cand("preference", "style", "global")], llm)
+    actions = resolve(conn, "w", "u", [cand("preference", "style")], llm)
     assert actions[0]["op"] == "UPDATE"
 
 
 def test_neighbor_conflict_hallucinated_id_falls_back_to_add(conn, seeded):
     # F4: LLM 指认的 conflicting_with 不匹配任何近邻时是幻觉——
     # 旧实现回退首行，会把无关 active 行拖进矛盾双存并降级×0.8；改为宁当轮 ADD
-    seeded("taboo", "style", "global")
+    seeded("taboo", "style")
     llm = ScriptedLLM({"conflict": True, "conflicting_with": "hallucinated_id"})
-    actions = resolve(conn, "w", "u", [cand("preference", "color", "global")], llm)
+    actions = resolve(conn, "w", "u", [cand("preference", "color")], llm)
     assert actions[0]["op"] == "ADD"
 
 
 def test_neighbor_conflict_with_matching_id(conn, seeded):
     # 近邻路径回归：指认匹配现存近邻 id → 照常 CONFLICT
-    seeded("taboo", "style", "global")
-    llm = ScriptedLLM({"conflict": True, "conflicting_with": "taboo_style_global"})
-    actions = resolve(conn, "w", "u", [cand("preference", "color", "global")], llm)
+    seeded("taboo", "style")
+    llm = ScriptedLLM({"conflict": True, "conflicting_with": "taboo_style"})
+    actions = resolve(conn, "w", "u", [cand("preference", "color")], llm)
     assert actions[0]["op"] == "CONFLICT"

@@ -15,7 +15,6 @@ interface Target {
   user_source: string
   user_id: string
   entry_id: string
-  scope: string
 }
 
 const props = defineProps<{
@@ -61,11 +60,9 @@ function emptyForm(): EntryEditPayload {
     user_source: '',
     user_id: '',
     entry_id: '',
-    scope: 'global',
     expected_version: '',
     new_dimension: '',
     new_topic: '',
-    new_scope: 'global',
     confidence: 0.5,
     status: 'pending_review',
     summary: '',
@@ -101,18 +98,15 @@ async function load(): Promise<void> {
       user_source: props.target.user_source,
       user_id: props.target.user_id,
       entry_id: props.target.entry_id,
-      scope: props.target.scope,
     })
     const detail = await api<ReviewDetail>(`/entries/detail?${params.toString()}`)
     form.value = {
       user_source: detail.entry.user_source,
       user_id: detail.entry.user_id,
       entry_id: detail.entry.id,
-      scope: detail.entry.scope,
       expected_version: detail.entry.updated_at,
       new_dimension: detail.entry.dimension,
       new_topic: detail.entry.topic,
-      new_scope: detail.entry.scope,
       confidence: detail.entry.confidence,
       status: detail.entry.status as EntryStatus,
       summary: detail.entry.summary,
@@ -196,8 +190,7 @@ watch(
         <div>
           <h3>编辑记忆</h3>
           <p class="edit-subtitle">
-            {{ form.new_dimension || '维度' }} / {{ form.new_topic || '主题' }} ·
-            {{ form.new_scope }}
+            {{ form.new_dimension || '维度' }} / {{ form.new_topic || '主题' }}
           </p>
         </div>
         <el-button text @click="visible = false">关闭</el-button>
@@ -241,30 +234,6 @@ watch(
             </el-form-item>
             <el-form-item label="主题">
               <el-input v-model="form.new_topic" />
-            </el-form-item>
-            <el-form-item label="作用域">
-              <el-select
-                v-model="form.new_scope"
-                filterable
-                allow-create
-                default-first-option
-                style="width: 100%"
-              >
-                <el-option
-                  v-for="item in facets?.scopes ?? []"
-                  :key="item.value"
-                  :label="item.value"
-                  :value="item.value"
-                />
-                <el-option
-                  v-if="
-                    form.new_scope &&
-                    !(facets?.scopes ?? []).some((item) => item.value === form.new_scope)
-                  "
-                  :label="form.new_scope"
-                  :value="form.new_scope"
-                />
-              </el-select>
             </el-form-item>
             <el-form-item label="状态">
               <el-select v-model="form.status" style="width: 100%">

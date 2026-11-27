@@ -176,7 +176,7 @@ def test_missing_api_key_still_sends_request():
 
 def test_gate_thresholds_configurable():
     # 默认阈值：0.86 explicit 直通；提高 auto_min 后同候选落 review
-    cand = {"dimension": "preference", "topic": "t", "scope": "global",
+    cand = {"dimension": "preference", "topic": "t",
             "confidence": 0.86, "kind": "explicit"}
     auto, review, _ = gate([dict(cand)])
     assert len(auto) == 1 and not review

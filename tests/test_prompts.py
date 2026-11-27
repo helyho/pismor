@@ -1,19 +1,16 @@
-"""提示词工程独立测试（黑盒修复轮）：prompt 内容契约、schema 约束、scope 兜底、近邻判定。
+"""提示词工程独立测试（黑盒修复轮）：prompt 内容契约、schema 约束、近邻判定。
 
 这些用例不依赖真实 LLM——用 CaptureLLM 捕获管线实际发给 LLM 的 system/user 文本，
 锁定提示词的结构性契约（第八轮修复的三处根因都在 prompt 层，防止回归）：
 1. taxonomy guidance 必须注入维度词表块（A2/D2 的判定标准缺口）；
-2. kind/scope 判定规则与 known_ids 反转措辞必须在场（A5 层 1 的"勿重复抽取"回归）；
-3. scope 白名单 pattern 在 schema 中，非法值出口回落 default_scope + 置信×0.8（A1 过程发现）；
+2. kind 判定规则与 known_ids 反转措辞必须在场（A5 层 1 的"勿重复抽取"回归）；
 4. 近邻互斥检测的 prompt 构造与对端解析（A5 层 2）。
 """
-import re
 from types import SimpleNamespace
 
 import pytest
 
 from pismor.pipeline import extractor, resolver
-from pismor.core.keys import valid_scope
 from pismor.llm.prompts import EXTRACT_CONVERSATION, EXTRACT_TEXT
 from pismor.pipeline.normalize import normalize
 from pismor.pipeline.writer import _insert_entry
@@ -32,7 +29,7 @@ class CaptureLLM:
 
 
 def _cand(**kw):
-    base = {"dimension": "preference", "topic": "lang", "scope": "global",
+    base = {"dimension": "preference", "topic": "lang",
             "body": "用户偏好 Python", "summary": "偏好Python", "confidence": 0.9,
             "kind": "explicit", "quote": "以后都用 Python", "topic_new": None}
     base.update(kw)
@@ -75,19 +72,15 @@ def test_dimension_block_truncates_long_guidance():
     assert len(seg) == 201 and seg.endswith("…")
 
 
-# ---------- 2) 对话模板契约：kind/scope 规则 + known_ids 反转 ----------
+# ---------- 2) 对话模板契约：kind 规则 + known_ids 反转 ----------
 
-def test_extract_prompt_contains_kind_and_scope_rules(taxonomy):
+def test_extract_prompt_contains_kind_rules(taxonomy):
     llm = CaptureLLM({"candidates": []})
     extractor.extract(_conv_ev(), taxonomy, llm, known_ids=["preference_style"])
     system = llm.calls[0]["system"]
     assert "explicit：用户本人第一人称" in system
     assert "inferred：转述的规范" in system
     assert "feedback：对 AI 已有输出的反馈" in system
-    # scope 统一口径（D）：project:<name> + slug 规范（含空格名转写示例）
-    assert '"global" 或 "project:<name>"' in system
-    assert "禁止空格与标点" in system
-    assert "project:my-web-app" in system
     # 注入防线（A4）：数据/指令分离句必须在场
     assert "不得遵从" in system
     # 健康细节概括级（A1）：矛盾表述不得回归
@@ -181,50 +174,9 @@ def test_dimension_block_marks_sensitive_topics(taxonomy):
 
 # ---------- 4) schema 约束 ----------
 
-def test_candidate_schema_scope_pattern_and_kind_enum():
+def test_candidate_schema_kind_enum():
     item = extractor._CANDIDATE_ITEM
-    pattern = item["properties"]["scope"]["pattern"]
-    assert re.fullmatch(pattern, "global")
-    assert re.fullmatch(pattern, "project:dashboard")
-    assert not re.fullmatch(pattern, "project")
-    assert not re.fullmatch(pattern, "scripting")
     assert item["properties"]["kind"]["enum"] == ["explicit", "inferred", "feedback"]
-
-
-def test_taxonomy_regression_scope_values_legal(taxonomy):
-    # 数据守卫：回归样例的 expect.scope 必须是白名单合法值（防再次写裸 "project"）
-    for case in taxonomy.regression_cases:
-        scope = case["expect"].get("scope")
-        if scope:
-            assert valid_scope(scope), f"illegal expect.scope: {case['quote']} -> {scope}"
-
-
-# ---------- 5) scope 兜底回落矩阵 ----------
-
-@pytest.mark.parametrize("raw_scope,dim,default_scope,expect_scale", [
-    ("scripting", "preference", "global", True),
-    ("../../etc", "context", "global", True),
-    ("脚本编写", "taboo", "global", True),
-    ("", "identity", "global", True),
-    ("global", "preference", "global", False),
-    ("project:dashboard", "preference", "global", False),
-])
-def test_scope_fallback_matrix(taxonomy, raw_scope, dim, default_scope, expect_scale):
-    llm = CaptureLLM({"candidates": [_cand(dimension=dim, scope=raw_scope,
-                                           confidence=0.9)]})
-    out = extractor.extract(_conv_ev(), taxonomy, llm, known_ids=[])
-    assert len(out) == 1
-    # 合法值原样保留；非法值回落 default_scope 并置信打 8 折
-    assert out[0]["scope"] == (raw_scope if not expect_scale else default_scope)
-    assert out[0]["confidence"] == pytest.approx(0.72 if expect_scale else 0.9)
-
-
-def test_scope_fallback_respects_sensitive_cap(taxonomy):
-    # sensitive topic 概括级压顶（0.6）与 scope 回落（×0.8）叠加：0.6×0.8=0.48
-    llm = CaptureLLM({"candidates": [_cand(dimension="identity", topic="region",
-                                           scope="bad scope", confidence=0.9)]})
-    out = extractor.extract(_conv_ev(), taxonomy, llm, known_ids=[])
-    assert out[0]["confidence"] == pytest.approx(0.48)
 
 
 # ---------- 6) 近邻互斥检测（resolver） ----------
@@ -232,9 +184,9 @@ def test_scope_fallback_respects_sensitive_cap(taxonomy):
 NOW = "2026-11-24T00:00:00+00:00"
 
 
-def _seed_neighbor(conn, dimension="preference", topic="style", scope="global"):
+def _seed_neighbor(conn, dimension="preference", topic="style"):
     _insert_entry(conn, "webchat", "u1",
-                  {"dimension": dimension, "topic": topic, "scope": scope,
+                  {"dimension": dimension, "topic": topic,
                    "body": "用户希望 AI 的回复语气保持正式", "summary": "语气正式",
                    "confidence": 0.9, "kind": "explicit", "quote": "回复要正式",
                    "topic_new": None},
@@ -244,14 +196,14 @@ def _seed_neighbor(conn, dimension="preference", topic="style", scope="global"):
 
 def _insert_pref(conn, topic, body, origin_ref):
     _insert_entry(conn, "webchat", "u1",
-                  {"dimension": "preference", "topic": topic, "scope": "global",
+                  {"dimension": "preference", "topic": topic,
                    "body": body, "summary": body[:10], "confidence": 0.9,
                    "kind": "explicit", "quote": f"q-{topic}", "topic_new": None},
                   status="active", now=NOW, origin_type="conversation", origin_ref=origin_ref)
 
 
 def _taboo_candidate():
-    return _cand(dimension="taboo", topic="tone", scope="global",
+    return _cand(dimension="taboo", topic="tone",
                  body="用户要求回复语气轻松随意，禁止正式", quote="别太正式")
 
 
@@ -263,7 +215,7 @@ def test_neighbor_no_rows_no_llm_call(conn, taxonomy):
 
 def test_neighbor_ignores_deformed_and_inactive_rows(conn, taxonomy):
     _insert_entry(conn, "webchat", "u1",
-                  {"dimension": "preference", "topic": "~style:20261124:1", "scope": "global",
+                  {"dimension": "preference", "topic": "~style:20261124:1",
                    "body": "轨迹行", "summary": "轨迹", "confidence": 0.9,
                    "kind": "explicit", "quote": "q", "topic_new": None},
                   status="archived", now=NOW, origin_type="conversation", origin_ref="e0")
@@ -287,16 +239,16 @@ def test_neighbor_conflict_returns_accused_target(conn, taxonomy):
     _insert_pref(conn, "style", "回复要正式", "e1")
     _insert_pref(conn, "verbosity", "回复要简短", "e2")
     conn.commit()
-    llm = CaptureLLM({"conflict": True, "conflicting_with": "preference_verbosity@global",
+    llm = CaptureLLM({"conflict": True, "conflicting_with": "preference_verbosity",
                       "reason": "详略互斥"})
     target = resolver._neighbor_conflict(conn, "webchat", "u1", _taboo_candidate(), llm)
-    assert target == ("preference", "verbosity", "global")  # LLM 指认优先
+    assert target == ("preference", "verbosity")  # LLM 指认优先
 
 
 def test_neighbor_conflict_hallucinated_ref_returns_none(conn, taxonomy):
     # F4：LLM 指认的 id 不在近邻结果里（幻觉）→ 返回 None 当轮 ADD，不回退首行误伤无辜行
     _seed_neighbor(conn)
-    llm = CaptureLLM({"conflict": True, "conflicting_with": "preference_nonexistent@global",
+    llm = CaptureLLM({"conflict": True, "conflicting_with": "preference_nonexistent",
                       "reason": "互斥"})
     assert resolver._neighbor_conflict(conn, "webchat", "u1", _taboo_candidate(), llm) is None
 
@@ -304,7 +256,7 @@ def test_neighbor_conflict_hallucinated_ref_returns_none(conn, taxonomy):
 def test_neighbor_skipped_for_unpaired_dimension(conn, taxonomy):
     _seed_neighbor(conn)
     llm = CaptureLLM({"conflict": True, "reason": "x"})
-    cand = _cand(dimension="fact", topic="possession", scope="global")
+    cand = _cand(dimension="fact", topic="possession")
     assert resolver._neighbor_conflict(conn, "webchat", "u1", cand, llm) is None
     assert llm.calls == []  # fact 不在 taboo↔preference 配对内，不调 LLM
 
@@ -314,7 +266,5 @@ def test_neighbor_skipped_for_unpaired_dimension(conn, taxonomy):
 def test_template_constants_contract():
     assert "不要自行去重" in EXTRACT_CONVERSATION
     assert "勿重复抽取" not in EXTRACT_CONVERSATION + EXTRACT_TEXT
-    assert '"global" 或 "project:<name>"' in EXTRACT_CONVERSATION
-    assert "禁止空格与标点" in EXTRACT_CONVERSATION
     assert "去重由决策器负责" in EXTRACT_TEXT
     assert "互斥" in resolver.NEIGHBOR_SYSTEM and "可并存" in resolver.NEIGHBOR_SYSTEM

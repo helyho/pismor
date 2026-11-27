@@ -34,7 +34,6 @@ export interface ReviewQueueItem {
   user_id: string
   dimension: string
   topic: string
-  scope: string
   summary: string
   confidence: number
   status: string
@@ -64,7 +63,6 @@ export interface ReviewEntry {
   user_id: string
   dimension: string
   topic: string
-  scope: string
   id: string
   confidence: number
   status: string
@@ -109,7 +107,6 @@ export interface ReviewConflict {
   id: string
   dimension: string
   topic: string
-  scope: string
   summary: string
   status: string
 }
@@ -128,7 +125,6 @@ export type ReviewDecision = 'confirm' | 'remove' | 'fix'
 export interface ReviewDecisionPayload {
   user_source: string
   user_id: string
-  scope: string
   entry_id: string
   decision: ReviewDecision
   entry_version: string
@@ -157,11 +153,9 @@ export interface EntryEditPayload {
   user_source: string
   user_id: string
   entry_id: string
-  scope: string
   expected_version: string
   new_dimension: string
   new_topic: string
-  new_scope: string
   confidence: number
   status: EntryStatus
   summary: string
@@ -173,7 +167,6 @@ export interface EntryEditConflict {
   id: string
   dimension: string
   topic: string
-  scope: string
   status: string
   summary: string
 }
@@ -227,7 +220,6 @@ export interface UserEntry {
   id: string
   dimension: string
   topic: string
-  scope: string
   status: string
   confidence: number
   summary: string
@@ -292,7 +284,6 @@ export interface EntryListItem {
   user_id: string
   dimension: string
   topic: string
-  scope: string
   summary: string
   status: string
   confidence: number
@@ -319,7 +310,6 @@ export interface EntryFacets {
   dimensions: EntryFacetValue[]
   statuses: EntryFacetValue[]
   sources: EntryFacetValue[]
-  scopes: EntryFacetValue[]
 }
 
 export interface ConfigDoc {

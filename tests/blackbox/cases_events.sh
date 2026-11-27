@@ -65,12 +65,12 @@ t6() {
   local ev; ev=$(next_event_id t6e)
   http POST /events "$(bb_event t6u "$ev" "记住, 我自己的小脚本默认都用 Python 写")"
   expect_status 202 || return 1
-  local cond="e.user_source='bb' AND e.user_id='t6u' AND e.dimension='preference' AND e.topic='lang' AND e.scope='global'"
+  local cond="e.user_source='bb' AND e.user_id='t6u' AND e.dimension='preference' AND e.topic='lang'"
   wait_db "SELECT 1 FROM entries e WHERE $cond AND e.status='active'" 90 \
     || { case_fail "90s 内 entries 未出现 preference/lang/global active 行"; }
   expect_db "SELECT count(*) FROM sources WHERE user_source='bb' AND user_id='t6u' AND origin_ref='blackbox:$ev' AND kind='explicit'" "1" || return 1
   # 证据链键一致性：sources.entry_id 与 entries.id 同值，可直接 JOIN
-  expect_db "SELECT count(*) FROM entries e JOIN sources s ON s.entry_id=e.id AND s.user_source=e.user_source AND s.user_id=e.user_id WHERE e.user_source='bb' AND e.user_id='t6u' AND e.dimension='preference' AND e.topic='lang' AND e.scope='global' AND s.origin_ref='blackbox:$ev'" "1" || return 1
+  expect_db "SELECT count(*) FROM entries e JOIN sources s ON s.entry_id=e.id AND s.user_source=e.user_source AND s.user_id=e.user_id WHERE e.user_source='bb' AND e.user_id='t6u' AND e.dimension='preference' AND e.topic='lang' AND s.origin_ref='blackbox:$ev'" "1" || return 1
   case_pass
 }
 # T7 闲聊零入库（LLM）：负向窗口 120s（覆盖单次 LLM timeout），窗口内 entries/sources 均无该用户行

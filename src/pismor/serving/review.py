@@ -25,7 +25,6 @@ def apply_review_decision(
     *,
     user_source: str,
     user_id: str,
-    scope: str,
     entry_id: str,
     decision: str,
     entry_version: str,
@@ -46,10 +45,10 @@ def apply_review_decision(
       - 不在白名单 → {"noop": False, "invalid_topic": True}，不改任何数据。
     """
     row = conn.execute(
-        "SELECT * FROM entries WHERE user_source=? AND user_id=? AND id=? AND scope=?"
+        "SELECT * FROM entries WHERE user_source=? AND user_id=? AND id=?"
         " AND updated_at=? AND topic NOT LIKE '~%'"
         " AND status IN ('pending_review','active','degraded')",
-        (user_source, user_id, entry_id, scope, entry_version)).fetchone()
+        (user_source, user_id, entry_id, entry_version)).fetchone()
     if row is None:
         return {"noop": True}
 
@@ -59,15 +58,15 @@ def apply_review_decision(
         cur = conn.execute(
             "UPDATE entries SET body=COALESCE(?, body), summary=COALESCE(?, summary),"
             " updated_at=?"
-            " WHERE user_source=? AND user_id=? AND id=? AND scope=? AND updated_at=?",
-            (body, summary, now, user_source, user_id, entry_id, scope, entry_version))
+            " WHERE user_source=? AND user_id=? AND id=? AND updated_at=?",
+            (body, summary, now, user_source, user_id, entry_id, entry_version))
         if cur.rowcount == 0:
             return {"noop": True}
         writer.sync_entry_vector(
             conn,
             user_source=user_source, user_id=user_id,
-            old_dimension=row["dimension"], old_topic=row["topic"], old_scope=row["scope"],
-            new_dimension=row["dimension"], new_topic=row["topic"], new_scope=row["scope"],
+            old_dimension=row["dimension"], old_topic=row["topic"],
+            new_dimension=row["dimension"], new_topic=row["topic"],
             old_body=row["body"], new_body=body if body is not None else row["body"],
             vector=vector, vector_requested=vector_requested,
         )
@@ -80,9 +79,9 @@ def apply_review_decision(
     if decision == "remove":
         # CAS：删除同样以 updated_at 为条件，行数 0 即判定作废
         cur = conn.execute(
-            "DELETE FROM entries WHERE user_source=? AND user_id=? AND id=? AND scope=?"
+            "DELETE FROM entries WHERE user_source=? AND user_id=? AND id=?"
             " AND updated_at=?",
-            (user_source, user_id, entry_id, scope, entry_version))
+            (user_source, user_id, entry_id, entry_version))
         if cur.rowcount == 0:
             return {"noop": True}
         conn.execute(
@@ -92,7 +91,7 @@ def apply_review_decision(
                 "SELECT 1 FROM sqlite_master WHERE type='table' AND name='embeddings'"
         ).fetchone():
             conn.execute("DELETE FROM embeddings WHERE entry_id=?", (vec_key(
-                user_source, user_id, row["dimension"], row["topic"], row["scope"]),))
+                user_source, user_id, row["dimension"], row["topic"]),))
     else:
         # orphan 候选 confirm → 观察区（spec §8.2 启用链入口），其余 → active
         new_status = "orphan_topic" if row["dimension"] == "orphan" else "active"
@@ -104,15 +103,14 @@ def apply_review_decision(
                 return {"noop": False, "invalid_topic": True}
             existing = conn.execute(
                 "SELECT id FROM entries WHERE user_source=? AND user_id=?"
-                " AND dimension=? AND topic=? AND scope=? AND id<>?"
+                " AND dimension=? AND topic=? AND id<>?"
                 " AND topic NOT LIKE '~%' AND topic NOT LIKE '!%'"
                 " AND status IN ('active','degraded','pending_review')",
-                (user_source, user_id, row["dimension"], topic, scope, row["id"])).fetchone()
+                (user_source, user_id, row["dimension"], topic, row["id"])).fetchone()
             if existing is not None:
                 merged = writer.merge_entries(
                     conn, user_source, user_id,
-                    src_id=row["id"], src_scope=scope,
-                    dst_id=existing["id"], dst_scope=scope, now=now)
+                    src_id=row["id"], dst_id=existing["id"], now=now)
                 if not merged["merged"]:
                     return {"noop": True}
                 conn.execute(
@@ -125,14 +123,14 @@ def apply_review_decision(
                 if pending is not None:
                     result["_pending_alias"] = pending
                 return result
-            new_id = entry_key(row["dimension"], topic, scope)
+            new_id = entry_key(row["dimension"], topic)
             cur = conn.execute(
                 "UPDATE entries SET status=?, topic=?, id=?, degraded_reason=NULL,"
                 " conflict_with=NULL, updated_at=?"
                 " WHERE user_source=? AND user_id=? AND dimension=?"
-                " AND topic=? AND scope=? AND updated_at=?",
+                " AND topic=? AND updated_at=?",
                 (new_status, topic, new_id, now, user_source, user_id,
-                 row["dimension"], row["topic"], scope, entry_version))
+                 row["dimension"], row["topic"], entry_version))
             if cur.rowcount == 0:
                 return {"noop": True}
             conn.execute(
@@ -142,11 +140,11 @@ def apply_review_decision(
             writer.sync_entry_vector(
                 conn,
                 user_source=user_source, user_id=user_id,
-                old_dimension=row["dimension"], old_topic=row["topic"], old_scope=scope,
-                new_dimension=row["dimension"], new_topic=topic, new_scope=scope,
+                old_dimension=row["dimension"], old_topic=row["topic"],
+                new_dimension=row["dimension"], new_topic=topic,
                 old_body=row["body"], new_body=row["body"],
             )
-            writer.resolve_conflicts(conn, user_source, user_id, entry_id, scope, now,
+            writer.resolve_conflicts(conn, user_source, user_id, entry_id, now,
                                      revive=True, clear_pending=True)
             conn.execute(
                 "INSERT INTO review_history (entry_id, user_source, user_id, decision,"
@@ -166,17 +164,17 @@ def apply_review_decision(
             canonical = row["topic"][1:]
             occupied = conn.execute(
                 "SELECT 1 FROM entries WHERE user_source=? AND user_id=?"
-                " AND dimension=? AND topic=? AND scope=? AND id<>?",
-                (user_source, user_id, row["dimension"], canonical, scope,
+                " AND dimension=? AND topic=? AND id<>?",
+                (user_source, user_id, row["dimension"], canonical,
                  row["id"])).fetchone()
             if occupied:
                 cur = conn.execute(
                     "UPDATE entries SET status='archived', archived_at=?,"
                     " conflict_with=NULL, degraded_reason=NULL, updated_at=?"
                     " WHERE user_source=? AND user_id=? AND dimension=?"
-                    " AND topic=? AND scope=? AND updated_at=?",
+                    " AND topic=? AND updated_at=?",
                     (now, now, user_source, user_id, row["dimension"],
-                     row["topic"], scope, entry_version))
+                     row["topic"], entry_version))
                 if cur.rowcount == 0:
                     return {"noop": True}
                 conn.execute(
@@ -187,15 +185,15 @@ def apply_review_decision(
                      note or "superseded_by_evolution", entry_version))
                 return {"noop": False, "updated": 1}
             new_topic, new_id = canonical, entry_key(
-                row["dimension"], canonical, scope)
+                row["dimension"], canonical)
         cur = conn.execute(
             "UPDATE entries SET status=?, topic=?, id=?,"
             " body=COALESCE(?, body), summary=COALESCE(?, summary),"
             " degraded_reason=NULL, conflict_with=NULL, updated_at=?"
             " WHERE user_source=? AND user_id=? AND dimension=?"
-            " AND topic=? AND scope=? AND updated_at=?",
+            " AND topic=? AND updated_at=?",
             (new_status, new_topic, new_id, fix_body, fix_summary, now,
-             user_source, user_id, row["dimension"], row["topic"], scope,
+             user_source, user_id, row["dimension"], row["topic"],
              entry_version))
         if cur.rowcount == 0:  # 并发：先到者已改版本 → 本判定作废
             return {"noop": True}
@@ -207,15 +205,15 @@ def apply_review_decision(
         writer.sync_entry_vector(
             conn,
             user_source=user_source, user_id=user_id,
-            old_dimension=row["dimension"], old_topic=row["topic"], old_scope=scope,
-            new_dimension=row["dimension"], new_topic=new_topic, new_scope=scope,
+            old_dimension=row["dimension"], old_topic=row["topic"],
+            new_dimension=row["dimension"], new_topic=new_topic,
             old_body=row["body"],
             new_body=fix_body if fix_body is not None else row["body"],
             vector=vector, vector_requested=vector_requested,
         )
-        # 矛盾收尾（C-1）：按 (id,scope) 清对方行标记、conflict_lost 恢复 active
+        # 矛盾收尾（C-1）：按条目 id 清对方行标记、conflict_lost 恢复 active
         writer.resolve_conflicts(conn, user_source, user_id,
-                                 entry_id, scope, now,
+                                 entry_id, now,
                                  revive=True, clear_pending=True)
     conn.execute(
         "INSERT INTO review_history (entry_id, user_source, user_id, decision,"

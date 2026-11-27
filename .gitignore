@@ -17,3 +17,6 @@ integration/
 config/settings.yaml
 integration/settings.yaml
 config/.*.lock
+
+# isolated worktrees
+.worktrees/

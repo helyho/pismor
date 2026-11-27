@@ -10,6 +10,8 @@ import type {
   EntryStatus,
   ReviewDetail,
 } from '@/api/types'
+import { formatError } from '@/utils/format'
+import ConflictPanel from './ConflictPanel.vue'
 
 interface Target {
   user_source: string
@@ -75,17 +77,6 @@ const form = ref<EntryEditPayload>(emptyForm())
 
 function statusLabel(value: string): string {
   return statusLabels[value] ?? value
-}
-
-function formatError(value: unknown): string {
-  if (value instanceof ApiError) {
-    const detail = value.detail as any
-    if (detail?.errors && Array.isArray(detail.errors)) return detail.errors.join('\n')
-    if (typeof detail === 'string') return detail
-    if (detail?.message) return String(detail.message)
-    return JSON.stringify(detail)
-  }
-  return value instanceof Error ? value.message : String(value)
 }
 
 async function load(): Promise<void> {
@@ -261,31 +252,11 @@ watch(
           </el-form-item>
         </el-form>
 
-        <el-alert
-          v-if="check?.errors.length"
-          :title="check.errors.join('；')"
-          type="error"
-          :closable="false"
-          show-icon
-          class="edit-alert"
+        <ConflictPanel
+          :errors="check?.errors"
+          :warnings="check?.warnings"
+          :conflicts="check?.conflicts"
         />
-        <el-alert
-          v-if="check?.warnings.length"
-          :title="check.warnings.join('；')"
-          type="warning"
-          :closable="false"
-          show-icon
-          class="edit-alert"
-        />
-
-        <div v-if="check?.conflicts.length" class="conflict-box">
-          <h4>目标键已有记忆</h4>
-          <el-table :data="check.conflicts" size="small">
-            <el-table-column prop="id" label="记忆" min-width="220" />
-            <el-table-column prop="status" label="状态" width="100" />
-            <el-table-column prop="summary" label="摘要" min-width="220" />
-          </el-table>
-        </div>
       </div>
 
       <footer class="edit-footer">
@@ -362,15 +333,6 @@ watch(
 .edit-footer-actions {
   display: flex;
   gap: 8px;
-}
-
-.conflict-box {
-  margin-top: 12px;
-}
-
-.conflict-box h4 {
-  margin: 0 0 8px;
-  font-size: 14px;
 }
 
 @media (max-width: 640px) {

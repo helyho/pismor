@@ -15,7 +15,7 @@ run_audit 只读；标记动作由 flag_violations 显式执行（spec §6 审�
 """
 import json
 
-from pismor.core.keys import entry_key
+from pismor.core.keys import display_key
 from pismor.llm.prompts import INSTRUCTION_RE
 from pismor.pipeline.safety import quote_is_negated, topics_near
 
@@ -52,12 +52,17 @@ def run_audit(conn, taxonomy, *, inferred_cap: float = 0.8) -> list[dict]:
 def _entry(row) -> dict:
     d = {k: row[k] for k in _ENTRY_FIELDS}
     d["id"] = row["id"] if "id" in row.keys() else None
+    d["variant"] = row["variant"] if "variant" in row.keys() else "normal"
+    d["variant_seq"] = row["variant_seq"] if "variant_seq" in row.keys() else 0
     return d
 
 
 def _loc(row):
-    """违规行定位前缀：user/user_id dim/topic。"""
-    return f"{row['user_source']}/{row['user_id']} {row['dimension']}/{row['topic']}"
+    """违规行定位前缀：user/user_id + 旧观感键（含 variant 形态）。"""
+    variant = row["variant"] if "variant" in row.keys() else "normal"
+    seq = row["variant_seq"] if "variant_seq" in row.keys() else 0
+    return (f"{row['user_source']}/{row['user_id']} "
+            f"{display_key(row['dimension'], row['topic'], variant, seq)}")
 
 
 def _violation(rule, row, detail) -> dict:
@@ -66,9 +71,10 @@ def _violation(rule, row, detail) -> dict:
 
 def _taboo_no_overlap(conn):
     rows = conn.execute(
-        "SELECT user_source, user_id, dimension, topic, id, degraded_reason,"
-        " conflict_with FROM entries"
-        " WHERE dimension IN ('taboo','preference') AND status IN ('active','degraded')").fetchall()
+        "SELECT user_source, user_id, dimension, topic, id, variant, variant_seq,"
+        " degraded_reason, conflict_with FROM entries"
+        " WHERE dimension IN ('taboo','preference') AND status IN ('active','degraded')"
+        " AND variant IN ('normal','conflict')").fetchall()
     taboos = [r for r in rows if r["dimension"] == "taboo"]
     prefs = [r for r in rows if r["dimension"] == "preference"]
     out = []
@@ -106,8 +112,8 @@ def _adjudicated(tb, pf):
 def _conflict_json(conn):
     out = []
     for r in conn.execute(
-            "SELECT user_source, user_id, dimension, topic, id, conflict_with"
-            " FROM entries WHERE conflict_with IS NOT NULL").fetchall():
+            "SELECT user_source, user_id, dimension, topic, id, variant, variant_seq,"
+            " conflict_with FROM entries WHERE conflict_with IS NOT NULL").fetchall():
         try:
             marks = json.loads(r["conflict_with"])
             if not isinstance(marks, list):
@@ -121,7 +127,8 @@ def _conflict_json(conn):
 def _taboo_negation(conn):
     out = []
     rows = conn.execute(
-        "SELECT e.user_source, e.user_id, e.dimension, e.topic, e.id, s.quote"
+        "SELECT e.user_source, e.user_id, e.dimension, e.topic, e.id,"
+        " e.variant, e.variant_seq, s.quote"
         " FROM entries e JOIN sources s"
         "  ON s.user_source=e.user_source AND s.user_id=e.user_id"
         " AND s.entry_id = e.id"
@@ -135,18 +142,20 @@ def _taboo_negation(conn):
 
 def _quote_required(conn):
     return [_violation("quote_required", r, f"{_loc(r)} 无证据行") for r in conn.execute(
-        "SELECT e.user_source, e.user_id, e.dimension, e.topic"
+        "SELECT e.id, e.user_source, e.user_id, e.dimension, e.topic,"
+        " e.variant, e.variant_seq"
         " FROM entries e LEFT JOIN sources s"
         "  ON s.user_source=e.user_source AND s.user_id=e.user_id"
         " AND s.entry_id = e.id"
-        " WHERE s.seq IS NULL AND e.topic NOT LIKE '~%'").fetchall()]
+        " WHERE s.seq IS NULL AND e.variant <> 'trace'").fetchall()]
 
 
 def _inferred_cap(conn, cap: float):
     return [_violation("inferred_cap", r,
                        f"{_loc(r)} inferred confidence {r['confidence']} > {cap}")
             for r in conn.execute(
-        "SELECT DISTINCT e.user_source, e.user_id, e.dimension, e.topic, e.confidence"
+        "SELECT DISTINCT e.id, e.user_source, e.user_id, e.dimension, e.topic,"
+        " e.variant, e.variant_seq, e.confidence"
         " FROM entries e JOIN sources s"
         "  ON s.user_source=e.user_source AND s.user_id=e.user_id"
         " AND s.entry_id = e.id"
@@ -154,10 +163,11 @@ def _inferred_cap(conn, cap: float):
 
 
 def _unique_key(conn):
-    return [_violation("unique_key", r, f"{_loc(r)} 四元组重复 {r['c']} 行")
+    return [_violation("unique_key", r, f"{_loc(r)} 六元组重复 {r['c']} 行")
             for r in conn.execute(
-        "SELECT user_source, user_id, dimension, topic, COUNT(*) c FROM entries"
-        " GROUP BY user_source, user_id, dimension, topic HAVING c > 1").fetchall()]
+        "SELECT user_source, user_id, dimension, topic, variant, variant_seq, COUNT(*) c"
+        " FROM entries GROUP BY user_source, user_id, dimension, topic, variant, variant_seq"
+        " HAVING c > 1").fetchall()]
 
 
 def _status_consistency(conn):
@@ -171,13 +181,19 @@ def _status_consistency(conn):
         # pending_review 的 orphan 候选按设计带 topic_new（复核通过才转 orphan_topic）
         ("status NOT IN ('orphan_topic','pending_review') AND topic_new IS NOT NULL",
          "topic_new 越界（仅 orphan_topic 可有）"),
-        ("topic LIKE '~%' AND status!='archived'", "轨迹行必 archived"),
-        ("topic LIKE '+%' AND status NOT IN ('active','degraded')", "'+' 变形行非法状态"),
+        ("variant='trace' AND status!='archived'", "轨迹行必 archived"),
+        ("variant='trace' AND degraded_reason IS NOT 'superseded'",
+         "轨迹行 degraded_reason 必 superseded"),
+        ("variant='conflict' AND status NOT IN ('active','degraded','archived')",
+         "conflict 行非法状态"),
+        ("variant='snapshot' AND status!='pending_review'", "快照行必 pending_review"),
+        ("variant='normal' AND variant_seq<>0", "normal 行 seq 必为 0"),
     ]
     out = []
     for cond, problem in checks:
         rows = conn.execute(
-            f"SELECT user_source, user_id, dimension, topic FROM entries WHERE {cond}"
+            f"SELECT id, user_source, user_id, dimension, topic, variant, variant_seq"
+            f" FROM entries WHERE {cond}"
         ).fetchall()
         out += [_violation("status_consistency", r, f"{_loc(r)} {problem}") for r in rows]
     return out
@@ -186,7 +202,8 @@ def _status_consistency(conn):
 def _instruction_pattern(conn):
     out = []
     for r in conn.execute(
-            "SELECT user_source, user_id, dimension, topic, body FROM entries").fetchall():
+            "SELECT id, user_source, user_id, dimension, topic, variant, variant_seq,"
+            " body FROM entries").fetchall():
         if INSTRUCTION_RE.search(r["body"]):
             out.append(_violation("instruction_pattern", r, f"{_loc(r)} 正文命中指令模式"))
     return out
@@ -201,7 +218,7 @@ def flag_violations(conn, violations: list[dict], now: str) -> int:
     with conn:
         for v in violations:
             e = v.get("entry")
-            if not e:
+            if not e or not e.get("id"):
                 continue
             if conn.execute(
                 "SELECT 1 FROM tombstones WHERE user_source=? AND user_id=?",
@@ -210,21 +227,21 @@ def flag_violations(conn, violations: list[dict], now: str) -> int:
                 continue
             row = conn.execute(
                 "SELECT status, updated_at FROM entries WHERE user_source=? AND user_id=?"
-                " AND dimension=? AND topic=?", tuple(e[k] for k in _ENTRY_FIELDS)
+                " AND id=?", (e["user_source"], e["user_id"], e["id"])
             ).fetchone()
             if row is None or row["status"] != "active":
                 continue
             cur = conn.execute(
                 "UPDATE entries SET status='pending_review', updated_at=?"
-                " WHERE user_source=? AND user_id=? AND dimension=? AND topic=?"
+                " WHERE user_source=? AND user_id=? AND id=?"
                 " AND status='active' AND updated_at=?",
-                (now, *[e[k] for k in _ENTRY_FIELDS], row["updated_at"]))
+                (now, e["user_source"], e["user_id"], e["id"], row["updated_at"]))
             if cur.rowcount == 0:
                 continue
             conn.execute(
                 "INSERT INTO review_history (entry_id, user_source, user_id, decision, actor,"
                 " ts, note, entry_version) VALUES (?, ?, ?, 'flagged', 'audit', ?, ?, ?)",
-                (e.get("id") or entry_key(e["dimension"], e["topic"]), e["user_source"], e["user_id"], now,
+                (e["id"], e["user_source"], e["user_id"], now,
                  v["rule"], row["updated_at"]))
             flagged += 1
     return flagged

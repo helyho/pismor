@@ -106,6 +106,7 @@ def user_assemble(
             related_top_k=a.related_top_k,
             half_life_days=a.half_life_days,
             clarify_ttl_days=a.clarify_ttl_days,
+            recall_conflicts=a.recall_conflicts,
             min_similarity=settings.embedding.min_similarity,
             write_clarifications=False,
         )

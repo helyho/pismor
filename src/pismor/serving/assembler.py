@@ -19,7 +19,19 @@ _RENDER_ORDER = ("taboo", "identity", "preference", "fact", "context")
 _TABOO_MERGE_THRESHOLD = 40
 _DEGRADED_PREFIX = "曾观察："
 _MUST_DIMS = ("taboo", "identity")
-_MUST_COLS = "id, dimension, body, confidence, status, updated_at, reinforcements"
+_MUST_COLS = ("id, dimension, topic, variant, variant_seq, body, confidence, status,"
+              " updated_at, reinforcements")
+
+
+def _recall_filter(recall_conflicts: bool) -> str:
+    """召回行过滤：variant 表形态，conflict_with 表争议状态。
+
+    默认只注入已收尾/无争议的行；recall_conflicts=True 退回旧行为（不看 conflict_with）。
+    """
+    sql = " AND status IN ('active','degraded') AND variant IN ('normal','conflict')"
+    if not recall_conflicts:
+        sql += " AND conflict_with IS NULL"
+    return sql
 
 
 def _empty_pack() -> dict:
@@ -37,6 +49,7 @@ def assemble(conn, embedder, user_source, user_id, budget=2000, dimensions=None,
              taboo_budget_share=0.6, related_top_k=20, half_life_days=30.0,
              clarify_ttl_days=7, min_similarity=0.5,
              write_clarifications=True, dimension_order=None,
+             recall_conflicts=False,
              taboo_merge_threshold=_TABOO_MERGE_THRESHOLD) -> dict:
     """装配用户记忆包。
 
@@ -53,11 +66,14 @@ def assemble(conn, embedder, user_source, user_id, budget=2000, dimensions=None,
                         (user_source, user_id)).fetchone():
             return _empty_pack()
         try:
-            must = _must_have(conn, user_source, user_id, dimension_order)
+            must = _must_have(conn, user_source, user_id, dimension_order,
+                              recall_conflicts=recall_conflicts)
             related = _related(conn, embedder, user_source, user_id, query, dimensions,
-                               top_k=related_top_k, min_similarity=min_similarity)
+                               top_k=related_top_k, min_similarity=min_similarity,
+                               recall_conflicts=recall_conflicts)
         except sqlite3.Error:
-            must = _must_have(conn, user_source, user_id, dimension_order)  # 只回必带集
+            must = _must_have(conn, user_source, user_id, dimension_order,
+                              recall_conflicts=recall_conflicts)  # 只回必带集
             related = []
         pack = _build(must, related, budget, now, user_id, include_memory, audit_sink,
                       taboo_budget_share=taboo_budget_share, half_life_days=half_life_days,
@@ -74,11 +90,12 @@ def assemble(conn, embedder, user_source, user_id, budget=2000, dimensions=None,
         return _empty_pack()
 
 
-def _must_have(conn, user_source, user_id, dimension_order=None) -> list[dict]:
+def _must_have(conn, user_source, user_id, dimension_order=None, *,
+               recall_conflicts: bool = False) -> list[dict]:
     # dimensions 白名单只作用于相关集；必带集（taboo+identity）无条件恒在
     sql = ("SELECT {} FROM entries WHERE user_source=? AND user_id=?"
            " AND dimension IN ('taboo','identity')"
-           " AND status IN ('active','degraded')").format(_MUST_COLS)
+           + _recall_filter(recall_conflicts)).format(_MUST_COLS)
     args = [user_source, user_id]
     sql += " ORDER BY confidence DESC"
     order = {d: i for i, d in enumerate(dimension_order or _RENDER_ORDER)}
@@ -89,7 +106,8 @@ def _must_have(conn, user_source, user_id, dimension_order=None) -> list[dict]:
 
 
 def _related(conn, embedder, user_source, user_id, query, dimensions, *,
-             top_k: int = 20, min_similarity: float = 0.5) -> list[dict]:
+             top_k: int = 20, min_similarity: float = 0.5,
+             recall_conflicts: bool = False) -> list[dict]:
     if not query:
         return []
     rows: list[dict] = []
@@ -97,11 +115,13 @@ def _related(conn, embedder, user_source, user_id, query, dimensions, *,
         try:
             vec = l2_normalize(embedder.embed([query])[0])  # 余弦阈值换算依赖单位向量
             rows = _vector_recall(conn, json.dumps(vec), user_source, user_id, dimensions,
-                                  top_k=top_k, min_similarity=min_similarity)
+                                  top_k=top_k, min_similarity=min_similarity,
+                                  recall_conflicts=recall_conflicts)
         except (EmbedUnavailable, KeyError, json.JSONDecodeError, IndexError, sqlite3.Error):
             rows = []  # 向量召回不可用（含网关 200 坏体 KeyError）→ 回退词面
     if not rows:
-        rows = _lexical(conn, user_source, user_id, tokens(query), dimensions, top_k=top_k)
+        rows = _lexical(conn, user_source, user_id, tokens(query), dimensions, top_k=top_k,
+                            recall_conflicts=recall_conflicts)
     return rows
 
 
@@ -115,17 +135,16 @@ def _cos_to_l2(cos: float) -> float:
 
 
 def _vector_recall(conn, vec_json, user_source, user_id, dimensions, *,
-                   top_k: int = 20, min_similarity: float = 0.5) -> list[dict]:
+                   top_k: int = 20, min_similarity: float = 0.5,
+                   recall_conflicts: bool = False) -> list[dict]:
     if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table'"
                     " AND name='embeddings'").fetchone() is None:
         raise sqlite3.OperationalError("embeddings table missing")
-    # 向量行主键为四元组合成键（keys.vec_key），JOIN 按四元组还原
-    sql = ("SELECT {} FROM embeddings v JOIN entries e"
-           " ON v.entry_id = e.user_source || char(31) || e.user_id || char(31)"
-           "    || e.dimension || char(31) || e.topic"
+    # 向量行主键为 entries.id（稳定行键），直接 JOIN
+    sql = ("SELECT {} FROM embeddings v JOIN entries e ON v.entry_id = e.id"
            " WHERE v.embedding MATCH ? AND v.k = {} AND v.distance <= ?"
-           " AND e.user_source = ? AND e.user_id = ?"
-           " AND e.status IN ('active','degraded')").format(_MUST_COLS, top_k)
+           " AND e.user_source = ? AND e.user_id = ?").format(_MUST_COLS, top_k)
+    sql += _recall_filter(recall_conflicts)
     args = [vec_json, _cos_to_l2(min_similarity), user_source, user_id]
     if dimensions:
         sql += " AND e.dimension IN ({})".format(",".join("?" * len(dimensions)))
@@ -135,7 +154,7 @@ def _vector_recall(conn, vec_json, user_source, user_id, dimensions, *,
 
 
 def _lexical(conn, user_source, user_id, query_tokens, dimensions, *,
-             top_k: int = 20) -> list[dict]:
+             top_k: int = 20, recall_conflicts: bool = False) -> list[dict]:
     """词面召回：mem_fts BM25 打分（向量召回不可用时的回退路径，spec §13）。
 
     tokens 来自 tokenizer 同源切词，OR 语义（任一命中即候选）；BM25 负值越小
@@ -145,7 +164,8 @@ def _lexical(conn, user_source, user_id, query_tokens, dimensions, *,
         return []
     sql = ("SELECT {}, bm25(mem_fts) AS _bm25 FROM entries e JOIN mem_fts f"
            " ON f.rowid = e.rowid WHERE mem_fts MATCH ?"
-           " AND e.user_source=? AND e.user_id=? AND e.status IN ('active','degraded')").format(_MUST_COLS)
+           " AND e.user_source=? AND e.user_id=?").format(_MUST_COLS)
+    sql += _recall_filter(recall_conflicts)
     args = [fts.match_expr(query_tokens), user_source, user_id]
     if dimensions:
         sql += " AND e.dimension IN ({})".format(",".join("?" * len(dimensions)))
@@ -232,14 +252,15 @@ def _clarifications(conn, user_source, user_id, *, ttl_days: int = 7,
                     write: bool = True) -> list[dict]:
     """对称 conflict_with 对 → clarifier.issue_many 落 pending 并随响应递交（spec §11）。
 
-    关联标记为裸 id（entries.id = {dimension}_{topic}），直接字符串相等定位。
+    关联标记为裸 id（entries.id 稳定行键），直接字符串相等定位。
     全部对合并为一次短事务写入（审查 #7），避免读接口长时间持有 WAL 写锁。
     ttl_days 透传为新建 pending 行的 TTL（settings.assembler.clarify_ttl_days）。
     """
     rows = conn.execute(
         "SELECT id, summary, confidence, conflict_with FROM entries"
         " WHERE user_source=? AND user_id=?"
-        " AND status IN ('active','degraded') AND conflict_with IS NOT NULL",
+        " AND status IN ('active','degraded') AND variant IN ('normal','conflict')"
+        " AND conflict_with IS NOT NULL",
         (user_source, user_id)).fetchall()
     by_key = {}
     parsed = {}

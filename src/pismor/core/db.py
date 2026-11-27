@@ -1,10 +1,13 @@
 import sqlite3
 from pathlib import Path
-import sqlite_vec
 
+import sqlite_vec
 
 from pismor.core import fts as _fts
 from pismor.core import tokenizer as _tokenizer
+
+# 2 = variant 重构（id 与 topic 解耦，同主题多形态共存）。不迁移 v1 数据。
+SCHEMA_VERSION = 2
 
 
 def _fts_terms(summary):
@@ -34,7 +37,10 @@ SCHEMA = """
 CREATE TABLE IF NOT EXISTS entries (
   user_source TEXT NOT NULL, user_id TEXT NOT NULL,
   dimension TEXT NOT NULL, topic TEXT NOT NULL,
-  id TEXT NOT NULL,
+  id TEXT PRIMARY KEY,
+  variant TEXT NOT NULL DEFAULT 'normal'
+    CHECK (variant IN ('normal','conflict','trace','snapshot')),
+  variant_seq INTEGER NOT NULL DEFAULT 0,
   confidence REAL NOT NULL,
   status TEXT NOT NULL CHECK (status IN ('pending_review','orphan_topic','active','degraded','archived')),
   body TEXT NOT NULL,
@@ -43,7 +49,11 @@ CREATE TABLE IF NOT EXISTS entries (
   last_reinforced_at TEXT NOT NULL,
   degraded_reason TEXT, superseded_by TEXT, topic_new TEXT,
   conflict_with TEXT, reinforcements INTEGER NOT NULL DEFAULT 0, archived_at TEXT,
-  PRIMARY KEY (user_source, user_id, dimension, topic)
+  -- 同一用户/维度/主题下，每种形态任意条数；normal 只能一条（seq 固定 0）
+  UNIQUE (user_source, user_id, dimension, topic, variant, variant_seq),
+  CHECK (variant <> 'normal' OR variant_seq = 0),
+  CHECK (variant <> 'trace' OR status = 'archived'),
+  CHECK (variant <> 'snapshot' OR status = 'pending_review')
 );
 CREATE TABLE IF NOT EXISTS sources (
   seq INTEGER PRIMARY KEY,
@@ -53,6 +63,9 @@ CREATE TABLE IF NOT EXISTS sources (
 );
 CREATE INDEX IF NOT EXISTS idx_sources_entry ON sources(user_source, user_id, entry_id);
 CREATE INDEX IF NOT EXISTS idx_entries_status_updated ON entries(status, updated_at);
+CREATE INDEX IF NOT EXISTS idx_entries_lookup
+  ON entries(user_source, user_id, dimension, topic, variant);
+CREATE INDEX IF NOT EXISTS idx_entries_variant_status ON entries(variant, status);
 CREATE TABLE IF NOT EXISTS review_history (
   entry_id TEXT, user_source TEXT, user_id TEXT,
   decision TEXT NOT NULL, actor TEXT NOT NULL, ts TEXT NOT NULL, note TEXT,
@@ -125,7 +138,18 @@ END;
 
 
 def init_schema(conn: sqlite3.Connection, vec_dimensions: int | None) -> None:
+    # v1 库（无 variant 列）会被 CREATE TABLE IF NOT EXISTS 静默保留，
+    # 随后所有写入都会错列；这里在动表之前硬拒绝，避免半迁移状态。
+    version = conn.execute("PRAGMA user_version").fetchone()[0]
+    has_entries = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='entries'").fetchone()
+    if has_entries and version < SCHEMA_VERSION:
+        raise RuntimeError(
+            "entries schema v1 与当前版本不兼容（variant 重构不迁移历史数据）。"
+            "请删除数据库文件后重建，例如：rm data/index.db*"
+        )
     conn.executescript(SCHEMA)
+    conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
     # 旧库升级：tombstones 增加 purged_at（软删除/彻底删除双态）
     columns = {row["name"] for row in conn.execute("PRAGMA table_info(tombstones)")}
     if "purged_at" not in columns:
@@ -133,10 +157,6 @@ def init_schema(conn: sqlite3.Connection, vec_dimensions: int | None) -> None:
         # 旧版本的删除是硬删除，存量 tombstone 的数据已不存在，统一标记为已彻底删除，
         # 避免升级后把它们显示成“可恢复”。
         conn.execute("UPDATE tombstones SET purged_at=deleted_at WHERE purged_at IS NULL")
-    # 行键自愈：id 必须等于 {dimension}_{topic}，entries.id 才能与 sources.entry_id 直接 JOIN。
-    conn.execute(
-        "UPDATE entries SET id = dimension || '_' || topic"
-        " WHERE id <> dimension || '_' || topic")
     # mem_fts 分词器一致性：配置与建索引时不符 → 全量重建（切换 jieba/bigram 生效）
     name = _tokenizer.current()
     row = conn.execute("SELECT value FROM fts_meta WHERE key='tokenizer'").fetchone()

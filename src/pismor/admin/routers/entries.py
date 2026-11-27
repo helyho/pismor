@@ -34,7 +34,7 @@ from pismor.admin.schemas import (
     ReviewDetailOut,
 )
 from pismor.core.db import get_conn
-from pismor.core.keys import entry_key
+from pismor.core.keys import display_key
 from pismor.pipeline import writer
 from pismor.pipeline.resolver import LlmUnavailable, neighbor_candidates
 
@@ -184,7 +184,7 @@ def edit_entry(
                 conn,
                 principal,
                 "entry.edit",
-                result["id"],
+                display_key(result["dimension"], result["topic"]),
                 {
                     "old_id": payload.entry_id,
                     "new_id": result["id"],
@@ -303,14 +303,14 @@ def create_entry_endpoint(
                       if exc.errors and exc.errors[0].code == "write_rejected"
                       else "safety_rejected")
             _audit_rejected(conn, principal, payload, reason,
-                            entry_key(payload.dimension, payload.topic))
+                            display_key(payload.dimension, payload.topic))
             raise HTTPException(
                 status_code=422,
                 detail={"errors": _field_errors(exc.errors)},
             ) from exc
         except LlmUnavailable:
             _audit_rejected(conn, principal, payload, "llm_unavailable",
-                            entry_key(payload.dimension, payload.topic))
+                            display_key(payload.dimension, payload.topic))
             return JSONResponse(status_code=503, content={
                 "ok": False,
                 "code": "llm_unavailable",
@@ -340,7 +340,7 @@ def create_entry_endpoint(
                 conn,
                 principal,
                 "entry.create",
-                result["id"],
+                display_key(result["dimension"], result["topic"]),
                 {
                     "user_source": payload.user_source,
                     "user_id": payload.user_id,

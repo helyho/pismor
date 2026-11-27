@@ -14,7 +14,7 @@ from pismor.admin.entry_service import (
     find_near_taboo,
     find_same_key,
 )
-from pismor.core.keys import entry_key
+from pismor.core.keys import new_id
 
 VERSION = "2026-01-01T00:00:00+00:00"
 
@@ -29,16 +29,19 @@ def _insert_entry(
     status="active",
     summary="summary",
     body="body",
+    variant="normal",
+    variant_seq=0,
 ):
-    entry_id = entry_key(dimension, topic)
+    entry_id = new_id()
     conn.execute(
         "INSERT INTO entries (user_source,user_id,dimension,topic,id,confidence,"
         "status,body,summary,created_at,updated_at,last_reinforced_at,degraded_reason,"
-        "superseded_by,topic_new,conflict_with,reinforcements,archived_at)"
-        " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        "superseded_by,topic_new,conflict_with,reinforcements,archived_at,"
+        "variant,variant_seq)"
+        " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (user_source, user_id, dimension, topic, entry_id, 0.9, status,
          body, summary, VERSION, VERSION, VERSION, None, None, None,
-         None, 0, None),
+         None, 0, None, variant, variant_seq),
     )
     conn.commit()
     return entry_id
@@ -229,9 +232,9 @@ def test_check_tombstone(conn):
 
 def test_find_same_key_miss_and_hit(conn):
     assert find_same_key(conn, "webchat", "u1", "preference", "style") is None
-    _insert_entry(conn, status="archived")
+    eid = _insert_entry(conn, status="archived")
     hit = find_same_key(conn, "webchat", "u1", "preference", "style")
-    assert hit["id"] == "preference_style"
+    assert hit["id"] == eid
     assert hit["status"] == "archived"
     for col in ("dimension", "topic", "summary", "confidence", "updated_at"):
         assert col in hit, col
@@ -241,10 +244,10 @@ def test_find_same_key_miss_and_hit(conn):
 
 
 def test_find_near_taboo(conn):
-    _insert_entry(conn, dimension="taboo", topic="phone")
+    peid = _insert_entry(conn, dimension="taboo", topic="phone")
     hit = find_near_taboo(conn, "webchat", "u1", "preference", "contact_phone")
     assert hit is not None
-    assert hit["id"] == entry_key("taboo", "phone")
+    assert hit["id"] == peid
     # topic 完全相同不算近似
     assert find_near_taboo(conn, "webchat", "u1", "preference", "phone") is None
 
@@ -257,8 +260,9 @@ def test_find_near_taboo_only_live_unmarked_rows(conn):
     _insert_entry(conn, user_id="b", dimension="taboo", topic="phone", status="degraded")
     hit = find_near_taboo(conn, "webchat", "b", "preference", "phone_number")
     assert hit is not None and hit["topic"] == "phone"
-    # ~ 前缀的 taboo 行不算近似
-    _insert_entry(conn, user_id="c", dimension="taboo", topic="~phone", status="degraded")
+    # trace 变体的 taboo 行不算近似
+    _insert_entry(conn, user_id="c", dimension="taboo", topic="phone", status="archived",
+                  variant="trace", variant_seq=1)
     assert find_near_taboo(conn, "webchat", "c", "preference", "phone_number") is None
 
 
@@ -327,22 +331,22 @@ def test_check_entry_create_taboo_negation(conn, taxonomy):
 
 
 def test_check_entry_create_same_key_conflict(conn, taxonomy):
-    _insert_entry(conn, status="active")
+    eid = _insert_entry(conn, status="active")
     result = check_entry_create(conn, taxonomy, **_create_kwargs(user_id="u1"))
     assert result.errors == []
     assert len(result.conflicts) == 1
-    assert result.conflicts[0]["id"] == "preference_style"
+    assert result.conflicts[0]["id"] == eid
     assert result.conflicts[0]["status"] == "active"
 
 
 def test_check_entry_create_normalizes_before_conflict(conn, taxonomy):
     """归一后 topic 用于同键判定。"""
-    _insert_entry(conn, dimension="taboo", topic="output_format")
+    oeid = _insert_entry(conn, dimension="taboo", topic="output_format")
     result = check_entry_create(conn, taxonomy, **_create_kwargs(
         dimension="taboo", topic="表格", quote="不要表格", user_id="u1"))
     assert result.normalized_topic == "output_format"
     assert result.conflicts
-    assert result.conflicts[0]["id"] == "taboo_output_format"
+    assert result.conflicts[0]["id"] == oeid
 
 
 def test_check_entry_create_assembly_order(conn, taxonomy):

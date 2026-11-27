@@ -59,6 +59,7 @@ class AssemblerSettings:
     related_top_k: int = 20          # 相关集召回条数
     half_life_days: float = 30.0     # 强化时效半衰期
     clarify_ttl_days: int = 7        # 新建澄清 pending 的 TTL 默认
+    recall_conflicts: bool = False   # 召回未收尾冲突行（旧行为 A/B 开关；默认只注入无争议行）
 
 @dataclass(frozen=True)
 class IntakeSettings:

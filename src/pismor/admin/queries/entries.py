@@ -90,8 +90,9 @@ def list_entries(
         "confidence_desc": "confidence DESC, updated_at DESC",
     }.get(order, "updated_at DESC, rowid DESC")
     rows = conn.execute(
-        "SELECT id, user_source, user_id, dimension, topic, summary, status,"
-        " confidence, updated_at, last_reinforced_at, reinforcements, conflict_with,"
+        "SELECT id, user_source, user_id, dimension, topic, variant, variant_seq,"
+        " summary, status, confidence, updated_at, last_reinforced_at, reinforcements,"
+        " conflict_with,"
         " (SELECT COUNT(*) FROM sources s WHERE s.user_source=entries.user_source"
         "   AND s.user_id=entries.user_id AND s.entry_id=entries.id) AS sources_count"
         f" FROM entries WHERE {where} ORDER BY {order_by} LIMIT ? OFFSET ?",

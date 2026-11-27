@@ -15,7 +15,6 @@ import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
-from pismor.core.keys import entry_key, vec_key
 from pismor.core.schemas import _KEY_UNSAFE_CHARS
 from pismor.pipeline.safety import (
     has_sensitive_detail,
@@ -70,7 +69,7 @@ def check_keys(user_source: str, user_id: str) -> list[FieldError]:
     """结构键校验：空 → missing、超 128 字 → too_long、含控制字符 → unsafe_chars。
 
     一个键可同时产出多条错误（如既含控制字符又超长）；键含 \\x00-\\x1f/\\x7f
-    会串号 vec_key（用户串扰），必须硬拒。
+    会串号行键/向量键（用户串扰），必须硬拒。
     """
     errors: list[FieldError] = []
     for field, value in (("user_source", user_source), ("user_id", user_id)):
@@ -119,11 +118,7 @@ def check_taxonomy(
         else:
             errors.append(FieldError("topic", "disabled", "主题已停用，不能新建条目"))
     if normalized.startswith(("~", "+", "!")):
-        message = "主题不能以 ~、+、! 开头"
-        if allow_foreign:
-            warnings.append(message)
-        else:
-            errors.append(FieldError("topic", "prefix", message))
+        errors.append(FieldError("topic", "prefix", "主题不能以 ~、+、! 开头"))
     if len(normalized) > _KEY_MAX_LEN:
         message = "主题不能超过 128 字"
         if allow_foreign:
@@ -213,7 +208,8 @@ def find_same_key(
     """同键既有条目（不限状态：archived 也算，创建时提示走编辑恢复）；无 → None。"""
     row = conn.execute(
         f"SELECT {_conflict_columns()} FROM entries"
-        " WHERE user_source=? AND user_id=? AND dimension=? AND topic=?",
+        " WHERE user_source=? AND user_id=? AND dimension=? AND topic=?"
+        " AND variant='normal'",
         (user_source, user_id, dimension, topic),
     ).fetchone()
     return dict(row) if row else None
@@ -222,14 +218,14 @@ def find_same_key(
 def find_near_taboo(
     conn, user_source: str, user_id: str, dimension: str, topic: str,
 ) -> dict | None:
-    """近似 taboo 行：存活（active/degraded）、不带 ~ 标记、topics_near 匹配
-    且 topic 不同；取第一条；无 → None。taboo 维度自身不查。"""
+    """近似 taboo 行：存活（active/degraded）、normal/conflict 形态、topics_near
+    匹配且 topic 不同；取第一条；无 → None。taboo 维度自身不查。"""
     if dimension == "taboo":
         return None
     for row in conn.execute(
         f"SELECT {_conflict_columns()} FROM entries"
         " WHERE user_source=? AND user_id=? AND dimension='taboo'"
-        " AND status IN ('active','degraded') AND topic NOT LIKE '~%'",
+        " AND status IN ('active','degraded') AND variant IN ('normal','conflict')",
         (user_source, user_id),
     ):
         if row["topic"] != topic and topics_near(topic, row["topic"]):
@@ -342,7 +338,7 @@ def check_entry_edit(
         rows = conn.execute(
             "SELECT id, dimension, topic, status, summary FROM entries"
             " WHERE user_source=? AND user_id=? AND dimension=? AND topic=?"
-            " AND id<>?",
+            " AND variant='normal' AND id<>?",
             (
                 user_source, user_id, new_dimension, new_topic, entry_id,
             ),
@@ -476,7 +472,6 @@ def apply_entry_edit(
 
     new_dimension = (new_dimension or "").strip()
     new_topic = (new_topic or "").strip()
-    new_id = entry_key(new_dimension, new_topic)
     now = utcnow()
     archived_at = row["archived_at"]
     if status == "archived":
@@ -486,12 +481,12 @@ def apply_entry_edit(
     superseded_by = row["superseded_by"] if status == "archived" else None
 
     current = conn.execute(
-        "UPDATE entries SET dimension=?, topic=?, id=?, confidence=?,"
+        "UPDATE entries SET dimension=?, topic=?, confidence=?,"
         " status=?, body=?, summary=?, degraded_reason=?, archived_at=?,"
         " superseded_by=?, topic_new=NULL, updated_at=?"
         " WHERE user_source=? AND user_id=? AND id=? AND updated_at=?",
         (
-            new_dimension, new_topic, new_id, confidence, status,
+            new_dimension, new_topic, confidence, status,
             body.strip(), summary.strip(), (degraded_reason or "").strip() or None,
             archived_at, superseded_by, now,
             user_source, user_id, entry_id, expected_version,
@@ -503,26 +498,22 @@ def apply_entry_edit(
             "conflicts": [], "stale": True, "id": None, "updated_at": None,
         }
 
-    if new_id != entry_id:
-        _rename_references(
-            conn,
-            user_source=user_source, user_id=user_id,
-            old_id=entry_id, new_id=new_id,
-        )
+    # 同主题全部变体跟随改键；id 稳定，sources/conflict_with 无需迁移
+    conn.execute(
+        "UPDATE entries SET dimension=?, topic=?, updated_at=?"
+        " WHERE user_source=? AND user_id=? AND dimension=? AND topic=? AND id<>?",
+        (new_dimension, new_topic, now, user_source, user_id,
+         row["dimension"], row["topic"], entry_id),
+    )
 
     vector_state = writer.sync_entry_vector(
-        conn,
-        user_source=user_source, user_id=user_id,
-        old_dimension=row["dimension"], old_topic=row["topic"],
-        new_dimension=new_dimension, new_topic=new_topic,
+        conn, user_source=user_source, user_id=user_id, entry_id=entry_id,
         old_body=row["body"], new_body=body.strip(),
         vector=vector, vector_requested=vector_requested,
     )
     warnings = list(checked["warnings"])
     if vector_state == "replaced":
         warnings.append("正文已更新，向量已重建")
-    elif vector_state == "moved":
-        warnings.append("向量已随条目键迁移")
     elif vector_state == "dropped":
         if vector_requested:
             warnings.append("正文已更新，嵌入服务不可用，该条目已退出向量召回")
@@ -535,7 +526,9 @@ def apply_entry_edit(
         "warnings": warnings,
         "conflicts": [],
         "stale": False,
-        "id": new_id,
+        "id": entry_id,
+        "dimension": new_dimension,
+        "topic": new_topic,
         "updated_at": now,
     }
 
@@ -658,12 +651,14 @@ def create_entry(conn, taxonomy, *, user_source, user_id, dimension, topic,
         raise SafetyRejectedError([FieldError(
             "body", "write_rejected", "条目未能写入：缺少原话引用，无法保存")])
 
-    # fetch_final：CONFLICT 双存落库 topic 带 "+" 前缀，裸键与变形键都可能命中
+    # fetch_final：冲突双存时同 topic 有 normal/conflict 两行，优先取规范行
     row = conn.execute(
         "SELECT id, dimension, topic, status, confidence FROM entries"
-        " WHERE user_source=? AND user_id=? AND dimension=?"
-        " AND topic IN (?, '+' || ?)",
-        (user_source, user_id, dimension, normalized, normalized),
+        " WHERE user_source=? AND user_id=? AND dimension=? AND topic=?"
+        " AND variant IN ('normal','conflict')"
+        " ORDER BY CASE variant WHEN 'normal' THEN 0 ELSE 1 END, variant_seq DESC"
+        " LIMIT 1",
+        (user_source, user_id, dimension, normalized),
     ).fetchone()
     warnings = list(checked.warnings)
     conflicts: list[dict] = []
@@ -679,11 +674,8 @@ def create_entry(conn, taxonomy, *, user_source, user_id, dimension, topic,
             conflicts = [dict(r) for r in conn.execute(
                 f"SELECT {_conflict_columns()} FROM entries"
                 f" WHERE id IN ({placeholders})", ids)]
-        if writer.entry_has_vector(
-                conn, vec_key(user_source, user_id, row["dimension"], row["topic"])
-        ) is False:
-            # None（表未启用）不算故障，不告警；键为 vec_key 组合键——
-            # embeddings.entry_id 存四元组键而非 entries.id（writer 既有约定）
+        if writer.entry_has_vector(conn, row["id"]) is False:
+            # None（表未启用）不算故障，不告警；embeddings.entry_id 直接存 entries.id
             warnings.append(_VECTOR_FAILED_WARNING)
 
     return {

@@ -1,8 +1,8 @@
 """每日聚合（spec §8.2/§10/§12/§11）：orphan 观察区启用/废弃、衰减、归档、复核超期、澄清过期。
 
 实现要点（上游裁决）：
-- 所有扫描 WHERE 按 status 语义自然排除 '~' 前缀轨迹行：轨迹行恒 archived，任一扫描条件
-  （orphan_topic/active/degraded/pending_review）都不命中；'+' 冲突行落 degraded/active，同理不命中。
+- 所有扫描 WHERE 按 status/variant 语义自然排除 trace 行：轨迹行恒 archived，任一扫描条件
+  （orphan_topic/active/degraded/pending_review）都不命中；conflict 行按 status 参与。
 - 时间统一以注入 now 参数与 SQLite julianday 混算：julianday 对带时区后缀（+08:00）与
   纯日期的 ISO 字符串均归一到 UTC，混算安全——tests/test_aggregator.py 边界用例钉死。
 - orphan 聚合（30 天窗口统一口径，修复轮 1 裁决）：GROUP BY topic_new；窗口内（created_at
@@ -16,7 +16,6 @@
 """
 import json
 
-from pismor.core.keys import entry_key
 from pismor.core.taxonomy_edit import (
     flush_taxonomy_edits,
     plan_topic_alias,
@@ -230,25 +229,20 @@ def _topic_is_sensitive(dim, topic):
 
 
 def _rekey(conn, rows, dim, topic, now):
-    """整组 re-key 转正：dimension/topic 按 LLM 指定，id 与证据键同步跟随；目标键被占的行进人工队列。"""
+    """整组 re-key 转正：dimension/topic 按 LLM 指定；id 稳定不变，证据键无需迁移；目标键被占的行进人工队列。"""
     activated = 0
     for r in rows:
-        new_id = entry_key(dim, topic)
         exists = conn.execute(
             "SELECT 1 FROM entries WHERE user_source=? AND user_id=? AND dimension=?"
-            " AND topic=?",
-            (r["user_source"], r["user_id"], dim, topic)).fetchone()
+            " AND topic=? AND variant='normal' AND id<>?",
+            (r["user_source"], r["user_id"], dim, topic, r["id"])).fetchone()
         if exists:
-            _queue_audit(conn, [r], now, note=f"merge_key_conflict: {new_id}")
+            _queue_audit(conn, [r], now, note=f"merge_key_conflict: {dim}_{topic}")
             continue
         conn.execute(
-            "UPDATE entries SET dimension=?, topic=?, id=?, status='active', topic_new=NULL,"
-            " updated_at=? WHERE user_source=? AND user_id=? AND dimension=? AND topic=?",
-            (dim, topic, new_id, now, r["user_source"], r["user_id"], r["dimension"],
-             r["topic"]))
-        conn.execute(
-            "UPDATE sources SET entry_id=? WHERE user_source=? AND user_id=? AND entry_id=?",
-            (new_id, r["user_source"], r["user_id"], r["id"]))
+            "UPDATE entries SET dimension=?, topic=?, status='active', topic_new=NULL,"
+            " updated_at=? WHERE id=?",
+            (dim, topic, now, r["id"]))
         activated += 1
     return activated
 
@@ -287,9 +281,8 @@ def _physically_drop(conn, rows):
             "DELETE FROM sources WHERE user_source=? AND user_id=? AND entry_id=?",
             (r["user_source"], r["user_id"], r["id"]))
         conn.execute(
-            "DELETE FROM entries WHERE user_source=? AND user_id=? AND dimension=?"
-            " AND topic=?",
-            (r["user_source"], r["user_id"], r["dimension"], r["topic"]))
+            "DELETE FROM entries WHERE user_source=? AND user_id=? AND id=?",
+            (r["user_source"], r["user_id"], r["id"]))
 
 
 def _bare_topic(topic_new: str, taxonomy) -> str:
@@ -323,7 +316,7 @@ def _decay(conn, now, degrade_days: int = 90, degrade_confidence: float = 0.7):
     """degrade_days 天无强化且 conf<degrade_confidence 的 active 条目衰减（taboo 恒不时间衰减，spec §11）。"""
     cur = conn.execute(
         "UPDATE entries SET status='degraded', degraded_reason='stale'"
-        " WHERE status='active' AND dimension!='taboo' AND confidence<?"
+        " WHERE status='active' AND variant='normal' AND dimension!='taboo' AND confidence<?"
         "   AND julianday(last_reinforced_at) < julianday(?) - ?"
         f"   AND {_ALIVE}",
         (degrade_confidence, now, degrade_days))
@@ -367,7 +360,7 @@ def _open_merge_tasks(conn, taxonomy, now, threshold: int) -> int:
         "SELECT user_source, user_id, COUNT(*) AS n,"
         " GROUP_CONCAT(DISTINCT topic) AS topics"
         f" FROM entries WHERE {_ALIVE} AND dimension='taboo'"
-        " AND status IN ('active','degraded')"
+        " AND status IN ('active','degraded') AND variant IN ('normal','conflict')"
         " GROUP BY user_source, user_id").fetchall()
     per_user: dict[tuple[str, str], dict] = {}
     for r in rows:
@@ -375,7 +368,7 @@ def _open_merge_tasks(conn, taxonomy, now, threshold: int) -> int:
             (r["user_source"], r["user_id"]), {"count": 0, "free": set()})
         bucket["count"] += r["n"]
         for t in (r["topics"] or "").split(","):
-            if t and t not in allowed and not t.startswith(("~", "!")):
+            if t and t not in allowed:
                 bucket["free"].add(t)
     opened = 0
     for (us, uid), b in per_user.items():

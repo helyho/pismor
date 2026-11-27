@@ -8,7 +8,6 @@ from fastapi.testclient import TestClient
 from pismor.admin.deps import Principal
 from pismor.core.config import EmbeddingSettings, LLMSettings, Settings
 from pismor.core.db import get_conn, init_schema
-from pismor.core.keys import vec_key
 from pismor.serving.api import create_app
 
 
@@ -141,7 +140,7 @@ def test_edit_renames_entry_and_syncs_references(tmp_path):
             " VALUES (?,?,?,?,?,?)",
             ("webchat", "u1", json.dumps([entry_id], ensure_ascii=False), "哪个更准确？", VERSION, 7),
         )
-        old_vec = vec_key("webchat", "u1", "preference", "style")
+        old_vec = entry_id
         conn.execute(
             "INSERT INTO embeddings (entry_id,user_source,user_id,embedding) VALUES (?,?,?,?)",
             (old_vec, "webchat", "u1", json.dumps([0.1, 0.2, 0.3, 0.4])),
@@ -152,12 +151,12 @@ def test_edit_renames_entry_and_syncs_references(tmp_path):
     assert res.status_code == 200
     body = res.json()
     assert body["ok"] is True
-    assert body["id"] == "fact_tone"
+    assert body["id"] == entry_id
 
     with closing(get_conn(db_path)) as conn:
         entry = conn.execute(
             "SELECT * FROM entries WHERE user_source='webchat' AND user_id='u1' AND id=?",
-            ("fact_tone",),
+            (entry_id,),
         ).fetchone()
         assert entry["dimension"] == "fact"
         assert entry["topic"] == "tone"
@@ -165,27 +164,22 @@ def test_edit_renames_entry_and_syncs_references(tmp_path):
         assert entry["body"] == "body"
         assert conn.execute(
             "SELECT entry_id FROM sources WHERE origin_ref='m1'"
-        ).fetchone()["entry_id"] == "fact_tone"
+        ).fetchone()["entry_id"] == entry_id
         assert conn.execute(
             "SELECT entry_id FROM review_history WHERE entry_id=?",
-            ("fact_tone",),
+            (entry_id,),
         ).fetchone() is not None
         other = conn.execute(
             "SELECT conflict_with FROM entries WHERE id='preference_other'"
         ).fetchone()
-        assert json.loads(other["conflict_with"]) == ["fact_tone"]
+        assert json.loads(other["conflict_with"]) == [entry_id]
         pending = conn.execute(
             "SELECT conflicting_ids FROM pending_clarifications WHERE user_source='webchat' AND user_id='u1'"
         ).fetchone()
-        assert json.loads(pending["conflicting_ids"]) == ["fact_tone"]
-        new_vec = vec_key("webchat", "u1", "fact", "tone")
+        assert json.loads(pending["conflicting_ids"]) == [entry_id]
         assert conn.execute(
-            "SELECT 1 FROM embeddings WHERE entry_id=?", (new_vec,)
+            "SELECT 1 FROM embeddings WHERE entry_id=?", (entry_id,)
         ).fetchone() is not None
-        assert conn.execute(
-            "SELECT 1 FROM embeddings WHERE entry_id=?",
-            (vec_key("webchat", "u1", "preference", "style"),),
-        ).fetchone() is None
         audit = conn.execute(
             "SELECT actor, action, target FROM admin_audit ORDER BY id DESC LIMIT 1"
         ).fetchone()
@@ -199,7 +193,7 @@ def test_edit_stale_version_and_body_invalidates_vector(tmp_path):
     with closing(get_conn(db_path)) as conn:
         init_schema(conn, 4)
         entry_id = _insert_entry(conn, topic="style")
-        old_vec = vec_key("webchat", "u1", "preference", "style")
+        old_vec = entry_id
         conn.execute(
             "INSERT INTO embeddings (entry_id,user_source,user_id,embedding) VALUES (?,?,?,?)",
             (old_vec, "webchat", "u1", json.dumps([0.1, 0.2, 0.3, 0.4])),
@@ -235,7 +229,7 @@ def test_edit_body_reembeds_vector_with_new_text(tmp_path):
         tmp_path, embedder=FakeEmbedder(), embedding_enabled=True)
     with closing(get_conn(db_path)) as conn:
         entry_id = _insert_entry(conn, topic="style")
-        old_vec = vec_key("webchat", "u1", "preference", "style")
+        old_vec = entry_id
         conn.execute(
             "INSERT INTO embeddings (entry_id,user_source,user_id,embedding) VALUES (?,?,?,?)",
             (old_vec, "webchat", "u1", json.dumps([0.9, 0.9, 0.9, 0.9])),

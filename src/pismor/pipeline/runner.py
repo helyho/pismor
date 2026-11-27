@@ -24,16 +24,16 @@ from pismor.serving import assembler
 from pismor.core import fts
 from pismor.core.config import Settings
 from pismor.llm.embedder import Embedder
-from pismor.core.keys import entry_key
+from pismor.core.keys import display_key, new_id
 from pismor.llm.client import LLMClient
 from pismor.core.schemas import canonical_hash
 from pismor.core.taxonomy import load_taxonomy
 
 logger = logging.getLogger("mem.pipeline")
 
-_PENDING_COLS = ("user_source,user_id,dimension,topic,id,confidence,status,body,summary,"
-                 "created_at,updated_at,last_reinforced_at,degraded_reason,superseded_by,"
-                 "topic_new,conflict_with,reinforcements,archived_at")
+_PENDING_COLS = ("user_source,user_id,dimension,topic,id,variant,variant_seq,confidence,"
+                 "status,body,summary,created_at,updated_at,last_reinforced_at,degraded_reason,"
+                 "superseded_by,topic_new,conflict_with,reinforcements,archived_at")
 
 
 def run_pipeline(conn, settings: Settings, event: dict, *, taxonomy=None, llm=None,
@@ -77,10 +77,13 @@ def _run(conn, settings: Settings, event, taxonomy, llm, embedder) -> None:
     ev = normalize(event)
     origin_type = ev.event_type
     origin_ref = event.get("origin_ref") or event.get("event_id") or canonical_hash(event)
-    known_ids = [r["id"] for r in conn.execute(
-        "SELECT DISTINCT id FROM entries WHERE user_source=? AND user_id=?"
-        " AND status IN ('active','degraded') LIMIT ?",
-        (us, uid, settings.pipeline.known_ids_limit)).fetchall()]
+    known_ids = [display_key(r["dimension"], r["topic"], r["variant"], r["variant_seq"])
+                 for r in conn.execute(
+                     "SELECT DISTINCT dimension, topic, variant, variant_seq FROM entries"
+                     " WHERE user_source=? AND user_id=?"
+                     " AND status IN ('active','degraded')"
+                     " AND variant IN ('normal','conflict') LIMIT ?",
+                     (us, uid, settings.pipeline.known_ids_limit)).fetchall()]
 
     if ev.is_dialogue:
         # 澄清回流仅作用于 dialogue（spec §10/§11），先于触发分级
@@ -122,7 +125,7 @@ def _gate_kwargs(settings: Settings) -> dict:
 
 
 def _reinforce(conn, us, uid, text, now, *, top_k: int = 20) -> int:
-    """无变化轮次强化：话题 BM25 top-k 条目 +1，刷新 last_reinforced_at（M-7）。
+    """无变化轮次强化：话题 BM25 top-k 规范条目 +1，刷新 last_reinforced_at（M-7）。
 
     词面命中由 mem_fts MATCH（显式 OR，任一 token 命中即候选）召回，按 BM25
     相关度排序截断——替代旧 LIKE OR 的表扫描+无序截断：高频通用词被 IDF 降权，
@@ -133,9 +136,10 @@ def _reinforce(conn, us, uid, text, now, *, top_k: int = 20) -> int:
     if not toks:
         return 0
     rows = conn.execute(
-        "SELECT e.dimension, e.topic FROM entries e JOIN mem_fts f"
+        "SELECT e.id FROM entries e JOIN mem_fts f"
         " ON f.rowid = e.rowid WHERE mem_fts MATCH ?"
         " AND e.user_source=? AND e.user_id=? AND e.status IN ('active','degraded')"
+        " AND e.variant='normal'"
         " ORDER BY bm25(mem_fts) LIMIT ?",
         [fts.match_expr(toks), us, uid, top_k]).fetchall()
     if not rows:
@@ -144,23 +148,21 @@ def _reinforce(conn, us, uid, text, now, *, top_k: int = 20) -> int:
         for r in rows:
             conn.execute(
                 "UPDATE entries SET reinforcements=reinforcements+1, last_reinforced_at=?"
-                " WHERE user_source=? AND user_id=? AND dimension=? AND topic=?",
-                (now, us, uid, r["dimension"], r["topic"]))
+                " WHERE id=?", (now, r["id"]))
     return len(rows)
 
 
 def _clarify_pair_rows(conn, us, uid, conflicting_ids) -> list:
-    """解析 pending 的矛盾对为存活行（标记即 entries.id 裸行键）。"""
+    """解析 pending 的矛盾对为存活行（标记即 entries.id）。"""
     rows, seen = [], set()
     for value in conflicting_ids:
-        # 行键即完整标记 {dim}_{topic}；标记直接按 entries.id 匹配
+        # 标记直接按 entries.id 匹配
         found = conn.execute(
             "SELECT * FROM entries WHERE user_source=? AND user_id=? AND id=?"
             " AND status IN ('active','degraded')", (us, uid, str(value))).fetchall()
         for r in found:
-            key = (r["dimension"], r["topic"])
-            if key not in seen:
-                seen.add(key)
+            if r["id"] not in seen:
+                seen.add(r["id"])
                 rows.append(r)
     # 扩展对端：行上的 conflict_with 标记（精确解析）指向的存活行
     for r in list(rows):
@@ -172,11 +174,9 @@ def _clarify_pair_rows(conn, us, uid, conflicting_ids) -> list:
             other = conn.execute(
                 "SELECT * FROM entries WHERE user_source=? AND user_id=? AND id=?"
                 " AND status IN ('active','degraded')", (us, uid, str(m))).fetchone()
-            if other is not None:
-                key = (other["dimension"], other["topic"])
-                if key not in seen:
-                    seen.add(key)
-                    rows.append(other)
+            if other is not None and other["id"] not in seen:
+                seen.add(other["id"])
+                rows.append(other)
     return rows
 
 
@@ -195,7 +195,8 @@ def _apply_clarification(conn, us, uid, hit, taxonomy, llm, embedder,
     for c in candidates:
         existing = conn.execute(
             "SELECT status FROM entries WHERE user_source=? AND user_id=? AND dimension=?"
-            " AND topic=?", (us, uid, c["dimension"], c["topic"])).fetchone()
+            " AND topic=? AND variant='normal'",
+            (us, uid, c["dimension"], c["topic"])).fetchone()
         if existing is None:
             actions.append({"op": "ADD", "candidate": c})
         elif existing["status"] in ("active", "degraded", "pending_review"):
@@ -215,36 +216,34 @@ def _apply_clarification(conn, us, uid, hit, taxonomy, llm, embedder,
 
 
 def _settle_pair(conn, us, uid, pair_rows, applied_keys, now) -> None:
-    """矛盾对收敛：+ 变形行归档；未被回答覆盖的规范行单侧降级；清残留互标。"""
+    """矛盾对收敛：败方归档（保留指针）；胜出方清标记保持 active；未覆盖规范行单侧降级。"""
     with conn:
         for old in pair_rows:
             row = conn.execute(
-                "SELECT id, dimension, topic, status FROM entries"
-                " WHERE user_source=? AND user_id=? AND dimension=? AND topic=?",
-                (us, uid, old["dimension"], old["topic"])).fetchone()
+                "SELECT id, dimension, topic, variant, status, degraded_reason FROM entries"
+                " WHERE user_source=? AND user_id=? AND id=?",
+                (us, uid, old["id"])).fetchone()
             if row is None:
                 continue
             key = (row["dimension"], row["topic"])
-            if row["topic"].startswith("+"):
-                # 冲突对方（+ 变形行）不再是活跃记忆条目：归档为轨迹（不物理删除）
+            if (row["variant"] == "conflict" and row["status"] in ("active", "degraded")
+                    and not (row["dimension"] == "taboo" and row["status"] == "active")):
+                # 冲突副本：裁决后归档（保留 conflict_with 供审计）；taboo 胜出方保留
                 conn.execute(
-                    "UPDATE entries SET status='archived', archived_at=?, conflict_with=NULL,"
-                    " degraded_reason=NULL, updated_at=? WHERE user_source=? AND user_id=?"
-                    " AND dimension=? AND topic=? AND status IN ('active','degraded')",
-                    (now, now, us, uid, *key))
-            elif row["dimension"] != "taboo" and key not in applied_keys:
+                    "UPDATE entries SET status='archived', archived_at=?, updated_at=?"
+                    " WHERE id=?", (now, now, row["id"]))
+            elif (row["variant"] == "normal" and row["status"] == "active"
+                  and row["dimension"] != "taboo" and key not in applied_keys):
                 # 单侧降级：回答揭示该条目不再成立；taboo 恒胜，不因澄清被降级
                 conn.execute(
                     "UPDATE entries SET conflict_with=NULL, updated_at=?,"
                     " status='degraded', degraded_reason='conflict_lost'"
-                    " WHERE user_source=? AND user_id=? AND dimension=? AND topic=?"
-                    " AND status='active'",
-                    (now, us, uid, *key))
-            # 其余（被回答覆盖/已降级/taboo 侧）只清残留互标
-            conn.execute(
-                "UPDATE entries SET conflict_with=NULL, updated_at=? WHERE user_source=?"
-                " AND user_id=? AND dimension=? AND topic=?"
-                " AND conflict_with IS NOT NULL", (now, us, uid, *key))
+                    " WHERE id=?", (now, row["id"]))
+            else:
+                # 胜出方/被回答覆盖/taboo 侧：清残留互标，保持 active
+                conn.execute(
+                    "UPDATE entries SET conflict_with=NULL, updated_at=?"
+                    " WHERE id=? AND conflict_with IS NOT NULL", (now, row["id"]))
             writer.resolve_conflicts(conn, us, uid, row["id"], now,
                                      revive=True, clear_pending=False)
 
@@ -261,13 +260,14 @@ def _write_pending(conn, us, uid, candidates, origin_type, origin_ref, now) -> i
             continue  # 硬约束（spec §5）：无 quote 不落库
         try:
             with conn:
-                entry_id = entry_key(c["dimension"], c["topic"])
+                entry_id = new_id()
                 conn.execute(
                     f"INSERT INTO entries ({_PENDING_COLS})"
-                    " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (us, uid, c["dimension"], c["topic"], entry_id,
-                     c["confidence"], "pending_review", c["body"], c["summary"] or "",
-                     now, now, now, None, None, c.get("topic_new"), None, 0, None))
+                     "normal", 0, c["confidence"], "pending_review", c["body"],
+                     c["summary"] or "", now, now, now, None, None,
+                     c.get("topic_new"), None, 0, None))
                 conn.execute(
                     "INSERT INTO sources (entry_id,user_source,user_id,origin_type,origin_ref,"
                     " quote,kind) VALUES (?,?,?,?,?,?,?)",

@@ -5,7 +5,6 @@
 """
 from datetime import datetime, timezone
 
-from pismor.core.keys import entry_key, vec_key
 from pismor.pipeline import writer
 
 
@@ -46,7 +45,7 @@ def apply_review_decision(
     """
     row = conn.execute(
         "SELECT * FROM entries WHERE user_source=? AND user_id=? AND id=?"
-        " AND updated_at=? AND topic NOT LIKE '~%'"
+        " AND updated_at=? AND variant<>'trace'"
         " AND status IN ('pending_review','active','degraded')",
         (user_source, user_id, entry_id, entry_version)).fetchone()
     if row is None:
@@ -63,10 +62,7 @@ def apply_review_decision(
         if cur.rowcount == 0:
             return {"noop": True}
         writer.sync_entry_vector(
-            conn,
-            user_source=user_source, user_id=user_id,
-            old_dimension=row["dimension"], old_topic=row["topic"],
-            new_dimension=row["dimension"], new_topic=row["topic"],
+            conn, user_source=user_source, user_id=user_id, entry_id=row["id"],
             old_body=row["body"], new_body=body if body is not None else row["body"],
             vector=vector, vector_requested=vector_requested,
         )
@@ -90,8 +86,7 @@ def apply_review_decision(
         if conn.execute(
                 "SELECT 1 FROM sqlite_master WHERE type='table' AND name='embeddings'"
         ).fetchone():
-            conn.execute("DELETE FROM embeddings WHERE entry_id=?", (vec_key(
-                user_source, user_id, row["dimension"], row["topic"]),))
+            conn.execute("DELETE FROM embeddings WHERE entry_id=?", (row["id"],))
     else:
         # orphan 候选 confirm → 观察区（spec §8.2 启用链入口），其余 → active
         new_status = "orphan_topic" if row["dimension"] == "orphan" else "active"
@@ -103,8 +98,7 @@ def apply_review_decision(
                 return {"noop": False, "invalid_topic": True}
             existing = conn.execute(
                 "SELECT id FROM entries WHERE user_source=? AND user_id=?"
-                " AND dimension=? AND topic=? AND id<>?"
-                " AND topic NOT LIKE '~%' AND topic NOT LIKE '!%'"
+                " AND dimension=? AND topic=? AND variant='normal' AND id<>?"
                 " AND status IN ('active','degraded','pending_review')",
                 (user_source, user_id, row["dimension"], topic, row["id"])).fetchone()
             if existing is not None:
@@ -123,27 +117,20 @@ def apply_review_decision(
                 if pending is not None:
                     result["_pending_alias"] = pending
                 return result
-            new_id = entry_key(row["dimension"], topic)
+            # 改键：id 稳定，同 topic 的全部 variant 级联到新 topic
             cur = conn.execute(
-                "UPDATE entries SET status=?, topic=?, id=?, degraded_reason=NULL,"
+                "UPDATE entries SET status=?, topic=?, degraded_reason=NULL,"
                 " conflict_with=NULL, updated_at=?"
-                " WHERE user_source=? AND user_id=? AND dimension=?"
-                " AND topic=? AND updated_at=?",
-                (new_status, topic, new_id, now, user_source, user_id,
-                 row["dimension"], row["topic"], entry_version))
+                " WHERE user_source=? AND user_id=? AND id=? AND updated_at=?",
+                (new_status, topic, now, user_source, user_id, row["id"],
+                 entry_version))
             if cur.rowcount == 0:
                 return {"noop": True}
             conn.execute(
-                "UPDATE sources SET entry_id=? WHERE user_source=? AND user_id=?"
-                " AND entry_id=?",
-                (new_id, user_source, user_id, row["id"]))
-            writer.sync_entry_vector(
-                conn,
-                user_source=user_source, user_id=user_id,
-                old_dimension=row["dimension"], old_topic=row["topic"],
-                new_dimension=row["dimension"], new_topic=topic,
-                old_body=row["body"], new_body=row["body"],
-            )
+                "UPDATE entries SET topic=?, updated_at=?"
+                " WHERE user_source=? AND user_id=? AND dimension=? AND topic=? AND id<>?",
+                (topic, now, user_source, user_id, row["dimension"],
+                 row["topic"], row["id"]))
             writer.resolve_conflicts(conn, user_source, user_id, entry_id, now,
                                      revive=True, clear_pending=True)
             conn.execute(
@@ -156,25 +143,28 @@ def apply_review_decision(
             if pending is not None:
                 result["_pending_alias"] = pending
             return result
-        new_topic, new_id = row["topic"], row["id"]
+        snapshot = row["variant"] == "snapshot"
         fix_body = body if decision == "fix" else None
         fix_summary = summary if decision == "fix" else None
-        if row["topic"].startswith("!"):
-            # 待复核快照 confirm：规范键已被新证据占用 → 快照归档（不复活旧猜测）
-            canonical = row["topic"][1:]
+        if snapshot:
+            # 待复核快照 confirm：规范槽已被新证据占用 → 快照归档（不复活旧猜测）
             occupied = conn.execute(
                 "SELECT 1 FROM entries WHERE user_source=? AND user_id=?"
-                " AND dimension=? AND topic=? AND id<>?",
-                (user_source, user_id, row["dimension"], canonical,
+                " AND dimension=? AND topic=? AND variant='normal' AND id<>?",
+                (user_source, user_id, row["dimension"], row["topic"],
                  row["id"])).fetchone()
             if occupied:
+                trace_seq = conn.execute(
+                    "SELECT COALESCE(MAX(variant_seq),0)+1 FROM entries"
+                    " WHERE user_source=? AND user_id=? AND dimension=? AND topic=?"
+                    " AND variant='trace'",
+                    (user_source, user_id, row["dimension"], row["topic"])).fetchone()[0]
                 cur = conn.execute(
-                    "UPDATE entries SET status='archived', archived_at=?,"
-                    " conflict_with=NULL, degraded_reason=NULL, updated_at=?"
-                    " WHERE user_source=? AND user_id=? AND dimension=?"
-                    " AND topic=? AND updated_at=?",
-                    (now, now, user_source, user_id, row["dimension"],
-                     row["topic"], entry_version))
+                    "UPDATE entries SET variant='trace', variant_seq=?, status='archived',"
+                    " archived_at=?, conflict_with=NULL, degraded_reason='superseded',"
+                    " updated_at=?"
+                    " WHERE user_source=? AND user_id=? AND id=? AND updated_at=?",
+                    (trace_seq, now, now, user_source, user_id, row["id"], entry_version))
                 if cur.rowcount == 0:
                     return {"noop": True}
                 conn.execute(
@@ -184,34 +174,24 @@ def apply_review_decision(
                     (entry_id, user_source, user_id, decision, actor, now,
                      note or "superseded_by_evolution", entry_version))
                 return {"noop": False, "updated": 1}
-            new_topic, new_id = canonical, entry_key(
-                row["dimension"], canonical)
+        sets = ["status=?", "body=COALESCE(?, body)", "summary=COALESCE(?, summary)",
+                "degraded_reason=NULL", "conflict_with=NULL", "updated_at=?"]
+        args = [new_status, fix_body, fix_summary, now]
+        if snapshot:
+            # 同一条 UPDATE 同时改 variant/seq/status，满足表级 CHECK
+            sets += ["variant='normal'", "variant_seq=0"]
         cur = conn.execute(
-            "UPDATE entries SET status=?, topic=?, id=?,"
-            " body=COALESCE(?, body), summary=COALESCE(?, summary),"
-            " degraded_reason=NULL, conflict_with=NULL, updated_at=?"
-            " WHERE user_source=? AND user_id=? AND dimension=?"
-            " AND topic=? AND updated_at=?",
-            (new_status, new_topic, new_id, fix_body, fix_summary, now,
-             user_source, user_id, row["dimension"], row["topic"],
-             entry_version))
+            "UPDATE entries SET {} WHERE user_source=? AND user_id=? AND id=?"
+            " AND updated_at=?".format(", ".join(sets)),
+            (*args, user_source, user_id, row["id"], entry_version))
         if cur.rowcount == 0:  # 并发：先到者已改版本 → 本判定作废
             return {"noop": True}
-        if new_id != row["id"]:  # 快照转正：证据链键跟随
-            conn.execute(
-                "UPDATE sources SET entry_id=? WHERE user_source=? AND user_id=?"
-                " AND entry_id=?",
-                (new_id, user_source, user_id, row["id"]))
         writer.sync_entry_vector(
-            conn,
-            user_source=user_source, user_id=user_id,
-            old_dimension=row["dimension"], old_topic=row["topic"],
-            new_dimension=row["dimension"], new_topic=new_topic,
+            conn, user_source=user_source, user_id=user_id, entry_id=row["id"],
             old_body=row["body"],
             new_body=fix_body if fix_body is not None else row["body"],
             vector=vector, vector_requested=vector_requested,
         )
-        # 矛盾收尾（C-1）：按条目 id 清对方行标记、conflict_lost 恢复 active
         writer.resolve_conflicts(conn, user_source, user_id,
                                  entry_id, now,
                                  revive=True, clear_pending=True)

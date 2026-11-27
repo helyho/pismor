@@ -132,10 +132,10 @@ t18_clarify() {
   done
   [[ "$n" == "0" ]] || { case_fail "回答后 pending 未消费（120s）"; }
 
-  # 6) 收敛：规范行生效、+ 变形行归档、互标清除、装配不再提问
-  expect_db "SELECT status FROM entries WHERE user_source='bb' AND user_id='$uid' AND id='preference_verbosity'" "active" || return 1
-  expect_db "SELECT status FROM entries WHERE user_source='bb' AND user_id='$uid' AND id='preference_+verbosity'" "archived" || return 1
-  expect_db "SELECT count(*) FROM entries WHERE user_source='bb' AND user_id='$uid' AND id IN ('preference_verbosity','preference_+verbosity') AND conflict_with IS NOT NULL" "0" || return 1
+  # 6) 收敛：规范行生效、conflict 变体归档、互标清除、装配不再提问
+  expect_db "SELECT status FROM entries WHERE user_source='bb' AND user_id='$uid' AND topic='verbosity' AND variant='normal'" "active" || return 1
+  expect_db "SELECT status FROM entries WHERE user_source='bb' AND user_id='$uid' AND topic='verbosity' AND variant='conflict'" "archived" || return 1
+  expect_db "SELECT count(*) FROM entries WHERE user_source='bb' AND user_id='$uid' AND topic='verbosity' AND variant IN ('normal','conflict') AND conflict_with IS NOT NULL" "0" || return 1
   http GET "/memory/bb/$uid"
   expect_status 200 || return 1
   expect_json '.clarification_needed | length' '0' || return 1

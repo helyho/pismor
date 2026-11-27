@@ -10,7 +10,6 @@ from fastapi.testclient import TestClient
 from pismor.admin.deps import Principal
 from pismor.core.config import EmbeddingSettings, LLMSettings, Settings
 from pismor.core.db import get_conn, init_schema
-from pismor.core.keys import vec_key
 from pismor.core.taxonomy import load_taxonomy
 from pismor.serving.api import create_app
 
@@ -63,16 +62,20 @@ def _insert_entry(
     summary="summary",
     body="body",
     updated_at=VERSION,
+    variant="normal",
+    variant_seq=0,
 ):
-    entry_id = f"{dimension}_{topic}"
+    entry_id = (f"{dimension}_{topic}" if variant == "normal"
+                else f"{dimension}_{topic}_{variant}")
     conn.execute(
         "INSERT INTO entries (user_source,user_id,dimension,topic,id,confidence,"
         "status,body,summary,created_at,updated_at,last_reinforced_at,degraded_reason,"
-        "superseded_by,topic_new,conflict_with,reinforcements,archived_at)"
-        " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        "superseded_by,topic_new,conflict_with,reinforcements,archived_at,"
+        "variant,variant_seq)"
+        " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (user_source, user_id, dimension, topic, entry_id, 0.9, status,
          body, summary, updated_at, updated_at, updated_at, None, None, None,
-         conflict_with, 0, None),
+         conflict_with, 0, None, variant, variant_seq),
     )
     conn.commit()
     return entry_id
@@ -85,9 +88,10 @@ def test_queue_filters_and_pagination(tmp_path):
                       updated_at="2026-01-01T00:00:00+00:00")
         _insert_entry(conn, topic="b", dimension="fact", user_id="u2", summary="beta",
                       updated_at="2026-01-02T00:00:00+00:00")
-        _insert_entry(conn, topic="+conflict", dimension="preference", status="active",
+        _insert_entry(conn, topic="conflict", dimension="preference", status="active",
                       summary="conflict summary", conflict_with='["preference_a"]',
-                      updated_at="2026-01-03T00:00:00+00:00")
+                      updated_at="2026-01-03T00:00:00+00:00",
+                      variant="conflict", variant_seq=1)
         _insert_entry(conn, topic="old", dimension="fact", status="archived",
                       summary="archived", updated_at="2026-01-04T00:00:00+00:00")
 
@@ -104,7 +108,7 @@ def test_queue_filters_and_pagination(tmp_path):
 
     res = client.get("/admin/api/review/queue", params={"q": "conflict"})
     assert res.json()["total"] == 1
-    assert res.json()["items"][0]["topic"] == "+conflict"
+    assert res.json()["items"][0]["topic"] == "conflict"
 
     res = client.get("/admin/api/review/queue", params={"user_id": "u2"})
     assert res.json()["total"] == 1
@@ -264,7 +268,7 @@ def test_confirm_rekeys_free_topic_to_whitelist(tmp_path):
     with closing(get_conn(db_path)) as conn:
         row = conn.execute("SELECT topic,id,status FROM entries").fetchone()
         assert row["topic"] == "output_format"
-        assert row["id"] == "taboo_output_format"
+        assert row["id"] == eid
         assert row["status"] == "active"
         assert conn.execute("SELECT entry_id FROM sources").fetchone()["entry_id"] == row["id"]
 
@@ -325,7 +329,7 @@ def test_fix_body_reembeds_vector(tmp_path):
         tmp_path, embedder=FakeEmbedder(), embedding_enabled=True)
     with closing(get_conn(db_path)) as conn:
         entry_id = _insert_entry(conn, topic="style")
-        key = vec_key("webchat", "u1", "preference", "style")
+        key = entry_id
         conn.execute(
             "INSERT INTO embeddings (entry_id,user_source,user_id,embedding) VALUES (?,?,?,?)",
             (key, "webchat", "u1", json.dumps([0.9, 0.9, 0.9, 0.9])),
@@ -354,7 +358,7 @@ def test_fix_body_drops_vector_without_embedder(tmp_path):
     with closing(get_conn(db_path)) as conn:
         init_schema(conn, 4)
         entry_id = _insert_entry(conn, topic="style")
-        key = vec_key("webchat", "u1", "preference", "style")
+        key = entry_id
         conn.execute(
             "INSERT INTO embeddings (entry_id,user_source,user_id,embedding) VALUES (?,?,?,?)",
             (key, "webchat", "u1", json.dumps([0.9, 0.9, 0.9, 0.9])),
@@ -372,27 +376,22 @@ def test_fix_body_drops_vector_without_embedder(tmp_path):
         ).fetchone() is None
 
 
-def test_confirm_rekey_moves_vector(tmp_path):
+def test_confirm_rekey_keeps_vector(tmp_path):
     app, client, db_path = _make_app(tmp_path)
     with closing(get_conn(db_path)) as conn:
         init_schema(conn, 4)
         eid = _insert_entry(conn, dimension="taboo", topic="不要表格", body="不要用表格")
-        old_key = vec_key("webchat", "u1", "taboo", "不要表格")
         conn.execute(
             "INSERT INTO embeddings (entry_id,user_source,user_id,embedding) VALUES (?,?,?,?)",
-            (old_key, "webchat", "u1", json.dumps([0.1, 0.2, 0.3, 0.4])),
+            (eid, "webchat", "u1", json.dumps([0.1, 0.2, 0.3, 0.4])),
         )
         conn.commit()
     res = _decide(client, eid, "output_format")
     assert res.status_code == 200, res.text
     assert res.json()["rekeyed_to"] == "output_format"
-    new_key = vec_key("webchat", "u1", "taboo", "output_format")
     with closing(get_conn(db_path)) as conn:
         assert conn.execute(
-            "SELECT 1 FROM embeddings WHERE entry_id=?", (old_key,)
-        ).fetchone() is None
-        assert conn.execute(
-            "SELECT 1 FROM embeddings WHERE entry_id=?", (new_key,)
+            "SELECT 1 FROM embeddings WHERE entry_id=?", (eid,)
         ).fetchone() is not None
 
 

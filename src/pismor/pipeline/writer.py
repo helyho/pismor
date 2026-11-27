@@ -7,7 +7,7 @@
 - CONFLICT 同 key 双存受主键唯一约束：新行 topic 加 "+" 前缀变形落库；
   对方是 taboo 时 taboo 恒胜（spec §11）：taboo 行只补 conflict_with（§13 装配
   "taboo 出全句、对方曾观察"依赖双向标记），不降置信不降状态；preference 侧直接 degraded。
-- 行键统一为 keys.entry_key（{dim}_{topic}）：entries.id = sources.entry_id；
+- 行键为稳定 id（keys.new_id）：entries.id = sources.entry_id；topic/variant 仅业务字段；
   旧裸 id 由 init_schema 迁移，跨行关联标记同形。
 - pending_review 不阻塞演进：同 key 新证据先把待复核行移入 "!" 快照（仍在复核队列），
   再写入规范 active 行（spec §10/§14，I-2）。
@@ -25,7 +25,10 @@ import math
 import sqlite3
 
 from pismor.llm.embedder import EmbedUnavailable, l2_normalize
-from pismor.core.keys import entry_key, vec_key
+from pismor.core.keys import (
+    VARIANT_CONFLICT, VARIANT_NORMAL, VARIANT_SNAPSHOT, VARIANT_TRACE,
+    new_id,
+)
 
 logger = logging.getLogger("mem.writer")
 
@@ -37,9 +40,10 @@ _LEGAL_TRANSITIONS = {
     ("orphan_topic", "active"), ("orphan_topic", "deleted"),
 }
 
-_ENTRY_COLS = ("user_source,user_id,dimension,topic,id,confidence,status,body,summary,"
-               "created_at,updated_at,last_reinforced_at,degraded_reason,superseded_by,"
-               "topic_new,conflict_with,reinforcements,archived_at")
+_ENTRY_COLS = ("user_source,user_id,dimension,topic,id,variant,variant_seq,"
+               "confidence,status,body,summary,created_at,updated_at,last_reinforced_at,"
+               "degraded_reason,superseded_by,topic_new,conflict_with,reinforcements,"
+               "archived_at")
 
 # 会写入向量行的 op（与 _add/_update/_conflict 的 append 点一一对应）
 _VECTOR_OPS = ("ADD", "UPDATE", "CONFLICT")
@@ -135,20 +139,22 @@ def _apply_one(conn, us, uid, action, origin_type, origin_ref, now, vectors,
 
 
 def _fetch_row(conn, us, uid, key):
+    """按 (dimension,topic) 取规范行；variant 行只能按 id 访问。"""
     d, t = key
     return conn.execute(
-        "SELECT * FROM entries WHERE user_source=? AND user_id=? AND dimension=? AND topic=?",
-        (us, uid, d, t)).fetchone()
+        "SELECT * FROM entries WHERE user_source=? AND user_id=? AND dimension=? AND topic=?"
+        " AND variant=?",
+        (us, uid, d, t, VARIANT_NORMAL)).fetchone()
 
 
 def _find_taboo(conn, us, uid, c):
-    """同 (user, topic) 的存活 taboo 条目；taboo 候选自身不构成互斥。"""
+    """同 (user, topic) 的存活 taboo 规范行；taboo 候选自身不构成互斥。"""
     if c["dimension"] == "taboo":
         return None
     return conn.execute(
         "SELECT * FROM entries WHERE user_source=? AND user_id=?"
-        " AND dimension='taboo' AND topic=? AND status IN ('active','degraded')",
-        (us, uid, c["topic"])).fetchone()
+        " AND dimension='taboo' AND topic=? AND variant=? AND status IN ('active','degraded')",
+        (us, uid, c["topic"], VARIANT_NORMAL)).fetchone()
 
 
 def _add(conn, us, uid, c, now, origin_type, origin_ref, vectors) -> bool:
@@ -166,7 +172,7 @@ def _add(conn, us, uid, c, now, origin_type, origin_ref, vectors) -> bool:
                              origin_ref=origin_ref, confidence=confidence,
                              degraded_reason=reason, conflict_with=conflict_ids)
     if entry_id:
-        vectors.append((vec_key(us, uid, c["dimension"], c["topic"]), c["body"]))
+        vectors.append((entry_id, c["body"]))
         if taboo:
             _append_conflict_mark(conn, taboo, entry_id)
     return bool(entry_id)
@@ -188,7 +194,7 @@ def _update(conn, us, uid, c, target, now, origin_type, origin_ref, vectors,
         entry_id = _insert_entry(conn, us, uid, c, status="active", now=now,
                                  origin_type=origin_type, origin_ref=origin_ref)
         if entry_id:
-            vectors.append((vec_key(us, uid, d, t), c["body"]))
+            vectors.append((entry_id, c["body"]))
         return bool(entry_id)
     _check_transition(old["status"], "archived")  # 旧行归档轨迹；archived 再 UPDATE 拒绝
     new_confidence = float(c.get("confidence") or 0.0)
@@ -201,74 +207,67 @@ def _update(conn, us, uid, c, target, now, origin_type, origin_ref, vectors,
             conn.execute(
                 "INSERT INTO review_history (entry_id,user_source,user_id,decision,actor,"
                 "ts,note,entry_version) VALUES (?,?,?,'revive_rejected','pipeline',?,?,?)",
-                (entry_key(d, t), us, uid, now,
+                (old["id"], us, uid, now,
                  f"confidence={conf:.2f} < {revive_min_confidence}", old["updated_at"]))
             return _noop(conn, us, uid, target, now)
         _check_transition("degraded", "active")  # 新证据演进恢复 active（spec §6）
         # F7: 复活恢复置信——降级无历史快照可考，取 max(降级残值, 新证据)，
         # 避免 0.8ⁿ 循环衰减使复活条目永远排不进装配预算
         new_confidence = max(float(old["confidence"] or 0.0), new_confidence)
-    sup_topic, sup_id = _superseded_identity(conn, us, uid, d, t, now)
-    # 轨迹行：旧行完整内容原样存档，topic 加 "~" 前缀避开主键；
-    # 同 key 多次 UPDATE → 时间戳+序号去重（同轮同 now 也唯一）
+    trace_seq = _superseded_identity(conn, us, uid, d, t, now)
+    trace_id = new_id()
+    # 轨迹行：旧行完整内容原样存档，variant='trace' + seq 与规范行共存；
+    # sources 仍指向规范行 id，轨迹行只做历史快照。
     conn.execute(
         f"INSERT INTO entries ({_ENTRY_COLS}) "
-        "SELECT user_source,user_id,dimension,?,?,confidence,'archived',body,summary,"
+        "SELECT user_source,user_id,dimension,topic,?,?,?,confidence,'archived',body,summary,"
         "created_at,?,last_reinforced_at,'superseded',?,topic_new,conflict_with,reinforcements,? "
-        "FROM entries WHERE user_source=? AND user_id=? AND dimension=? AND topic=?",
-        (sup_topic, sup_id, now, entry_key(d, t), now, us, uid, d, t))
+        "FROM entries WHERE user_source=? AND user_id=? AND dimension=? AND topic=?"
+        " AND variant=?",
+        (trace_id, VARIANT_TRACE, trace_seq, now, old["id"], now,
+         us, uid, d, t, VARIANT_NORMAL))
     # 旧行证据链转移给轨迹行（spec §12：archived 条目保留全部字段与证据链）。
-    # sources.entry_id 存行唯一键 entries.id（即 entry_key 结果）
     conn.execute(
         "UPDATE sources SET entry_id=? WHERE user_source=? AND user_id=? AND entry_id=?",
-        (sup_id, us, uid, entry_key(d, t)))
-    # 原行同 key 覆盖新值；旧行带冲突标记 → 本行 conflict_with 归空（spec §11 闭环）
+        (trace_id, us, uid, old["id"]))
+    # 规范行原地覆盖新值；id/topic/variant 不变，引用无需迁移
     conn.execute(
         "UPDATE entries SET body=?,summary=?,confidence=?,status='active',degraded_reason=NULL,"
         "superseded_by=NULL,topic_new=NULL,conflict_with=NULL,updated_at=?,last_reinforced_at=? "
-        "WHERE user_source=? AND user_id=? AND dimension=? AND topic=?",
-        (c["body"], c["summary"], new_confidence, now, now, us, uid, d, t))
+        "WHERE user_source=? AND user_id=? AND id=? AND variant=?",
+        (c["body"], c["summary"], new_confidence, now, now, us, uid, old["id"],
+         VARIANT_NORMAL))
     if old["conflict_with"]:
         # M-1：普通演进只清标记，不复活矛盾对方；仅澄清（kind=clarification）可复活。
         # 澄清路径的 pending 删除延后到管线写入成功后（I-17）。
         is_clarification = c.get("kind") == "clarification"
-        resolve_conflicts(conn, us, uid, entry_key(d, t), now,
+        resolve_conflicts(conn, us, uid, old["id"], now,
                           revive=is_clarification, clear_pending=not is_clarification)
     conn.execute(
         "INSERT INTO sources (entry_id,user_source,user_id,origin_type,origin_ref,quote,kind)"
         " VALUES (?,?,?,?,?,?,?)",
-        (entry_key(d, t), us, uid, origin_type, origin_ref, c["quote"],
+        (old["id"], us, uid, origin_type, origin_ref, c["quote"],
          c.get("kind") or "explicit"))
-    vectors.append((vec_key(us, uid, d, t), c["body"]))
+    vectors.append((old["id"], c["body"]))
     return True
 
 
 def _release_pending(conn, us, uid, old, now):
-    """把 pending_review 行改成 "!" 快照（仍在复核队列），腾出规范键给新证据。"""
-    base = f"!{old['topic']}"
-    topic = base
-    seq = 1
-    while conn.execute(
-            "SELECT 1 FROM entries WHERE user_source=? AND user_id=? AND dimension=?"
-            " AND topic=?",
-            (us, uid, old["dimension"], topic)).fetchone():
-        seq += 1
-        topic = f"{base}:{seq}"
-    new_id = entry_key(old["dimension"], topic)
+    """把 pending_review 行改成 snapshot 变体（仍在复核队列），腾出 normal 槽位。
+
+    id 不变，sources/conflict_with 无需迁移；规范槽位由后续新行占用。
+    """
+    seq = _next_variant_seq(conn, us, uid, old["dimension"], old["topic"],
+                            VARIANT_SNAPSHOT)
     conn.execute(
-        "UPDATE entries SET topic=?, id=?, updated_at=? WHERE user_source=? AND user_id=?"
-        " AND dimension=? AND topic=?",
-        (topic, new_id, now, us, uid, old["dimension"], old["topic"]))
-    conn.execute(
-        "UPDATE sources SET entry_id=? WHERE user_source=? AND user_id=? AND entry_id=?",
-        (new_id, us, uid, old["id"]))
-    # 其他行 conflict_with 里指向旧行键的标记同步改写，避免悬空标记被误判为"已裁决"
-    _rekey_conflict_marks(conn, us, uid, old["id"], new_id)
+        "UPDATE entries SET variant=?, variant_seq=?, updated_at=?"
+        " WHERE id=? AND status='pending_review'",
+        (VARIANT_SNAPSHOT, seq, now, old["id"]))
 
 
 def _rekey_conflict_marks(conn, us, uid, old_id, new_id):
     rows = conn.execute(
-        "SELECT dimension, topic, conflict_with FROM entries"
+        "SELECT id, conflict_with FROM entries"
         " WHERE user_source=? AND user_id=? AND conflict_with IS NOT NULL",
         (us, uid)).fetchall()
     for row in rows:
@@ -277,10 +276,8 @@ def _rekey_conflict_marks(conn, us, uid, old_id, new_id):
             continue
         rewritten = [new_id if str(m) == old_id else m for m in marks]
         conn.execute(
-            "UPDATE entries SET conflict_with=? WHERE user_source=? AND user_id=?"
-            " AND dimension=? AND topic=?",
-            (json.dumps(rewritten, ensure_ascii=False), us, uid,
-             row["dimension"], row["topic"]))
+            "UPDATE entries SET conflict_with=? WHERE id=?",
+            (json.dumps(rewritten, ensure_ascii=False), row["id"]))
 
 
 def _load_marks(value):
@@ -301,7 +298,7 @@ def resolve_conflicts(conn, us, uid, entry_id, now, *, revive=False, clear_pendi
     须在调用方事务内执行。
     """
     rows = conn.execute(
-        "SELECT dimension, topic, status, degraded_reason, conflict_with"
+        "SELECT id, status, degraded_reason, conflict_with"
         " FROM entries WHERE user_source=? AND user_id=?"
         " AND status IN ('active','degraded') AND conflict_with IS NOT NULL",
         (us, uid)).fetchall()
@@ -323,14 +320,12 @@ def resolve_conflicts(conn, us, uid, entry_id, now, *, revive=False, clear_pendi
         if revive and o["status"] == "degraded" and o["degraded_reason"] == "conflict_lost":
             conn.execute(
                 "UPDATE entries SET conflict_with=?, status='active', degraded_reason=NULL,"
-                " updated_at=? WHERE user_source=? AND user_id=? AND dimension=?"
-                " AND topic=?",
-                (new_conflict, now, us, uid, o["dimension"], o["topic"]))
+                " updated_at=? WHERE id=?",
+                (new_conflict, now, o["id"]))
         else:
             conn.execute(
-                "UPDATE entries SET conflict_with=? WHERE user_source=? AND user_id=?"
-                " AND dimension=? AND topic=?",
-                (new_conflict, us, uid, o["dimension"], o["topic"]))
+                "UPDATE entries SET conflict_with=? WHERE id=?",
+                (new_conflict, o["id"]))
     if clear_pending:
         _clear_pending_for(conn, us, uid, entry_id)
 
@@ -350,23 +345,18 @@ def _clear_pending_for(conn, us, uid, entry_id):
                 (us, uid, row["conflicting_ids"]))
 
 
+def _next_variant_seq(conn, us, uid, d, t, variant):
+    """同 (用户,维度,主题,形态) 的下一个序号；MAX+1 避免删行后复用。"""
+    row = conn.execute(
+        "SELECT COALESCE(MAX(variant_seq), 0) + 1 FROM entries"
+        " WHERE user_source=? AND user_id=? AND dimension=? AND topic=? AND variant=?",
+        (us, uid, d, t, variant)).fetchone()
+    return int(row[0])
+
+
 def _superseded_identity(conn, us, uid, d, t, now):
-    """轨迹行 topic/id：~{topic}:{紧凑now}:{序号}，同 key 多次 UPDATE（含同轮同 now）唯一。"""
-    compact = now.replace("-", "").replace(":", "").split("+")[0]  # 2026-11-24T…+08:00 → 20261124T…
-    base = f"~{t}:{compact}:"
-    rows = conn.execute(
-        "SELECT topic FROM entries WHERE user_source=? AND user_id=? AND dimension=? AND topic LIKE ?",
-        (us, uid, d, f"{base}%")).fetchall()
-    # F8: COUNT 在轨迹行被人工归并物理删除后会复用已删序号（撞主键整批失败），
-    # 改取现存键的最大序号 +1
-    top = 0
-    for r in rows:
-        tail = r["topic"].rsplit(":", 1)[-1]
-        if tail.isdigit():
-            top = max(top, int(tail))
-    seq = top + 1
-    topic = f"{base}{seq}"
-    return topic, entry_key(d, topic)
+    """轨迹行序号：同 (dim,topic,trace) 取 MAX+1；时间由 archived_at 表达。"""
+    return _next_variant_seq(conn, us, uid, d, t, VARIANT_TRACE)
 
 
 def _conflict(conn, us, uid, c, target, now, origin_type, origin_ref, vectors) -> bool:
@@ -390,41 +380,43 @@ def _conflict(conn, us, uid, c, target, now, origin_type, origin_ref, vectors) -
     else:
         # 普通矛盾双存：双方 degraded(conflict_lost)、各降置信（对称性裁决）
         status, reason, confidence = "degraded", "conflict_lost", c["confidence"] * 0.8
-    entry_id = _insert_entry(conn, us, uid, {**c, "topic": f"+{c['topic']}"},
+    conflict_seq = _next_variant_seq(conn, us, uid, c["dimension"], c["topic"],
+                                     VARIANT_CONFLICT)
+    entry_id = _insert_entry(conn, us, uid, c,
                              status=status, now=now, origin_type=origin_type,
                              origin_ref=origin_ref, confidence=confidence,
-                             degraded_reason=reason, conflict_with=conflict_ids)
+                             degraded_reason=reason, conflict_with=conflict_ids,
+                             variant=VARIANT_CONFLICT, variant_seq=conflict_seq)
     if entry_id:
-        vectors.append((vec_key(us, uid, c["dimension"], f"+{c['topic']}"), c["body"]))
+        vectors.append((entry_id, c["body"]))
     new_mark = entry_id
     if old["dimension"] == "taboo":
         # 旧行是 taboo：只互标 conflict_with，不降置信不降状态
         conn.execute(
-            "UPDATE entries SET conflict_with=?,updated_at=? "
-            "WHERE user_source=? AND user_id=? AND dimension=? AND topic=?",
+            "UPDATE entries SET conflict_with=?,updated_at=? WHERE id=?",
             (json.dumps(_merge_conflict(old["conflict_with"], new_mark), ensure_ascii=False),
-             now, us, uid, *target))
+             now, old["id"]))
     else:
         if old["status"] != "degraded":
             _check_transition(old["status"], "degraded")  # active→degraded；已 degraded 重复落败仅刷字段
         conn.execute(
             "UPDATE entries SET conflict_with=?,confidence=confidence*0.8,status='degraded',"
-            "degraded_reason='conflict_lost',updated_at=?,last_reinforced_at=? "
-            "WHERE user_source=? AND user_id=? AND dimension=? AND topic=?",
+            "degraded_reason='conflict_lost',updated_at=?,last_reinforced_at=? WHERE id=?",
             (json.dumps(_merge_conflict(old["conflict_with"], new_mark), ensure_ascii=False),
-             now, now, us, uid, *target))
+             now, now, old["id"]))
     if taboo:
         _append_conflict_mark(conn, taboo, new_mark)
     return bool(entry_id)
 
 
 def _noop(conn, us, uid, target, now) -> bool:
-    if target is None or _fetch_row(conn, us, uid, target) is None:
+    old = _fetch_row(conn, us, uid, target) if target is not None else None
+    if old is None:
         raise IllegalTransition(f"NOOP target not found: {target}")
     conn.execute(
-        "UPDATE entries SET reinforcements=reinforcements+1, last_reinforced_at=? "
-        "WHERE user_source=? AND user_id=? AND dimension=? AND topic=?",
-        (now, us, uid, *target))
+        "UPDATE entries SET reinforcements=reinforcements+1, last_reinforced_at=?"
+        " WHERE id=?",
+        (now, old["id"]))
     return True
 
 
@@ -436,12 +428,13 @@ def _orphan(conn, us, uid, c, now, origin_type, origin_ref) -> bool:
         logger.warning("drop orphan candidate without topic_new: %s", c.get("body"))
         return False
     key = ("orphan", topic_new)
-    if _fetch_row(conn, us, uid, key) is not None:
+    old = _fetch_row(conn, us, uid, key)
+    if old is not None:
         # 同主题 orphan 复现：计数 +1（spec §8.2 启用门槛"复现≥3次/30天"依据）
         conn.execute(
-            "UPDATE entries SET reinforcements=reinforcements+1, last_reinforced_at=? "
-            "WHERE user_source=? AND user_id=? AND dimension=? AND topic=?",
-            (now, us, uid, *key))
+            "UPDATE entries SET reinforcements=reinforcements+1, last_reinforced_at=?"
+            " WHERE id=?",
+            (now, old["id"]))
         return True
     entry_id = _insert_entry(conn, us, uid, {**c, "topic": topic_new, "topic_new": topic_new},
                              status="orphan_topic", now=now,
@@ -450,17 +443,18 @@ def _orphan(conn, us, uid, c, now, origin_type, origin_ref) -> bool:
 
 
 def _insert_entry(conn, us, uid, c, *, status, now, origin_type, origin_ref,
-                  confidence=None, degraded_reason=None, conflict_with=None):
+                  confidence=None, degraded_reason=None, conflict_with=None,
+                  variant=VARIANT_NORMAL, variant_seq=0):
     quote = c.get("quote")
     if not quote:
         return None  # 硬约束（spec §5）：无 quote 的条目拒绝入库
     if confidence is None:
         confidence = c["confidence"]
-    # 行键：entries.id 与 sources.entry_id 同值，可直接 JOIN（spec §5/§12）
-    entry_id = entry_key(c["dimension"], c["topic"])
+    entry_id = new_id()
     conn.execute(
-        f"INSERT INTO entries ({_ENTRY_COLS}) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-        (us, uid, c["dimension"], c["topic"], entry_id,
+        f"INSERT INTO entries ({_ENTRY_COLS})"
+        " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (us, uid, c["dimension"], c["topic"], entry_id, variant, variant_seq,
          confidence, status, c["body"], c["summary"] or "", now, now, now,
          degraded_reason, None, c.get("topic_new"),
          json.dumps(conflict_with, ensure_ascii=False) if conflict_with else None, 0, None))
@@ -482,10 +476,9 @@ def _merge_conflict(existing, mark_value):
 def _append_conflict_mark(conn, taboo_row, other_mark):
     """taboo 恒胜：taboo 行只补 conflict_with，不降置信不降状态。"""
     conn.execute(
-        "UPDATE entries SET conflict_with=? WHERE user_source=? AND user_id=?"
-        " AND dimension='taboo' AND topic=?",
+        "UPDATE entries SET conflict_with=? WHERE id=?",
         (json.dumps(_merge_conflict(taboo_row["conflict_with"], other_mark), ensure_ascii=False),
-         taboo_row["user_source"], taboo_row["user_id"], taboo_row["topic"]))
+         taboo_row["id"]))
 
 
 def _has_embeddings_table(conn):
@@ -504,49 +497,33 @@ def compute_vector(embedder, text: str) -> list[float] | None:
         return None
 
 
-def sync_entry_vector(conn, *, user_source: str, user_id: str,
-                      old_dimension: str, old_topic: str,
-                      new_dimension: str, new_topic: str,
+def sync_entry_vector(conn, *, user_source: str, user_id: str, entry_id: str,
                       old_body: str, new_body: str, vector: list[float] | None = None,
                       vector_requested: bool = False) -> str:
-    """编辑后的向量对齐：正文未变搬键/保留，正文变化重嵌或删除，绝不保留旧向量。
+    """编辑后的向量对齐：id 稳定，改键不搬向量；正文变化重嵌或删除。
 
     vector 由 compute_vector 在事务外预先算好；vector_requested 表示本次编辑
     本应重嵌（嵌入服务已启用），vector 为 None 即嵌入失败，按删除降级。
-    返回 kept/moved/absent/replaced/dropped/disabled，供调用方拼装提示。
+    返回 kept/absent/replaced/dropped/disabled，供调用方拼装提示。
     """
     if not _has_embeddings_table(conn):
         return "disabled"
-    old_key = vec_key(user_source, user_id, old_dimension, old_topic)
-    new_key = vec_key(user_source, user_id, new_dimension, new_topic)
     body_changed = (new_body or "").strip() != (old_body or "").strip()
+    had_old = conn.execute(
+        "SELECT 1 FROM embeddings WHERE entry_id=?", (entry_id,)).fetchone() is not None
     if not body_changed:
-        if old_key == new_key:
-            return "kept"
-        if conn.execute("SELECT 1 FROM embeddings WHERE entry_id=?", (old_key,)).fetchone() is None:
-            return "absent"  # 条目从未嵌入（如嵌入服务关闭期创建），键变了也无需搬运
-        conn.execute("DELETE FROM embeddings WHERE entry_id=?", (new_key,))
-        conn.execute(
-            "INSERT INTO embeddings (entry_id,user_source,user_id,embedding)"
-            " SELECT ?, user_source, user_id, embedding FROM embeddings WHERE entry_id=?",
-            (new_key, old_key))
-        conn.execute("DELETE FROM embeddings WHERE entry_id=?", (old_key,))
-        return "moved"
+        return "kept" if had_old else "absent"
     # 正文变化：旧向量可能已不代表条目内容，先删再决定能否重建，
     # 嵌入失败或无嵌入服务时宁可不召回也不返回脏语义。
-    had_old = conn.execute(
-        "SELECT 1 FROM embeddings WHERE entry_id=?", (old_key,)).fetchone() is not None
-    conn.execute("DELETE FROM embeddings WHERE entry_id=?", (old_key,))
-    if new_key != old_key:
-        conn.execute("DELETE FROM embeddings WHERE entry_id=?", (new_key,))
+    conn.execute("DELETE FROM embeddings WHERE entry_id=?", (entry_id,))
     if not vector_requested or vector is None:
         return "dropped" if had_old else "absent"
     try:
         conn.execute(
             "INSERT INTO embeddings (entry_id,user_source,user_id,embedding) VALUES (?,?,?,?)",
-            (new_key, user_source, user_id, json.dumps(l2_normalize(vector))))
+            (entry_id, user_source, user_id, json.dumps(l2_normalize(vector))))
     except sqlite3.Error:  # 维度配置错等：条目行保留，仅跳过向量（spec §20）
-        logger.exception("vector write failed for edited entry %s", new_key)
+        logger.exception("vector write failed for edited entry %s", entry_id)
         return "dropped"
     return "replaced"
 
@@ -572,18 +549,38 @@ def merge_entries(conn, us, uid, *, src_id, dst_id, now) -> dict:
         "UPDATE sources SET entry_id=? WHERE user_source=? AND user_id=? AND entry_id=?",
         (dst_id, us, uid, src_id))
     _rekey_conflict_marks(conn, us, uid, src_id, dst_id)
+    conn.execute("UPDATE entries SET superseded_by=? WHERE superseded_by=?",
+                 (dst_id, src_id))
     conn.execute(
         "UPDATE entries SET confidence=MAX(confidence, ?),"
         " reinforcements=reinforcements+?, updated_at=?"
         " WHERE user_source=? AND user_id=? AND id=?",
         (src["confidence"], src["reinforcements"], now, us, uid, dst_id))
+    # src 主题的轨迹/冲突/快照跟随规范行并入 dst 主题，避免变体孤儿
+    _move_topic_variants(conn, us, uid, src["dimension"], src["topic"],
+                         dst["dimension"], dst["topic"], now)
     conn.execute(
         "DELETE FROM entries WHERE user_source=? AND user_id=? AND id=?",
         (us, uid, src_id))
     if _has_embeddings_table(conn):
-        conn.execute("DELETE FROM embeddings WHERE entry_id=?",
-                     (vec_key(us, uid, src["dimension"], src["topic"]),))
+        conn.execute("DELETE FROM embeddings WHERE entry_id=?", (src_id,))
     return {"merged": True}
+
+
+def _move_topic_variants(conn, us, uid, src_dim, src_topic, dst_dim, dst_topic, now):
+    """把 src 主题下的非 normal 形态迁到 dst 主题，seq 按目标 MAX+1 重排。"""
+    if (src_dim, src_topic) == (dst_dim, dst_topic):
+        return
+    rows = conn.execute(
+        "SELECT id, variant FROM entries WHERE user_source=? AND user_id=?"
+        " AND dimension=? AND topic=? AND variant<>?",
+        (us, uid, src_dim, src_topic, VARIANT_NORMAL)).fetchall()
+    for row in rows:
+        seq = _next_variant_seq(conn, us, uid, dst_dim, dst_topic, row["variant"])
+        conn.execute(
+            "UPDATE entries SET dimension=?, topic=?, variant_seq=?, updated_at=?"
+            " WHERE id=?",
+            (dst_dim, dst_topic, seq, now, row["id"]))
 
 
 def _write_vectors(conn, us, uid, vectors, precomputed):
@@ -603,12 +600,8 @@ def _write_vectors(conn, us, uid, vectors, precomputed):
             continue
 
 
-def entry_has_vector(conn, entry_key: str) -> bool | None:
-    """条目是否有向量行；表结构细节封在本写入器内。
-
-    entry_key 是条目在 embeddings 表中的键位——writer 既有约定：该表
-    entry_id 列存 vec_key 四元组组合键（非 entries.id），调用方（如
-    create_entry）用 vec_key(user_source, user_id, dimension, topic) 构造。
+def entry_has_vector(conn, entry_id: str) -> bool | None:
+    """条目是否有向量行；embeddings.entry_id 直接存 entries.id。
 
     返回 True/False 仅在 embeddings 表存在时有意义：False = 表存在但该条目
     无向量行（如嵌入失败被降级跳过）。表未启用 → None，调用方据此整体跳过
@@ -617,5 +610,5 @@ def entry_has_vector(conn, entry_key: str) -> bool | None:
     if not _has_embeddings_table(conn):
         return None
     return conn.execute(
-        "SELECT 1 FROM embeddings WHERE entry_id=?", (entry_key,)
+        "SELECT 1 FROM embeddings WHERE entry_id=?", (entry_id,)
     ).fetchone() is not None

@@ -7,7 +7,6 @@ import pytest
 from pismor.serving.assembler import assemble
 from pismor.serving import assembler as assembler_mod
 from pismor.llm.embedder import EmbedUnavailable
-from pismor.core.keys import vec_key
 
 NOW = "2026-11-20T00:00:00+00:00"
 
@@ -46,15 +45,20 @@ def audit_sink():
 
 
 def _entry(conn, dim, topic, body, *, entry_id=None, status="active", conf=0.9,
-           conflict_with=None, uid="u1", updated=NOW):
+           conflict_with=None, uid="u1", updated=NOW,
+           variant="normal", variant_seq=0):
+    default_id = f"{dim}_{topic}" if variant == "normal" else f"{dim}_{topic}_{variant}"
     conn.execute(
-        "INSERT INTO entries (user_source,user_id,dimension,topic,id,confidence,status,"
-        "body,summary,created_at,updated_at,last_reinforced_at,reinforcements,conflict_with)"
-        " VALUES ('w',?,?,?,?,?,?,?,?,?,?,?,0,?)",
+        "INSERT INTO entries (user_source,user_id,dimension,topic,id,variant,variant_seq,"
+        "confidence,status,body,summary,created_at,updated_at,last_reinforced_at,"
+        "reinforcements,conflict_with)"
+        " VALUES ('w',?,?,?,?,?,?,?,?,?,?,?,?,?,0,?)",
         (uid, dim, topic,
-         entry_id if entry_id else f"{dim}_{topic}",
+         entry_id if entry_id else default_id,
+         variant, variant_seq,
          conf, status,
          body, body[:20], updated, updated, updated, conflict_with))
+    return entry_id if entry_id else default_id
 
 
 @pytest.fixture
@@ -218,7 +222,7 @@ def test_vector_recall(conn, seeded):
     conn.execute("CREATE VIRTUAL TABLE embeddings USING vec0("
                  "entry_id TEXT PRIMARY KEY, user_source TEXT, user_id TEXT, embedding float[4])")
     conn.execute("INSERT INTO embeddings VALUES (?, 'w','u1', ?)",
-                 (vec_key("w", "u1", "preference", "coffee"),
+                 ("preference_coffee",
                   json.dumps([0.1, 0.2, 0.3, 0.4])))
     conn.commit()
     pack = assemble(conn, EmbedderStub(), "w", "u1", budget=2000, query="咖啡")
@@ -231,7 +235,7 @@ def test_vector_recall_drops_dissimilar(conn, seeded):
     conn.execute("CREATE VIRTUAL TABLE embeddings USING vec0("
                  "entry_id TEXT PRIMARY KEY, user_source TEXT, user_id TEXT, embedding float[4])")
     conn.execute("INSERT INTO embeddings VALUES (?, 'w','u1', ?)",
-                 (vec_key("w", "u1", "preference", "coffee"),
+                 ("preference_coffee",
                   json.dumps([-0.1, -0.2, -0.3, -0.4])))
     conn.commit()
     pack = assemble(conn, EmbedderStub(), "w", "u1", budget=2000, query="深度学习")
@@ -243,7 +247,7 @@ def test_vector_recall_threshold_configurable(conn, seeded):
     conn.execute("CREATE VIRTUAL TABLE embeddings USING vec0("
                  "entry_id TEXT PRIMARY KEY, user_source TEXT, user_id TEXT, embedding float[4])")
     conn.execute("INSERT INTO embeddings VALUES (?, 'w','u1', ?)",
-                 (vec_key("w", "u1", "preference", "coffee"),
+                 ("preference_coffee",
                   json.dumps([-0.1, -0.2, -0.3, -0.4])))
     conn.commit()
     pack = assemble(conn, EmbedderStub(), "w", "u1", budget=2000, query="深度学习",
@@ -372,7 +376,7 @@ def test_vector_recall_normalizes_query(conn):
     conn.execute("CREATE VIRTUAL TABLE embeddings USING vec0("
                  "entry_id TEXT PRIMARY KEY, user_source TEXT, user_id TEXT, embedding float[2])")
     conn.execute("INSERT INTO embeddings VALUES (?, 'w','u1', ?)",
-                 (vec_key("w", "u1", "preference", "deep"), json.dumps([1.0, 0.0])))
+                 ("preference_deep", json.dumps([1.0, 0.0])))
     conn.commit()
     pack = assemble(conn, UnitQueryEmbedder(), "w", "u1", budget=2000, query="无关主题")
     assert "preference_deep" in [e["id"] for e in pack["entries"]]
@@ -399,7 +403,7 @@ def test_must_have_is_all_user_entries(conn):
     # 必带集 = 该用户全部 active/degraded 的 taboo/identity，且不跨用户取数
     _entry(conn, "taboo", "excel", "用户一禁忌", uid="u1")
     _entry(conn, "identity", "role", "用户一身份", uid="u1")
-    _entry(conn, "taboo", "excel", "用户二禁忌", uid="u2")
+    _entry(conn, "taboo", "excel", "用户二禁忌", uid="u2", entry_id="taboo_excel_u2")
     conn.commit()
     pack = assemble(conn, None, "w", "u1", budget=2000)
     ids = {e["id"] for e in pack["entries"]}

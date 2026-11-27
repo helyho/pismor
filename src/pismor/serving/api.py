@@ -115,12 +115,13 @@ def create_app(settings: Settings, llm=None, embedder=None) -> FastAPI:
                                       related_top_k=a.related_top_k,
                                       half_life_days=a.half_life_days,
                                       clarify_ttl_days=a.clarify_ttl_days,
+                                      recall_conflicts=a.recall_conflicts,
                                       min_similarity=s.embedding.min_similarity)
 
     @app.get("/review/queue")
     def review_queue():
-        # 复核队列 = pending_review 行 + 未消解的 '+' 变形矛盾双存行
-        #（~ 轨迹行恒 archived 不命中；conflict_with 已清空 = 矛盾已消解，移出队列）
+        # 复核队列 = pending_review 行 + 未消解的 conflict 形态矛盾双存行
+        #（trace 行恒 archived 不命中；conflict_with 已清空 = 矛盾已消解，移出队列）
         s = settings_store.current()
         with closing(get_conn(s.db_path)) as conn:
             rows = conn.execute(
@@ -129,7 +130,7 @@ def create_app(settings: Settings, llm=None, embedder=None) -> FastAPI:
                 " FROM entries WHERE NOT EXISTS (SELECT 1 FROM tombstones t"
                 "   WHERE t.user_source=entries.user_source AND t.user_id=entries.user_id)"
                 " AND (status='pending_review'"
-                "    OR (topic LIKE '+%' AND status IN ('active','degraded')"
+                "    OR (variant='conflict' AND status IN ('active','degraded')"
                 "        AND conflict_with IS NOT NULL))"
                 " ORDER BY updated_at").fetchall()
         return {"items": [dict(r) for r in rows]}

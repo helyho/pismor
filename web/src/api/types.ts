@@ -37,6 +37,7 @@ export interface ReviewQueueItem {
   summary: string
   confidence: number
   status: string
+  variant: string
   entry_version: string
   note: string | null
 }
@@ -64,6 +65,8 @@ export interface ReviewEntry {
   dimension: string
   topic: string
   id: string
+  variant: string
+  variant_seq: number
   confidence: number
   status: string
   body: string

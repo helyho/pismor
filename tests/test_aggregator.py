@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 import yaml
 
+from pismor.core.keys import new_id
 from pismor.pipeline.aggregator import run_daily
 from pismor.core.taxonomy import load_taxonomy
 from pismor.pipeline.extractor import extract as _extract
@@ -36,7 +37,7 @@ def _entry(conn, *, us="w", uid="u1", dim="preference", topic="orphan",
            body="偏好简短回复", summary="简短回复"):
     updated = updated or created
     reinforced = reinforced or created
-    entry_id = f"{dim}_{topic}"
+    entry_id = new_id()
     conn.execute(
         "INSERT INTO entries (user_source,user_id,dimension,topic,id,confidence,status,"
         "body,summary,created_at,updated_at,last_reinforced_at,topic_new,reinforcements)"
@@ -165,10 +166,10 @@ def test_orphan_activated_after_threshold(conn, seeded_orphans_3, taxonomy, fake
     assert conn.execute("SELECT status FROM entries WHERE status='orphan_topic'").fetchone() is None
     row = conn.execute("SELECT status, topic, dimension, id, topic_new FROM entries").fetchone()
     assert row["status"] == "active" and row["topic"] == "lang" and row["topic_new"] is None
-    assert row["dimension"] == "preference" and row["id"] == "preference_lang"
-    # 证据链 entry_id 跟随 re-key
+    assert row["dimension"] == "preference" and len(row["id"]) == 32
+    # re-key 只改 dimension/topic，id 稳定，证据链 entry_id 不变
     src = conn.execute("SELECT entry_id FROM sources").fetchone()
-    assert src["entry_id"] == "preference_lang"
+    assert src["entry_id"] == row["id"]
 
 
 def test_orphan_new_topic_activated_and_yaml(conn, taxonomy_writable, fake_llm_new_topic):

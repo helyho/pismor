@@ -195,11 +195,12 @@ def _seed_neighbor(conn, dimension="preference", topic="style"):
 
 
 def _insert_pref(conn, topic, body, origin_ref):
-    _insert_entry(conn, "webchat", "u1",
-                  {"dimension": "preference", "topic": topic,
-                   "body": body, "summary": body[:10], "confidence": 0.9,
-                   "kind": "explicit", "quote": f"q-{topic}", "topic_new": None},
-                  status="active", now=NOW, origin_type="conversation", origin_ref=origin_ref)
+    return _insert_entry(conn, "webchat", "u1",
+                         {"dimension": "preference", "topic": topic,
+                          "body": body, "summary": body[:10], "confidence": 0.9,
+                          "kind": "explicit", "quote": f"q-{topic}", "topic_new": None},
+                         status="active", now=NOW, origin_type="conversation",
+                         origin_ref=origin_ref)
 
 
 def _taboo_candidate():
@@ -215,10 +216,11 @@ def test_neighbor_no_rows_no_llm_call(conn, taxonomy):
 
 def test_neighbor_ignores_deformed_and_inactive_rows(conn, taxonomy):
     _insert_entry(conn, "webchat", "u1",
-                  {"dimension": "preference", "topic": "~style:20261124:1",
+                  {"dimension": "preference", "topic": "style",
                    "body": "轨迹行", "summary": "轨迹", "confidence": 0.9,
                    "kind": "explicit", "quote": "q", "topic_new": None},
-                  status="archived", now=NOW, origin_type="conversation", origin_ref="e0")
+                  status="archived", now=NOW, origin_type="conversation",
+                  origin_ref="e0", variant="trace", degraded_reason="superseded")
     conn.commit()
     llm = CaptureLLM({"conflict": True, "reason": "x"})
     assert resolver._neighbor_conflict(conn, "webchat", "u1", _taboo_candidate(), llm) is None
@@ -237,9 +239,9 @@ def test_neighbor_not_conflict_returns_none(conn, taxonomy):
 
 def test_neighbor_conflict_returns_accused_target(conn, taxonomy):
     _insert_pref(conn, "style", "回复要正式", "e1")
-    _insert_pref(conn, "verbosity", "回复要简短", "e2")
+    vid = _insert_pref(conn, "verbosity", "回复要简短", "e2")
     conn.commit()
-    llm = CaptureLLM({"conflict": True, "conflicting_with": "preference_verbosity",
+    llm = CaptureLLM({"conflict": True, "conflicting_with": vid,
                       "reason": "详略互斥"})
     target = resolver._neighbor_conflict(conn, "webchat", "u1", _taboo_candidate(), llm)
     assert target == ("preference", "verbosity")  # LLM 指认优先

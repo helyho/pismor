@@ -47,11 +47,11 @@
 
 ### 1.3 键与命名
 
-- 规范条目：`topic` 就是词表主题；`id = entry_key(dimension, topic)`。
-- 冲突变形行：`topic = "+{topic}"`，只能处于 `active/degraded`。
-- 历史轨迹行：`topic = "~{topic}:{紧凑时间}:{序号}"`，必须 `archived`。
-- 待复核快照：`topic = "!{topic}"`（冲突时 `!topic:2`…），仍为 `pending_review`。
-- `sources.entry_id` 必须随条目 `id` 同步迁移；任何改键操作都要同步证据链。
+- 规范条目：`variant='normal'`、`variant_seq=0`，`topic` 就是词表主题；`id` 是稳定行键（`keys.new_id()`），不再由 dimension/topic 派生。
+- 冲突变体：`variant='conflict'`、`variant_seq` 递增，`topic` 仍是基础主题；状态限 `active/degraded/archived`。
+- 历史轨迹行：`variant='trace'`、`variant_seq` 递增，必须 `archived`，`degraded_reason='superseded'`。
+- 待复核快照：`variant='snapshot'`、`variant_seq` 递增，仍为 `pending_review`。
+- `sources.entry_id` 指向稳定的 `entries.id`；改键/合并不再迁移 id，同 topic 的全部 variant 级联改 topic。
 
 ---
 
@@ -227,8 +227,8 @@ POST /events
 - 向量在事务外预计算（批量一次，失败逐条重试），条目、证据、向量在同一事务边界内提交。
 - 单条失败（`IntegrityError` / `IllegalTransition`）会让整批回滚，然后 orchestrator 逐条重放隔离；失败条写 `review_history(decision='apply_failed')`。
 - `ADD`：无 quote 拒绝；taboo 冲突则降级落库；否则 `active`。
-- `UPDATE`：旧值转 archived 轨迹行，原行覆盖为新值；`pending_review` 先转 `!` 快照再插新行。
-- `CONFLICT`：新值放 `+topic` 变形行；双方降级或 taboo 单侧取胜。
+- `UPDATE`：旧值转 `variant='trace'` 的 archived 轨迹行，原行覆盖为新值；`pending_review` 先转 `variant='snapshot'` 腾出 normal 槽，再插新行。
+- `CONFLICT`：新值放 `variant='conflict'` 的副本行；双方降级或 taboo 单侧取胜。
 - `NOOP`：只强化，不改状态。
 - `ORPHAN`：写 `orphan_topic`，同 `topic_new` 复现只累加强化次数。
 
@@ -256,7 +256,7 @@ POST /events
 主键不含 `status`，所以 `UPDATE` 的语义是：
 
 1. 先 `_check_transition(old.status, 'archived')` 拦住不可演进的旧态（例如 archived 不能再更新）。
-2. 把旧行完整复制成 `~topic:时间:序号` 的 `archived` 轨迹行，`degraded_reason = 'superseded'`，证据链迁移到轨迹行。
+2. 把旧行完整复制成 `variant='trace'`、`variant_seq` 递增的 `archived` 轨迹行，`degraded_reason = 'superseded'`，证据链迁移到轨迹行。
 3. 原行原地覆盖新 `body/summary/confidence`，状态回到 `active`，清空 `degraded_reason/conflict_with/topic_new`，刷新 `updated_at` 与 `last_reinforced_at`。
 4. 追加一条新 `sources`（kind 取候选的 `explicit/inferred/clarification`）。
 
@@ -285,7 +285,7 @@ POST /events
 - 普通矛盾：双方 `degraded / conflict_lost`，置信 ×0.8，并互相写 `conflict_with`。
 - 一方是 taboo：taboo 保持 `active`，对方降级；taboo 行只补 `conflict_with`。
 - 新候选是 taboo：新行 `active`，旧行降级。
-- 冲突行统一放在 `+topic`，避免覆盖规范键。
+- 冲突行统一用 `variant='conflict'`，与 normal 行同 topic 并存，避免覆盖规范键。
 - `resolve_conflicts` 只做精确匹配：按完整 `id` 定位；`revive=True` 时只恢复 `degraded_reason == 'conflict_lost'` 的对方。
 
 ### 5.6 合并条目
@@ -325,7 +325,7 @@ POST /events
 
 ### 6.3 矛盾对收敛（`_settle_pair`）
 
-- `+topic` 变形行归档；
+- `variant='conflict'` 的败方归档（taboo 胜出方保留）；
 - 未被回答覆盖、且仍是 `active` 的非 taboo 行降级为 `conflict_lost`；
 - 清残留互标；
 - 最后 `resolve_conflicts(revive=True)` 复活可恢复的对方；
@@ -450,9 +450,9 @@ OR (topic LIKE '+%' AND status IN ('active','degraded') AND conflict_with IS NOT
    - topic 不在词表 → 返回 `invalid_topic`，不改数据；
    - 目标 topic 已有存活行 → `merge_entries` 合并过去，返回 `merged_into`；
    - 目标不存在 → 改键、迁移证据、清冲突标记，返回 `rekeyed_to`。
-3. 若当前是 `!topic` 快照：
-   - 规范键已被占用 → 快照归档（`superseded_by_evolution`）；
-   - 否则改回规范 topic/id。
+3. 若当前是 `variant='snapshot'` 快照：
+   - 规范槽已被占用 → 快照转 `variant='trace'` 并归档（`superseded_by_evolution`）；
+   - 否则同一条 UPDATE 改回 `variant='normal'`, `variant_seq=0`。
 4. 最终 CAS 更新状态、正文/摘要（仅在提供时覆盖）、清 `degraded_reason/conflict_with`；
 5. `resolve_conflicts(revive=True, clear_pending=True)` 复活因冲突落败的对方并清待澄清；
 6. 写 `review_history`。
@@ -462,7 +462,7 @@ OR (topic LIKE '+%' AND status IN ('active','degraded') AND conflict_with IS NOT
 - 所有写操作都带 `entry_version` CAS；版本不符返回 `noop`，先到者生效。
 - `fix` 不改变状态、不清冲突、不做快照转换——它只修文字。
 - 超过 14 天的 `pending_review` 会被日批物理删除，并写 `decision='expired'`。
-- `+topic` 冲突行如果未被确认，会一直留在队列；确认/移除后按上述规则收敛。
+- `variant='conflict'` 的争议行如果未被确认，会一直留在队列；确认/移除后按上述规则收敛。
 
 ---
 

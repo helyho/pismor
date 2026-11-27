@@ -86,22 +86,23 @@ def _assert_consumed(llm):
     assert llm.remaining == [], llm.remaining
 
 
-def _entry(db, dim, topic, *, us="webchat", uid="u1"):
+def _entry(db, dim, topic, *, variant="normal", us="webchat", uid="u1"):
     return db.execute(
-        "SELECT * FROM entries WHERE user_source=? AND user_id=? AND dimension=? AND topic=?",
-        (us, uid, dim, topic)).fetchone()
+        "SELECT * FROM entries WHERE user_source=? AND user_id=? AND dimension=? AND topic=?"
+        " AND variant=?",
+        (us, uid, dim, topic, variant)).fetchone()
 
 
-def _seed(db, dim, topic, body, *, status="active", conf=0.9,
-          us="webchat", uid="u1", degraded_reason=None, conflict_with=None):
-    entry_id = f"{dim}_{topic}"
+def _seed(db, dim, topic, body, *, status="active", conf=0.9, variant="normal",
+          variant_seq=0, us="webchat", uid="u1", degraded_reason=None, conflict_with=None):
+    entry_id = f"{dim}_{topic}" if variant == "normal" else f"{dim}_{topic}_{variant}"
     db.execute(
-        "INSERT INTO entries (user_source,user_id,dimension,topic,id,confidence,status,"
-        " body,summary,created_at,updated_at,last_reinforced_at,reinforcements,"
-        " degraded_reason,conflict_with)"
-        " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,0,?,?)",
-        (us, uid, dim, topic, entry_id, conf, status, body, body[:20],
-         NOW, NOW, NOW, degraded_reason, conflict_with))
+        "INSERT INTO entries (user_source,user_id,dimension,topic,id,variant,variant_seq,"
+        " confidence,status,body,summary,created_at,updated_at,last_reinforced_at,"
+        " reinforcements,degraded_reason,conflict_with)"
+        " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,0,?,?)",
+        (us, uid, dim, topic, entry_id, variant, variant_seq, conf, status, body,
+         body[:20], NOW, NOW, NOW, degraded_reason, conflict_with))
     db.execute(
         "INSERT INTO sources (entry_id,user_source,user_id,origin_type,origin_ref,quote,kind)"
         " VALUES (?,?,?,?,?,?,?)",
@@ -150,23 +151,23 @@ def test_full_lifecycle(client_with_script, db):
     # 2) 矛盾出现 → CONFLICT 双存；装配挂澄清问题（模板拼接不调 LLM）
     assert _post(client, llm, conv("evt_2", "以后聊天回复随意一点，别太正式",
                                    turn=2)).status_code == 202
-    plus = _entry(db, "preference", "+style")
+    plus = _entry(db, "preference", "style", variant="conflict")
     degraded_main = _entry(db, "preference", "style")
     assert degraded_main["conflict_with"] and plus["status"] == "degraded" \
         and plus["degraded_reason"] == "conflict_lost"
-    assert json.loads(degraded_main["conflict_with"]) == ["preference_+style"]
+    assert json.loads(degraded_main["conflict_with"]) == [plus["id"]]
 
     pack = client.get("/memory/webchat/u1?budget=2000").json()
     assert len(pack["clarification_needed"]) == 1
     item = pack["clarification_needed"][0]
-    assert item["conflicting_ids"] == ["preference_style", "preference_+style"]
+    assert set(item["conflicting_ids"]) == {degraded_main["id"], plus["id"]}
     assert "正式书面语" in item["question"] and "随意自然" in item["question"]
     assert db.execute("SELECT COUNT(*) FROM pending_clarifications").fetchone()[0] == 1
 
     # 3) 用户回答 → LLM 规范化 → 覆盖规范行并归档 '+' 行
     assert _post(client, llm, conv("evt_3", answer, turn=3)).status_code == 202
     main = _entry(db, "preference", "style")
-    opposed = _entry(db, "preference", "+style")
+    opposed = _entry(db, "preference", "style", variant="conflict")
     # 原文祈使句不入库：body 是抽取出的陈述句（C-2）
     assert main["status"] == "active" and main["body"] == "日常聊天回复随意自然"
     assert main["body"] != answer and main["summary"] == "聊天随意自然"
@@ -175,7 +176,7 @@ def test_full_lifecycle(client_with_script, db):
     assert opposed["status"] == "archived" and opposed["archived_at"] == NOW
     assert db.execute("SELECT COUNT(*) FROM pending_clarifications").fetchone()[0] == 0
     kinds = [r["kind"] for r in db.execute(
-        "SELECT kind FROM sources WHERE entry_id='preference_style'").fetchall()]
+        "SELECT kind FROM sources WHERE entry_id=?", (main["id"],)).fetchall()]
     assert "clarification" in kinds
     assert client.get("/memory/webchat/u1?budget=2000").json()["clarification_needed"] == []
 
@@ -184,8 +185,8 @@ def test_full_lifecycle(client_with_script, db):
                  ).status_code == 202
     note = _entry(db, "fact", "event")
     assert note["status"] == "active"
-    src = db.execute("SELECT origin_type FROM sources WHERE entry_id='fact_event'"
-                     ).fetchone()
+    src = db.execute("SELECT origin_type FROM sources WHERE entry_id=?",
+                     (note["id"],)).fetchone()
     assert src["origin_type"] == "text"
 
     # 5) taboo / identity 经管线产生
@@ -201,10 +202,16 @@ def test_full_lifecycle(client_with_script, db):
 def test_repeated_get_keeps_clarification(client_with_script, db):
     # ① 同一秒内重复装配：issue 去重复用问题，不再吞空/累积 pending 行
     client, _llm = client_with_script([])
-    _seed(db, "preference", "style", "回复使用正式书面语", conf=0.76, status="degraded",
-          degraded_reason="conflict_lost", conflict_with='["preference_+style"]')
-    _seed(db, "preference", "+style", "聊天回复随意自然", conf=0.72, status="degraded",
-          degraded_reason="conflict_lost", conflict_with='["preference_style"]')
+    main_id = _seed(db, "preference", "style", "回复使用正式书面语", conf=0.76,
+                    status="degraded", degraded_reason="conflict_lost")
+    plus_id = _seed(db, "preference", "style", "聊天回复随意自然", conf=0.72,
+                    variant="conflict", variant_seq=1, status="degraded",
+                    degraded_reason="conflict_lost")
+    db.execute("UPDATE entries SET conflict_with=? WHERE id=?",
+               (json.dumps([plus_id]), main_id))
+    db.execute("UPDATE entries SET conflict_with=? WHERE id=?",
+               (json.dumps([main_id]), plus_id))
+    db.commit()
 
     first = client.get("/memory/webchat/u1?budget=2000").json()["clarification_needed"]
     second = client.get("/memory/webchat/u1?budget=2000").json()["clarification_needed"]
@@ -233,13 +240,15 @@ def test_clarification_updates_canonical_main_row(client_with_script, db):
     _post(client, llm, conv("evt_h1", "以后回复都用正式书面语"))
     _post(client, llm, conv("evt_h2", "以后聊天回复随意一点，别太正式", turn=2))
     pack = client.get("/memory/webchat/u1?budget=2000").json()
+    main0 = _entry(db, "preference", "style")
+    plus0 = _entry(db, "preference", "style", variant="conflict")
     assert pack["clarification_needed"][0]["conflicting_ids"] == \
-        ["preference_+style", "preference_style"]  # 高置信变形行在首项
+        [plus0["id"], main0["id"]]  # 高置信变形行在首项
 
     _post(client, llm, conv("evt_h3", answer, turn=3))
     _assert_consumed(llm)
     main = _entry(db, "preference", "style")
-    plus = _entry(db, "preference", "+style")
+    plus = _entry(db, "preference", "style", variant="conflict")
     assert main["status"] == "active" and main["body"] == "回复保持正式书面语"
     assert main["body"] != answer and len(main["summary"]) <= 20
     assert main["conflict_with"] is None and plus["conflict_with"] is None
@@ -348,14 +357,17 @@ def test_run_regression_dry(capsys):
 
 def test_clarification_updates_only_pending_pair_rows(client_with_script, db):
     """C-1：pending 指向矛盾对时，澄清只改这对行，未涉及的条目保持不动。"""
-    _seed(db, "preference", "style", "正式",
-          conflict_with='["preference_+style"]')
-    _seed(db, "preference", "+style", "随意", status="degraded",
-          degraded_reason="conflict_lost", conflict_with='["preference_style"]')
+    main_id = _seed(db, "preference", "style", "正式")
+    plus_id = _seed(db, "preference", "style", "随意", variant="conflict",
+                    variant_seq=1, status="degraded", degraded_reason="conflict_lost")
+    db.execute("UPDATE entries SET conflict_with=? WHERE id=?",
+               (json.dumps([plus_id]), main_id))
+    db.execute("UPDATE entries SET conflict_with=? WHERE id=?",
+               (json.dumps([main_id]), plus_id))
     _seed(db, "preference", "lang", "主语言 Python")
     db.execute("INSERT INTO pending_clarifications (user_source,user_id,conflicting_ids,"
                "question,issued_at) VALUES ('webchat','u1',?, 'q', ?)",
-               ('["preference_style","preference_+style"]', NOW))
+               (json.dumps([main_id, plus_id]), NOW))
     db.commit()
     script = [
         S("clarification_answer_check", {"is_answer": True}),
@@ -367,7 +379,7 @@ def test_clarification_updates_only_pending_pair_rows(client_with_script, db):
     _post(client, llm, conv("evt_x1", "项目里随意说"))
     _assert_consumed(llm)
     style_row = _entry(db, "preference", "style")
-    plus_row = _entry(db, "preference", "+style")
+    plus_row = _entry(db, "preference", "style", variant="conflict")
     lang_row = _entry(db, "preference", "lang")
     assert style_row["body"] == "项目内回复使用口语" and style_row["status"] == "active"
     assert plus_row["status"] == "archived"

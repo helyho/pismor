@@ -167,7 +167,7 @@ def test_memory_after_pipeline(client, fake_llm, wait_for_pipeline):
     r = client.get("/memory/webchat/u1?budget=2000")
     assert r.status_code == 200 and "entries" in r.json()
     r = client.get("/memory/webchat/u1?budget=2000&query=Python")
-    assert any(e["id"] == "preference_lang" for e in r.json()["entries"])
+    assert any("Python" in e["text"] for e in r.json()["entries"])
 
 
 def test_review_decision_flow(client, conn):
@@ -259,8 +259,9 @@ def test_pipeline_duplicate_key_degrades_to_noop(conn, fake_llm, embedder_stub, 
     run_pipeline(conn, fake_settings, dict(CONV_EVENT, event_id="evt_3"),
                  taxonomy=taxonomy, llm=fake_llm, embedder=embedder_stub)
     rows = conn.execute(
-        "SELECT COUNT(*) c FROM entries WHERE topic='+style'").fetchone()["c"]
-    assert rows == 1  # 第二次同 key 写入被降级，不抛异常不重复落行
+        "SELECT COUNT(*) c FROM entries WHERE topic='style' AND variant='conflict'"
+    ).fetchone()["c"]
+    assert rows == 2  # 同 key 多次冲突各占一个 variant_seq，不再撞主键
 
 
 def test_pipeline_swallows_exceptions(conn, fake_settings, taxonomy, embedder_stub):
@@ -351,21 +352,26 @@ def test_trigger_explicit_keywords_custom_vocab():
 
 
 def _seed_conflict_pair(conn):
-    """active 原行 + '+' 变形行（degraded/conflict_lost），双向互标 + 一条 pending。"""
+    """normal 行 + conflict 变体（同 topic），双向互标 + 一条 pending。"""
+    main_id, plus_id = "preference_style_main", "preference_style_conflict"
     conn.execute(
-        "INSERT INTO entries (user_source,user_id,dimension,topic,id,confidence,status,"
-        " body,summary,created_at,updated_at,last_reinforced_at,degraded_reason,conflict_with)"
-        " VALUES ('webchat','u1','preference','style','preference_style',0.9,'active',"
-        " '偏好正式','正式',?, ?, ?, NULL, ?)", (NOW, NOW, NOW, '["preference_+style"]'))
+        "INSERT INTO entries (user_source,user_id,dimension,topic,id,variant,variant_seq,"
+        " confidence,status,body,summary,created_at,updated_at,last_reinforced_at,"
+        " degraded_reason,conflict_with)"
+        " VALUES ('webchat','u1','preference','style',?, 'normal',0,0.9,'active',"
+        " '偏好正式','正式',?,?,?, NULL, ?)",
+        (main_id, NOW, NOW, NOW, json.dumps([plus_id])))
     conn.execute(
-        "INSERT INTO entries (user_source,user_id,dimension,topic,id,confidence,status,"
-        " body,summary,created_at,updated_at,last_reinforced_at,degraded_reason,conflict_with)"
-        " VALUES ('webchat','u1','preference','+style','preference_+style',0.72,"
-        " 'degraded','偏好随意','随意',?, ?, ?, 'conflict_lost', ?)",
-        (NOW, NOW, NOW, '["preference_style"]'))
+        "INSERT INTO entries (user_source,user_id,dimension,topic,id,variant,variant_seq,"
+        " confidence,status,body,summary,created_at,updated_at,last_reinforced_at,"
+        " degraded_reason,conflict_with)"
+        " VALUES ('webchat','u1','preference','style',?, 'conflict',1,0.72,"
+        " 'degraded','偏好随意','随意',?,?,?, 'conflict_lost', ?)",
+        (plus_id, NOW, NOW, NOW, json.dumps([main_id])))
     conn.execute(
         "INSERT INTO pending_clarifications (user_source, user_id, conflicting_ids, question,"
-        " issued_at) VALUES ('webchat','u1','[\"preference_style\",\"preference_+style\"]','以哪种为准？',?)", (NOW,))
+        " issued_at) VALUES ('webchat','u1',?, '以哪种为准？',?)",
+        (json.dumps([main_id, plus_id]), NOW))
     conn.commit()
 
 
@@ -381,15 +387,16 @@ def test_clarification_closes_conflict_loop(client, conn, fake_llm):
     ev = dict(CONV_EVENT, event_id="evt_c1",
               messages=[{"role": "user", "text": "以后都正式一点"}])
     client.post("/events", json=ev)
-    marks = {r["topic"]: r["conflict_with"] for r in conn.execute(
-        "SELECT topic, conflict_with FROM entries WHERE topic IN ('style','+style')").fetchall()}
-    assert marks["style"] is None and marks["+style"] is None
+    marks = {r["variant"]: r["conflict_with"] for r in conn.execute(
+        "SELECT variant, conflict_with FROM entries WHERE topic='style'").fetchall()}
+    assert marks["normal"] is None and marks["conflict"] is None
     plus = conn.execute(
         "SELECT status, degraded_reason, confidence, archived_at FROM entries"
-        " WHERE topic='+style'").fetchone()
+        " WHERE topic='style' AND variant='conflict'").fetchone()
     # '+' 变形行按裁决归档为轨迹，不得原样 active（C-2/T14）
     assert plus["status"] == "archived" and plus["archived_at"] is not None
-    main = conn.execute("SELECT body, status FROM entries WHERE topic='style'").fetchone()
+    main = conn.execute(
+        "SELECT body, status FROM entries WHERE topic='style' AND variant='normal'").fetchone()
     assert main["status"] == "active" and main["body"] == "回复保持正式书面语"
     assert conn.execute("SELECT COUNT(*) FROM pending_clarifications").fetchone()[0] == 0
     assert client.get("/memory/webchat/u1").json()["clarification_needed"] == []
@@ -398,21 +405,25 @@ def test_clarification_closes_conflict_loop(client, conn, fake_llm):
 def test_decision_advances_version_and_clears_conflict(client, conn):
     # I-2：decision 刷 updated_at（同版本二次判定 noop）+ '+' 行收尾移出复核队列
     _seed_conflict_pair(conn)
+    plus_id = conn.execute(
+        "SELECT id FROM entries WHERE topic='style' AND variant='conflict'").fetchone()[0]
     queue = client.get("/review/queue").json()["items"]
-    assert any(i["entry_id"] == "preference_+style" for i in queue)
-    version = next(i["entry_version"] for i in queue if i["entry_id"] == "preference_+style")
-    r = client.post("/review/webchat/u1/preference_+style/decision",
+    assert any(i["entry_id"] == plus_id for i in queue)
+    version = next(i["entry_version"] for i in queue if i["entry_id"] == plus_id)
+    r = client.post(f"/review/webchat/u1/{plus_id}/decision",
                     json={"decision": "confirm", "entry_version": version})
     assert r.status_code == 200 and r.json()["noop"] is False
     plus = conn.execute(
-        "SELECT status, conflict_with, updated_at FROM entries WHERE topic='+style'").fetchone()
+        "SELECT status, conflict_with, updated_at FROM entries"
+        " WHERE topic='style' AND variant='conflict'").fetchone()
     assert plus["status"] == "active" and plus["conflict_with"] is None
     assert plus["updated_at"] != version  # 版本已推进（spec §8.1 变更即刷新）
     assert conn.execute(  # 对方行 conflict_lost 恢复 active
-        "SELECT status FROM entries WHERE topic='style'").fetchone()[0] == "active"
+        "SELECT status FROM entries WHERE topic='style' AND variant='normal'"
+    ).fetchone()[0] == "active"
     remaining = client.get("/review/queue").json()["items"]
-    assert not any(i["entry_id"] == "preference_+style" for i in remaining)
-    r2 = client.post("/review/webchat/u1/preference_+style/decision",
+    assert not any(i["entry_id"] == plus_id for i in remaining)
+    r2 = client.post(f"/review/webchat/u1/{plus_id}/decision",
                      json={"decision": "remove", "entry_version": version})
     assert r2.status_code == 200 and r2.json()["noop"] is True  # 同版本二次判定作废
     assert conn.execute("SELECT COUNT(*) FROM review_history").fetchone()[0] == 1
@@ -428,20 +439,22 @@ def test_orphan_candidate_review_confirm_to_observation(client, conn, fake_llm, 
                    "topic_new": "手工模型", "status": "orphan_topic"}
     fake_llm.by_name["extract_candidates"] = [{"candidates": [orphan_cand]}]
     client.post("/events", json=dict(CONV_EVENT, event_id="evt_o1"))
+    orphan_id = conn.execute(
+        "SELECT id FROM entries WHERE dimension='orphan' AND topic='手工模型'").fetchone()[0]
     queue = client.get("/review/queue").json()["items"]
-    assert any(i["entry_id"] == "orphan_手工模型" and i["status"] == "pending_review"
+    assert any(i["entry_id"] == orphan_id and i["status"] == "pending_review"
                for i in queue)
-    version = next(i["entry_version"] for i in queue if i["entry_id"] == "orphan_手工模型")
-    client.post("/review/webchat/u1/orphan_手工模型/decision",
+    version = next(i["entry_version"] for i in queue if i["entry_id"] == orphan_id)
+    client.post(f"/review/webchat/u1/{orphan_id}/decision",
                 json={"decision": "confirm", "entry_version": version})
     row = conn.execute(
         "SELECT status, topic_new, degraded_reason FROM entries"
-        " WHERE id='orphan_手工模型'").fetchone()
+        " WHERE id=?", (orphan_id,)).fetchone()
     assert row["status"] == "orphan_topic" and row["topic_new"] == "手工模型"
     from pismor.pipeline.aggregator import run_daily
     stats = run_daily(conn, taxonomy, fake_llm, False, "2026-12-24T00:00:00+00:00")
     still = conn.execute(
-        "SELECT status FROM entries WHERE id='orphan_手工模型'").fetchone()
+        "SELECT status FROM entries WHERE id=?", (orphan_id,)).fetchone()
     assert still["status"] == "orphan_topic"  # 窗口内仅 1 行 → 保留等复现，启用链可用
     assert stats["dropped_orphan"] == 0
 
@@ -547,18 +560,16 @@ def test_decision_remove_deletes_entry_and_sources(client, conn):
 def test_decision_remove_clears_vectors(client, conn):
     # 复核中的行可能已有向量（如 active 被审计标记成 pending_review）；
     # remove 物理删条目时必须同时清 embeddings，否则留下指向不存在条目的残行
-    from pismor.core.keys import vec_key
-
     init_schema(conn, 4)  # 模拟启用向量库的部署（app 只在 embedding.enabled 时建表）
-    _seed_entry(conn, "preference", "style", "pending_review", "正式", "正式", 0.7)
-    key = vec_key("webchat", "u1", "preference", "style")
+    entry_id = _seed_entry(conn, "preference", "style", "pending_review", "正式", "正式", 0.7)
+    key = entry_id
     conn.execute(
         "INSERT INTO embeddings (entry_id, user_source, user_id, embedding) VALUES (?,?,?,?)",
         (key, "webchat", "u1", json.dumps([0.1, 0.2, 0.3, 0.4])))
     conn.commit()
     item = next(i for i in client.get("/review/queue").json()["items"]
-                if i["entry_id"] == "preference_style")
-    r = client.post("/review/webchat/u1/preference_style/decision",
+                if i["entry_id"] == entry_id)
+    r = client.post(f"/review/webchat/u1/{entry_id}/decision",
                     json={"decision": "remove", "entry_version": item["entry_version"]})
     assert r.status_code == 200
     n = conn.execute("SELECT COUNT(*) c FROM embeddings WHERE entry_id=?", (key,)).fetchone()["c"]
@@ -573,13 +584,15 @@ def test_pending_review_does_not_block_evolution(client, conn, fake_llm):
         quote="记住以后回复简洁")]}]
     client.post("/events", json=dict(CONV_EVENT, event_id="evt_p1",
                                      messages=[{"role": "user", "text": "记住以后回复简洁"}]))
-    main = conn.execute("SELECT status, body FROM entries WHERE topic='style'").fetchone()
-    pending = conn.execute("SELECT status, topic FROM entries WHERE status='pending_review'"
-                           ).fetchone()
+    main = conn.execute(
+        "SELECT status, body FROM entries WHERE topic='style' AND variant='normal'"
+        " AND status='active'").fetchone()
+    pending = conn.execute(
+        "SELECT id, status, topic, variant FROM entries WHERE variant='snapshot'").fetchone()
     assert main["status"] == "active" and main["body"] == "明确偏好简洁"
-    assert pending["topic"].startswith("!")
+    assert pending["topic"] == "style" and pending["variant"] == "snapshot"
     queue = client.get("/review/queue").json()["items"]
-    assert any(i["entry_id"] == "preference_!style" for i in queue)
+    assert any(i["entry_id"] == pending["id"] for i in queue)
 
 
 def test_illegal_transition_isolated_not_batch_rollback(conn, fake_settings, taxonomy,
@@ -658,14 +671,17 @@ def test_pending_snapshot_confirm_does_not_override_evolution(client, conn, fake
         quote="记住以后简洁")]}]
     client.post("/events", json=dict(CONV_EVENT, event_id="evt_snap",
                                      messages=[{"role": "user", "text": "记住以后简洁"}]))
+    pending_id = conn.execute(
+        "SELECT id FROM entries WHERE variant='snapshot'").fetchone()[0]
     item = next(i for i in client.get("/review/queue").json()["items"]
-                if i["entry_id"] == "preference_!style")
-    r = client.post("/review/webchat/u1/preference_!style/decision",
+                if i["entry_id"] == pending_id)
+    r = client.post(f"/review/webchat/u1/{pending_id}/decision",
                     json={"decision": "confirm", "entry_version": item["entry_version"]})
     assert r.status_code == 200 and r.json()["noop"] is False
     snap = conn.execute(
-        "SELECT status FROM entries WHERE topic='!style'").fetchone()
-    canon = conn.execute("SELECT status, body FROM entries WHERE topic='style'").fetchone()
+        "SELECT status FROM entries WHERE id=?", (pending_id,)).fetchone()
+    canon = conn.execute(
+        "SELECT status, body FROM entries WHERE topic='style' AND variant='normal'").fetchone()
     assert snap["status"] == "archived"
     assert canon["status"] == "active" and canon["body"] == "明确简洁"
 

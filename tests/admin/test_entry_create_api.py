@@ -14,7 +14,6 @@ from fastapi.testclient import TestClient
 from pismor.admin.deps import Principal
 from pismor.core.config import EmbeddingSettings, LLMSettings, Settings
 from pismor.core.db import get_conn
-from pismor.core.keys import vec_key
 from pismor.core.taxonomy import load_taxonomy
 from pismor.llm.embedder import EmbedUnavailable
 from pismor.pipeline import writer
@@ -92,16 +91,20 @@ def _insert_entry(
     conflict_with=None,
     confidence=0.9,
     updated_at=VERSION,
+    variant="normal",
+    variant_seq=0,
 ):
-    entry_id = f"{dimension}_{topic}"
+    entry_id = (f"{dimension}_{topic}" if variant == "normal"
+                else f"{dimension}_{topic}_{variant}")
     conn.execute(
         "INSERT INTO entries (user_source,user_id,dimension,topic,id,confidence,"
         "status,body,summary,created_at,updated_at,last_reinforced_at,degraded_reason,"
-        "superseded_by,topic_new,conflict_with,reinforcements,archived_at)"
-        " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        "superseded_by,topic_new,conflict_with,reinforcements,archived_at,"
+        "variant,variant_seq)"
+        " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (user_source, user_id, dimension, topic, entry_id, confidence, status,
          body, summary, updated_at, updated_at, updated_at, None, None, None,
-         conflict_with, 0, None),
+         conflict_with, 0, None, variant, variant_seq),
     )
     conn.commit()
     return entry_id
@@ -143,7 +146,8 @@ def test_create_201_persists_entry_source_and_audits(tmp_path):
     assert res.status_code == 201, res.text
     body = res.json()
     assert body["ok"] is True
-    assert body["id"] == "preference_verbosity"
+    eid = body["id"]
+    assert len(eid) == 32
     assert body["dimension"] == "preference"
     assert body["topic"] == "verbosity"
     assert body["status"] == "active"
@@ -154,10 +158,10 @@ def test_create_201_persists_entry_source_and_audits(tmp_path):
         assert run_audit(conn, taxonomy) == []
         row = conn.execute(
             "SELECT * FROM entries WHERE user_source='webchat' AND user_id='u1'"
-            " AND id='preference_verbosity'").fetchone()
+            " AND id=?", (eid,)).fetchone()
         assert row is not None and row["status"] == "active"
         src = conn.execute(
-            "SELECT * FROM sources WHERE entry_id='preference_verbosity'").fetchone()
+            "SELECT * FROM sources WHERE entry_id=?", (eid,)).fetchone()
         assert src is not None
         assert src["origin_type"] == "admin_manual"
         assert src["kind"] == "explicit"
@@ -184,9 +188,10 @@ def test_create_201_defaults_confidence_to_one(tmp_path):
     assert res.status_code == 201, res.text
     assert res.json()["confidence"] == 1.0
 
+    eid = res.json()["id"]
     with closing(get_conn(db_path)) as conn:
         row = conn.execute(
-            "SELECT confidence FROM entries WHERE id='preference_verbosity'").fetchone()
+            "SELECT confidence FROM entries WHERE id=?", (eid,)).fetchone()
         assert row is not None and row["confidence"] == 1.0
 
 
@@ -201,13 +206,11 @@ def test_create_201_with_vector_table_writes_embedding(tmp_path):
     res = client.post("/admin/api/entries", json=_create_payload())
     assert res.status_code == 201, res.text
     assert not any("向量化失败" in w for w in res.json()["warnings"])
+    eid = res.json()["id"]
     with closing(get_conn(db_path)) as conn:
         assert conn.execute(
-            "SELECT 1 FROM embeddings WHERE entry_id=?",
-            (vec_key("webchat", "u1", "preference", "verbosity"),),
-        ).fetchone() is not None
-        assert writer.entry_has_vector(
-            conn, vec_key("webchat", "u1", "preference", "verbosity")) is True
+            "SELECT 1 FROM embeddings WHERE entry_id=?", (eid,)).fetchone() is not None
+        assert writer.entry_has_vector(conn, eid) is True
 
 
 def test_create_201_vector_failure_kept_entry_with_warning(tmp_path):
@@ -217,13 +220,12 @@ def test_create_201_vector_failure_kept_entry_with_warning(tmp_path):
     assert res.status_code == 201, res.text
     warnings = res.json()["warnings"]
     assert any("向量化失败" in w for w in warnings)
+    eid = res.json()["id"]
     with closing(get_conn(db_path)) as conn:
-        row = conn.execute(
-            "SELECT id FROM entries WHERE id='preference_verbosity'").fetchone()
+        row = conn.execute("SELECT id FROM entries WHERE id=?", (eid,)).fetchone()
         assert row is not None
-        # 条目在、向量行缺失（embeddings.entry_id 存 vec_key 四元组键）
-        assert writer.entry_has_vector(
-            conn, vec_key("webchat", "u1", "preference", "verbosity")) is False
+        # 条目在、向量行缺失（embeddings.entry_id 直接存 entries.id）
+        assert writer.entry_has_vector(conn, eid) is False
 
 
 def test_create_201_without_vector_table_has_no_vector_warning(tmp_path):
@@ -242,11 +244,12 @@ def test_create_201_without_vector_table_has_no_vector_warning(tmp_path):
 def test_create_201_same_topic_taboo_wins_and_degrades(tmp_path):
     app, client, db_path = _make_app(tmp_path)
     with closing(get_conn(db_path)) as conn:
-        _insert_entry(conn, dimension="taboo", topic="verbosity", status="active")
+        tid = _insert_entry(conn, dimension="taboo", topic="verbosity", status="active")
 
     res = client.post("/admin/api/entries", json=_create_payload())
     assert res.status_code == 201, res.text
     body = res.json()
+    eid = body["id"]
     assert body["status"] == "degraded"
     assert body["confidence"] == 0.8 * 0.8
     assert any("降级" in w for w in body["warnings"])
@@ -254,13 +257,13 @@ def test_create_201_same_topic_taboo_wins_and_degrades(tmp_path):
     with closing(get_conn(db_path)) as conn:
         row = conn.execute(
             "SELECT status, degraded_reason, conflict_with FROM entries"
-            " WHERE id='preference_verbosity'").fetchone()
+            " WHERE id=?", (eid,)).fetchone()
         assert row["status"] == "degraded"
         assert row["degraded_reason"] == "conflict_lost"
-        assert json.loads(row["conflict_with"]) == ["taboo_verbosity"]
+        assert json.loads(row["conflict_with"]) == [tid]
         taboo = conn.execute(
-            "SELECT conflict_with FROM entries WHERE id='taboo_verbosity'").fetchone()
-        assert json.loads(taboo["conflict_with"]) == ["preference_verbosity"]
+            "SELECT conflict_with FROM entries WHERE id=?", (tid,)).fetchone()
+        assert json.loads(taboo["conflict_with"]) == [eid]
 
 
 # ---------------------------------------------------------------------------
@@ -268,29 +271,31 @@ def test_create_201_same_topic_taboo_wins_and_degrades(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_create_201_near_taboo_conflict_dedupes_with_plus_topic(tmp_path):
+def test_create_201_near_taboo_conflict_writes_conflict_variant(tmp_path):
     app, client, db_path = _make_app(tmp_path)
     with closing(get_conn(db_path)) as conn:
-        _insert_entry(conn, dimension="taboo", topic="output_format", status="active")
+        tid = _insert_entry(conn, dimension="taboo", topic="output_format", status="active")
 
     res = client.post(
         "/admin/api/entries", json=_create_payload(topic="format"))
     assert res.status_code == 201, res.text
     body = res.json()
-    # 接口返回实际落库 topic（+ 变形）
-    assert body["topic"] == "+format"
+    eid = body["id"]
+    # 接口返回基础 topic；冲突以 variant=conflict 表达
+    assert body["topic"] == "format"
     assert body["status"] == "degraded"
 
     with closing(get_conn(db_path)) as conn:
         new_row = conn.execute(
             "SELECT id, status, conflict_with FROM entries"
-            " WHERE dimension='preference' AND topic='+format'").fetchone()
+            " WHERE dimension='preference' AND topic='format' AND variant='conflict'"
+        ).fetchone()
         assert new_row is not None
         assert new_row["status"] == "degraded"
-        assert json.loads(new_row["conflict_with"]) == ["taboo_output_format"]
+        assert json.loads(new_row["conflict_with"]) == [tid]
         taboo = conn.execute(
-            "SELECT conflict_with FROM entries WHERE id='taboo_output_format'").fetchone()
-        assert json.loads(taboo["conflict_with"]) == ["preference_+format"]
+            "SELECT conflict_with FROM entries WHERE id=?", (tid,)).fetchone()
+        assert json.loads(taboo["conflict_with"]) == [eid]
 
 
 # ---------------------------------------------------------------------------
@@ -301,15 +306,15 @@ def test_create_201_near_taboo_conflict_dedupes_with_plus_topic(tmp_path):
 
 
 def test_create_201_neighbor_llm_conflict_marks_counterpart(tmp_path):
+    app, client, db_path = _make_app(tmp_path)
+    with closing(get_conn(db_path)) as conn:
+        vid = _insert_entry(conn, dimension="preference", topic="verbosity", status="active")
     llm = ScriptedLLM("neighbor_conflict", {
         "conflict": True,
-        "conflicting_with": "preference_verbosity",
+        "conflicting_with": vid,
         "reason": "与既有偏好互相矛盾",
     })
-    app, client, db_path = _make_app(tmp_path)
     app.state.llm = llm
-    with closing(get_conn(db_path)) as conn:
-        _insert_entry(conn, dimension="preference", topic="verbosity", status="active")
 
     # 候选 taboo 维度（quote 须含否定词）；对端 preference 行由 LLM 指认
     res = client.post("/admin/api/entries", json=_create_payload(
@@ -317,21 +322,22 @@ def test_create_201_neighbor_llm_conflict_marks_counterpart(tmp_path):
     assert res.status_code == 201, res.text
     body = res.json()
     assert llm.calls == ["neighbor_conflict"]
-    assert body["topic"] == "+action"  # CONFLICT 双存 + 变形
+    assert body["topic"] == "action"  # CONFLICT 双存，variant=conflict
     assert body["status"] == "active"  # taboo 侧恒胜不降
 
     with closing(get_conn(db_path)) as conn:
         # target 对端行被降级（degraded ×0.8）
         old = conn.execute(
             "SELECT status, confidence, degraded_reason, conflict_with FROM entries"
-            " WHERE id='preference_verbosity'").fetchone()
+            " WHERE id=?", (vid,)).fetchone()
         assert old["status"] == "degraded"
         assert old["degraded_reason"] == "conflict_lost"
         assert old["confidence"] == 0.9 * 0.8
-        assert json.loads(old["conflict_with"]) == ["taboo_+action"]
+        assert json.loads(old["conflict_with"]) == [body["id"]]
         new_row = conn.execute(
-            "SELECT conflict_with FROM entries WHERE id='taboo_+action'").fetchone()
-        assert json.loads(new_row["conflict_with"]) == ["preference_verbosity"]
+            "SELECT conflict_with FROM entries WHERE topic='action' AND variant='conflict'"
+        ).fetchone()
+        assert json.loads(new_row["conflict_with"]) == [vid]
 
 
 # ---------------------------------------------------------------------------
@@ -375,7 +381,7 @@ def test_create_identity_dimension_not_affected_by_llm_none(tmp_path):
         dimension="identity", topic="name",
         summary="称呼", body="用户名叫小明", quote="我叫小明"))
     assert res.status_code == 201, res.text
-    assert res.json()["id"] == "identity_name"
+    assert len(res.json()["id"]) == 32
 
 
 # ---------------------------------------------------------------------------

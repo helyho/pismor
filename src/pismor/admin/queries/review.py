@@ -6,7 +6,7 @@ import sqlite3
 QUEUE_CONDITION = (
     "NOT EXISTS (SELECT 1 FROM tombstones t"
     " WHERE t.user_source=entries.user_source AND t.user_id=entries.user_id)"
-    " AND (status='pending_review' OR (topic LIKE '+%' AND status IN ('active','degraded')"
+    " AND (status='pending_review' OR (variant='conflict' AND status IN ('active','degraded')"
     " AND conflict_with IS NOT NULL))"
 )
 
@@ -63,7 +63,7 @@ def list_queue(
     sort = "DESC" if order == "newest" else "ASC"
     rows = conn.execute(
         "SELECT id AS entry_id, user_source, user_id, dimension, topic, summary,"
-        f" confidence, status, updated_at AS entry_version, degraded_reason AS note"
+        f" confidence, status, variant, updated_at AS entry_version, degraded_reason AS note"
         f" FROM entries WHERE {where}"
         f" ORDER BY updated_at {sort}, rowid {sort} LIMIT ? OFFSET ?",
         (*params, page_size, (page - 1) * page_size),

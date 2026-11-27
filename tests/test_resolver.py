@@ -48,14 +48,19 @@ def conn_db(conn):
 
 @pytest.fixture
 def seeded(conn):
-    def _seed(dimension, topic, body="旧条目正文"):
+    def _seed(dimension, topic, body="旧条目正文", *, variant="normal", status="active",
+              degraded_reason=None, archived_at=None):
         ts = "2026-11-01T00:00:00+08:00"
+        entry_id = f"{dimension}_{topic}_{variant}"
         conn.execute(
-            "INSERT INTO entries (user_source,user_id,dimension,topic,id,confidence,status,"
-            "body,summary,created_at,updated_at,last_reinforced_at)"
-            " VALUES ('w','u',?,?,?,?,'active',?,'旧摘要',?,?,?)",
-            (dimension, topic, f"{dimension}_{topic}", 0.8, body, ts, ts, ts))
+            "INSERT INTO entries (user_source,user_id,dimension,topic,id,variant,variant_seq,"
+            "confidence,status,body,summary,created_at,updated_at,last_reinforced_at,"
+            "degraded_reason,archived_at)"
+            " VALUES ('w','u',?,?,?,?,0,0.8,?,?,'旧摘要',?,?,?,?,?)",
+            (dimension, topic, entry_id, variant, status, body, ts, ts, ts,
+             degraded_reason, archived_at))
         conn.commit()
+        return entry_id
     return _seed
 
 
@@ -163,8 +168,8 @@ def test_neighbor_conflict_hallucinated_id_falls_back_to_add(conn, seeded):
 
 def test_neighbor_conflict_with_matching_id(conn, seeded):
     # 近邻路径回归：指认匹配现存近邻 id → 照常 CONFLICT
-    seeded("taboo", "style")
-    llm = ScriptedLLM({"conflict": True, "conflicting_with": "taboo_style"})
+    sid = seeded("taboo", "style")
+    llm = ScriptedLLM({"conflict": True, "conflicting_with": sid})
     actions = resolve(conn, "w", "u", [cand("preference", "color")], llm)
     assert actions[0]["op"] == "CONFLICT"
 
@@ -180,9 +185,10 @@ def test_neighbor_candidates_queries_peer_dim(conn, taxonomy, seeded):
     # 候选查询抽出后的过滤口径：对端维度 active 规范行命中；archived / 带前缀变形不命中
     seeded("taboo", "style")
     seeded("taboo", "gone")           # 将改为 archived
-    seeded("taboo", "~tilde_deform")  # ~ 变形（矛盾双存行）
-    seeded("taboo", "+plus_deform")   # + 变形
-    seeded("taboo", "!bang_deform")   # ! 变形
+    seeded("taboo", "tilde_deform", variant="trace", status="archived",
+           degraded_reason="superseded", archived_at="2026-11-01T00:00:00+08:00")
+    seeded("taboo", "plus_deform", variant="conflict")
+    seeded("taboo", "bang_deform", variant="snapshot", status="pending_review")
     conn.execute("UPDATE entries SET status='archived',"
                  " archived_at='2026-11-01T00:00:00+08:00' WHERE topic='gone'")
     conn.commit()

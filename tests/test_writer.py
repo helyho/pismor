@@ -4,7 +4,6 @@ import json
 import pytest
 
 from pismor.llm.embedder import EmbedUnavailable
-from pismor.core.keys import vec_key
 from pismor.pipeline.writer import IllegalTransition, apply_actions
 
 NOW = "2026-11-24T00:00:00+08:00"
@@ -92,25 +91,25 @@ def seeded_archived(conn):
 
 def test_add_writes_entry_and_sources(conn, embedder_stub):
     apply_actions(conn, "w", "u", [add_action()], embedder_stub, "conversation", "s1:1", NOW)
-    row = conn.execute("SELECT * FROM entries").fetchone()
-    assert row["status"] == "active" and row["id"] == "preference_lang"
+    row = conn.execute("SELECT * FROM entries WHERE variant='normal'").fetchone()
+    assert row["status"] == "active" and row["topic"] == "lang" and len(row["id"]) == 32
     assert row["last_reinforced_at"] == NOW and row["reinforcements"] == 0
     assert conn.execute("SELECT COUNT(*) c FROM sources").fetchone()["c"] == 1
     src = conn.execute("SELECT * FROM sources").fetchone()
     # sources.entry_id 即 entries.id 行键（{dimension}_{topic}），可直接归属与 JOIN
     assert (src["entry_id"], src["origin_type"], src["origin_ref"], src["kind"]) == \
-        ("preference_lang", "conversation", "s1:1", "explicit")
+        (row["id"], "conversation", "s1:1", "explicit")
 
 
 def test_update_archives_old(conn, embedder_stub, seeded_active):
     apply_actions(conn, "w", "u", [update_action("preference", "lang")],
                   embedder_stub, "text", "e1", NOW)
     # 轨迹行（topic 加 "~" 前缀+时间戳序号）：旧行完整内容 archived，superseded_by 指向新行 id
-    sup = conn.execute("SELECT * FROM entries WHERE topic LIKE '~lang:%'").fetchone()
+    sup = conn.execute("SELECT * FROM entries WHERE variant='trace'").fetchone()
     assert sup["status"] == "archived" and sup["superseded_by"] == "preference_lang"
     assert sup["archived_at"] == NOW and sup["body"] == "旧值"
     # 原行同 key 覆盖为新值 active（bi-temporal 旧值由轨迹行承载）
-    cur = conn.execute("SELECT * FROM entries WHERE topic='lang'").fetchone()
+    cur = conn.execute("SELECT * FROM entries WHERE topic='lang' AND variant='normal'").fetchone()
     assert cur["status"] == "active" and cur["body"] == "新值"
     assert cur["last_reinforced_at"] == NOW and cur["superseded_by"] is None
 
@@ -124,8 +123,9 @@ def test_update_copies_sources_to_superseded_row(conn, embedder_stub, seeded_act
     conn.commit()
     apply_actions(conn, "w", "u", [update_action("preference", "lang")],
                   embedder_stub, "text", "e1", NOW)
+    trace = conn.execute("SELECT id FROM entries WHERE variant='trace'").fetchone()
     sup_srcs = conn.execute(
-        "SELECT * FROM sources WHERE entry_id LIKE 'preference_~lang:%' ORDER BY origin_ref").fetchall()
+        "SELECT * FROM sources WHERE entry_id=? ORDER BY origin_ref", (trace["id"],)).fetchall()
     assert [(s["origin_type"], s["origin_ref"], s["quote"]) for s in sup_srcs] == \
         [("text", "doc:2", "旧证据"), ("conversation", "s1:1", "旧证据")]
     cur_srcs = conn.execute(
@@ -137,8 +137,8 @@ def test_update_copies_sources_to_superseded_row(conn, embedder_stub, seeded_act
 def test_conflict_symmetric(conn, embedder_stub, seeded_active):
     apply_actions(conn, "w", "u", [conflict_action("preference", "lang")],
                   embedder_stub, "text", "e1", NOW)
-    old = conn.execute("SELECT * FROM entries WHERE topic='lang'").fetchone()
-    new = conn.execute("SELECT * FROM entries WHERE topic='+lang'").fetchone()
+    old = conn.execute("SELECT * FROM entries WHERE topic='lang' AND variant='normal'").fetchone()
+    new = conn.execute("SELECT * FROM entries WHERE topic='lang' AND variant='conflict'").fetchone()
     # Review Focus #4：对称互标（裸 id 标记，C-1）
     assert new["id"] in json.loads(old["conflict_with"])
     assert old["id"] in json.loads(new["conflict_with"])
@@ -186,9 +186,9 @@ def test_confidence_at_threshold_revives_degraded(conn, embedder_stub):
     action = update_action("preference", "lang")
     action["candidate"]["confidence"] = 0.85
     apply_actions(conn, "w", "u", [action], embedder_stub, "conversation", "s1:1", NOW)
-    row = conn.execute("SELECT * FROM entries WHERE topic='lang'").fetchone()
+    row = conn.execute("SELECT * FROM entries WHERE topic='lang' AND variant='normal'").fetchone()
     assert row["status"] == "active" and row["body"] == "新值"
-    assert conn.execute("SELECT COUNT(*) c FROM entries WHERE topic LIKE '~lang:%'").fetchone()["c"] == 1
+    assert conn.execute("SELECT COUNT(*) c FROM entries WHERE variant='trace'").fetchone()["c"] == 1
     assert conn.execute("SELECT COUNT(*) c FROM review_history").fetchone()["c"] == 0
 
 
@@ -231,8 +231,8 @@ def test_embed_written_when_table_exists(conn, embedder_stub):
     conn.execute("CREATE VIRTUAL TABLE embeddings USING vec0("
                  "entry_id TEXT PRIMARY KEY, user_source TEXT, user_id TEXT, embedding float[4])")
     apply_actions(conn, "w", "u", [add_action()], embedder_stub, "text", "e1", NOW)
-    assert conn.execute("SELECT entry_id FROM embeddings").fetchone()["entry_id"] == \
-        vec_key("w", "u", "preference", "lang")
+    row = conn.execute("SELECT id FROM entries WHERE variant='normal'").fetchone()
+    assert conn.execute("SELECT entry_id FROM embeddings").fetchone()["entry_id"] == row["id"]
 
 
 def test_update_refreshes_vector(conn, embedder_stub):
@@ -241,9 +241,9 @@ def test_update_refreshes_vector(conn, embedder_stub):
     apply_actions(conn, "w", "u", [add_action()], embedder_stub, "text", "e1", NOW)
     apply_actions(conn, "w", "u", [update_action("preference", "lang")],
                   embedder_stub, "text", "e2", NOW)
+    row = conn.execute("SELECT id FROM entries WHERE variant='normal'").fetchone()
     rows = conn.execute("SELECT entry_id FROM embeddings").fetchall()
-    assert [r["entry_id"] for r in rows] == \
-        [vec_key("w", "u", "preference", "lang")]  # 同四元组覆盖，不重复
+    assert [r["entry_id"] for r in rows] == [row["id"]]  # 同一条目覆盖，不重复
 
 
 def test_orphan_goes_pending(conn, embedder_stub):
@@ -296,8 +296,8 @@ def test_conflict_with_taboo_taboo_unmoved(conn, embedder_stub):
     apply_actions(conn, "w", "u", [conflict_action("preference", "lang")],
                   embedder_stub, "text", "e1", NOW)
     taboo = conn.execute("SELECT * FROM entries WHERE dimension='taboo'").fetchone()
-    pref_old = conn.execute("SELECT * FROM entries WHERE dimension='preference' AND topic='lang'").fetchone()
-    pref_new = conn.execute("SELECT * FROM entries WHERE topic='+lang'").fetchone()
+    pref_old = conn.execute("SELECT * FROM entries WHERE dimension='preference' AND topic='lang' AND variant='normal'").fetchone()
+    pref_new = conn.execute("SELECT * FROM entries WHERE topic='lang' AND variant='conflict'").fetchone()
     assert pref_new["status"] == "degraded" and pref_new["degraded_reason"] == "conflict_lost"
     new_marks = json.loads(pref_new["conflict_with"])
     assert taboo["id"] in new_marks
@@ -324,10 +324,10 @@ def test_update_twice_creates_distinct_superseded_rows(conn, embedder_stub, seed
     second["candidate"]["body"] = "最新值"
     apply_actions(conn, "w", "u", [second], embedder_stub, "text", "e2", NOW)
     sups = conn.execute(
-        "SELECT topic, body FROM entries WHERE topic LIKE '~lang:%' ORDER BY topic").fetchall()
+        "SELECT topic, body FROM entries WHERE variant='trace' ORDER BY variant_seq").fetchall()
     assert len(sups) == 2
     assert sups[0]["body"] == "旧值" and sups[1]["body"] == "新值"  # 各版本各归其档
-    cur = conn.execute("SELECT * FROM entries WHERE topic='lang'").fetchone()
+    cur = conn.execute("SELECT * FROM entries WHERE topic='lang' AND variant='normal'").fetchone()
     assert cur["status"] == "active" and cur["body"] == "最新值"
 
 
@@ -335,14 +335,16 @@ def test_update_twice_creates_distinct_superseded_rows(conn, embedder_stub, seed
 
 def _seed_row(conn, *, dim="preference", topic="lang", status="active",
               body="旧值", conflict_with=None, updated=NOW, archived_at=None,
-              degrad="conflict_lost"):
-    entry_id = f"{dim}_{topic}"
+              degrad="conflict_lost", variant="normal", variant_seq=0):
+    entry_id = f"{dim}_{topic}" if variant == "normal" else f"{dim}_{topic}_{variant}"
     conn.execute(
-        "INSERT INTO entries (user_source,user_id,dimension,topic,id,confidence,status,"
+        "INSERT INTO entries (user_source,user_id,dimension,topic,id,variant,variant_seq,"
+        "confidence,status,"
         "body,summary,created_at,updated_at,last_reinforced_at,degraded_reason,conflict_with,"
-        "archived_at) VALUES ('w','u',?,?,?,0.7,?,?,?,?,?,?,?,?,?)",
-        (dim, topic, entry_id, status, body, body[:20], "2026-01-01", updated,
-         "2026-01-01", degrad if status == "degraded" else None, conflict_with, archived_at))
+        "archived_at) VALUES ('w','u',?,?,?,?,?,0.7,?,?,?,?,?,?,?,?,?)",
+        (dim, topic, entry_id, variant, variant_seq, status, body, body[:20],
+         "2026-01-01", updated, "2026-01-01",
+         degrad if status == "degraded" else None, conflict_with, archived_at))
     conn.execute(
         "INSERT INTO sources (entry_id,user_source,user_id,origin_type,origin_ref,quote,kind)"
         " VALUES (?,'w','u','text','seed','原话','explicit')",
@@ -373,7 +375,7 @@ def test_normal_update_does_not_revive_opponent(conn):
     # M-1：普通演进 UPDATE 只清 conflict_with，不复活冲突对方
     _seed_row(conn, topic="lang",
               conflict_with=json.dumps(["preference_+lang"]))
-    _seed_row(conn, topic="+lang", status="degraded",
+    _seed_row(conn, topic="lang", status="degraded", variant="conflict", variant_seq=1,
               body="相反偏好", conflict_with=json.dumps(["preference_lang"]))
     # 用真实写路径（apply_actions 需要 embedder，传最小 stub）
     class E:
@@ -381,8 +383,8 @@ def test_normal_update_does_not_revive_opponent(conn):
             return [[0.1] * 4 for _ in texts]
     apply_actions(conn, "w", "u", [update_action("preference", "lang")], E(),
                   "text", "e2", NOW)
-    main = conn.execute("SELECT status, conflict_with FROM entries WHERE topic='lang'").fetchone()
-    plus = conn.execute("SELECT status, degraded_reason FROM entries WHERE topic='+lang'").fetchone()
+    main = conn.execute("SELECT status, conflict_with FROM entries WHERE topic='lang' AND variant='normal'").fetchone()
+    plus = conn.execute("SELECT status, degraded_reason FROM entries WHERE topic='lang' AND variant='conflict'").fetchone()
     assert main["status"] == "active" and main["conflict_with"] is None
     assert plus["status"] == "degraded" and plus["degraded_reason"] == "conflict_lost"
 
@@ -419,11 +421,11 @@ def test_pending_review_row_evolves_without_blocking(conn):
             return [[0.1] * 4 for _ in texts]
     apply_actions(conn, "w", "u", [update_action("preference", "style")], E(),
                   "text", "e2", NOW)
-    main = conn.execute("SELECT status, body FROM entries WHERE topic='style'").fetchone()
+    main = conn.execute("SELECT status, body FROM entries WHERE topic='style' AND variant='normal'").fetchone()
     pending = conn.execute(
-        "SELECT status, topic FROM entries WHERE status='pending_review'").fetchone()
+        "SELECT status, topic, variant FROM entries WHERE status='pending_review'").fetchone()
     assert main["status"] == "active" and main["body"] == "新值"
-    assert pending is not None and pending["topic"].startswith("!")
+    assert pending is not None and pending["variant"] == "snapshot"
     assert conn.execute("SELECT COUNT(*) c FROM entries").fetchone()["c"] == 2
 
 
@@ -436,7 +438,8 @@ def test_vector_rows_keyed_by_four_tuple_and_sqlite_error_degrades(conn):
     apply_actions(conn, "w", "u", [add_action("preference", "lang")],
                   E(), "text", "e1", NOW)
     keys = {r["entry_id"] for r in conn.execute("SELECT entry_id FROM embeddings").fetchall()}
-    assert keys == {vec_key("w", "u", "preference", "lang")}
+    row = conn.execute("SELECT id FROM entries WHERE topic='lang' AND variant='normal'").fetchone()
+    assert keys == {row["id"]}
     # 维度配置错：vec 插入抛 sqlite 错误 → 条目照写、不抛出（spec §20）
     class WrongDim:
         def embed(self, texts):
@@ -448,10 +451,10 @@ def test_vector_rows_keyed_by_four_tuple_and_sqlite_error_degrades(conn):
 
 
 def test_entry_id_is_row_key_matching_sources(conn, embedder_stub):
-    """entries.id 与 sources.entry_id 同为行键 {dim}_{topic}，可直接 JOIN。"""
+    """entries.id 是稳定行键，sources.entry_id 直接引用它，可直接 JOIN。"""
     apply_actions(conn, "w", "u", [add_action()], embedder_stub, "conversation", "s1:1", NOW)
     row = conn.execute("SELECT id FROM entries").fetchone()
-    assert row["id"] == "preference_lang"
+    assert len(row["id"]) == 32
     src = conn.execute("SELECT entry_id FROM sources").fetchone()
     assert src["entry_id"] == row["id"]
     hit = conn.execute(
@@ -515,7 +518,7 @@ def test_release_pending_redirects_dangling_marks(conn):
     apply_actions(conn, "w", "u", [update_action("preference", "style")], E(),
                   "text", "e2", NOW)
     row = conn.execute("SELECT conflict_with FROM entries WHERE topic='tone'").fetchone()
-    assert json.loads(row["conflict_with"]) == ["preference_!style"]
+    assert json.loads(row["conflict_with"]) == ["preference_style"]
 
 
 def test_apply_actions_returns_only_written_actions(conn):
@@ -578,15 +581,16 @@ def test_superseded_seq_not_reused_after_merge_deletion(conn, embedder_stub, see
                   embedder_stub, "conversation", "s1:1", NOW)  # 轨迹 :1
     apply_actions(conn, "w", "u", [update_action("preference", "lang")],
                   embedder_stub, "conversation", "s1:2", NOW)  # 轨迹 :2
-    conn.execute("DELETE FROM entries WHERE topic='~lang:20261124T000000:1'")
+    trace1 = conn.execute(
+        "SELECT id FROM entries WHERE variant='trace' AND variant_seq=1").fetchone()
+    conn.execute("DELETE FROM entries WHERE id=?", (trace1["id"],))
     conn.commit()
     # 剩余轨迹仅 :2；修复前 COUNT=1 → seq=2 撞主键 IntegrityError，修复后 seq=3
     apply_actions(conn, "w", "u", [update_action("preference", "lang")],
                   embedder_stub, "conversation", "s1:3", NOW)
-    topics = [r["topic"] for r in conn.execute(
-        "SELECT topic FROM entries WHERE topic LIKE '~lang:%'").fetchall()]
-    assert "~lang:20261124T000000:3" in topics
-    assert "~lang:20261124T000000:2" in topics
+    seqs = {r["variant_seq"] for r in conn.execute(
+        "SELECT variant_seq FROM entries WHERE variant='trace'").fetchall()}
+    assert seqs == {2, 3}
 
 
 def test_conflict_degradation_refreshes_reinforced_at(conn, embedder_stub, seeded_active):

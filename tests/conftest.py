@@ -1,4 +1,6 @@
 from pathlib import Path
+import shutil
+
 import pytest
 from pismor.core.db import get_conn, init_schema
 from pismor.core.taxonomy import load_taxonomy
@@ -14,8 +16,10 @@ def conn(tmp_path):
 
 
 @pytest.fixture
-def taxonomy():
-    return load_taxonomy(REPO / "config" / "taxonomy.yaml")
+def taxonomy(tmp_path):
+    dst = tmp_path / "taxonomy.yaml"
+    shutil.copy(REPO / "config" / "taxonomy.yaml", dst)
+    return load_taxonomy(dst)
 
 
 class ScriptedLLM:

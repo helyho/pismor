@@ -16,14 +16,12 @@
 """
 import json
 
-from pismor.core.config_files import (
-    ConfigVersionConflict,
-    dump_yaml,
-    read_yaml,
-    write_config,
-)
 from pismor.core.keys import entry_key
-from pismor.core.taxonomy import load_taxonomy
+from pismor.core.taxonomy_edit import (
+    flush_taxonomy_edits,
+    plan_topic_alias,
+    revert_taxonomy_edits,
+)
 
 
 _ALIVE = (
@@ -53,16 +51,23 @@ def run_daily(conn, taxonomy, llm, auto_activate: bool, now: str, *,
               on_taxonomy_updated=None) -> dict:
     """跑全部日批扫描，返回统计计数。衰减阈值可由 settings.aggregator 配置。
 
-    整轮单事务（含澄清过期，故 expire 传 commit=False）；taxonomy 追加先改内存（同轮后续组
-    需要看到新 topic），yaml 落盘推迟到提交成功之后——事务回滚时文件与内存都不留痕。
+    三段式（F17）：阶段1 只读收集孤儿处置计划、阶段2 无锁调 LLM 归并判定——两者都
+    不持有写事务，LLM 慢/超时不再阻塞 serving 写路径；LLM 失败直接冒泡，本轮零写入。
+    阶段3 单写事务完成全部落库（含澄清过期，故 expire 传 commit=False）；taxonomy
+    追加先改内存（同轮后续组需要看到新 topic），yaml 落盘推迟到提交成功之后——
+    事务回滚时文件与内存都不留痕。组行以阶段1 快照参与判定：应用时行已被并发
+    删除/改键，则按主键 WHERE 自然落空。
     """
     stats = {"activated": 0, "merged": 0, "decayed": 0, "archived": 0,
              "dropped_review": 0, "expired_clarifications": 0, "dropped_orphan": 0,
              "merge_tasks": 0}
     appends: list[dict] = []
+    plans, drop_plans = _collect_orphan_plans(conn, taxonomy, now)
+    _judge_orphan_plans(llm, taxonomy, plans)  # 阶段2：无锁 LLM 判定，异常冒泡=零写入
     try:
         with conn:
-            _activate_orphans(conn, taxonomy, llm, auto_activate, now, stats, appends)
+            _apply_orphan_plans(conn, taxonomy, auto_activate, now, stats, appends,
+                                plans, drop_plans)
             stats["merge_tasks"] = _open_merge_tasks(
                 conn, taxonomy, now, taboo_merge_threshold)
             stats["decayed"] = _decay(conn, now, degrade_days, degrade_confidence)
@@ -71,9 +76,9 @@ def run_daily(conn, taxonomy, llm, auto_activate: bool, now: str, *,
             from pismor.pipeline.clarifier import expire
             stats["expired_clarifications"] = expire(conn, now, commit=False)
     except Exception:
-        _revert_taxonomy(taxonomy, appends)
+        revert_taxonomy_edits(taxonomy, appends)
         raise
-    new_taxonomy = _flush_taxonomy(
+    new_taxonomy = flush_taxonomy_edits(
         taxonomy,
         appends,
         backup_root=taxonomy_backup_root,
@@ -103,63 +108,120 @@ def _group_rows(conn, topic_new):
         (topic_new,)).fetchall()
 
 
-def _activate_orphans(conn, taxonomy, llm, auto_activate, now, stats, appends):
+def _dimension_block(taxonomy, extra_new: dict[str, set[str]] | None = None) -> str:
+    """词表块文本；extra_new 把本轮已判定的 new_topic 并入展示（同轮后续组可见，保原语义）。"""
+    lines = []
+    for d in taxonomy.dimensions.values():
+        disabled = getattr(d, "disabled_topics", None) or []
+        topics = [t for t in d.topics if t not in disabled]
+        if extra_new:
+            for t in sorted(extra_new.get(d.key, ())):
+                if t not in topics:
+                    topics.append(t)
+        lines.append(f"- {d.key}({d.name}): " + ", ".join(topics))
+    return "\n".join(lines)
+
+
+def _collect_orphan_plans(conn, taxonomy, now):
+    """阶段1（只读）：观察区分组收集处置计划，不写库不调 LLM。
+
+    返回 (plans, drop_plans)。plans 每项 {"topic_new", "rows", ...} 进 LLM 判定
+    （taboo 组标 taboo_queue，直接进人工队列不判定）；drop_plans 是窗口零复现组。
+    """
     activate_groups, drop_groups = _fetch_groups(conn, now)
+    drop_plans = []
     for topic_new in drop_groups:
         rows = _group_rows(conn, topic_new)
-        if any(r["dimension"] == "taboo" for r in rows):
-            _queue_audit(conn, rows, now, note=f"taboo_orphan_expired: {topic_new}")
-            continue  # taboo 词表外候选禁自动处置（不废弃、不建桶）
-        _physically_drop(conn, rows)
-        stats["dropped_orphan"] += len(rows)
+        drop_plans.append({"topic_new": topic_new, "rows": rows,
+                           "taboo": any(r["dimension"] == "taboo" for r in rows)})
+    plans = []
     for topic_new in activate_groups:
         rows = _group_rows(conn, topic_new)
         if any(r["dimension"] == "taboo" for r in rows):
-            _queue_audit(conn, rows, now, note=f"taboo_orphan: {topic_new}")
+            plans.append({"topic_new": topic_new, "rows": rows, "taboo_queue": True})
             continue
         if _already_queued(conn, rows):
             continue  # 条目状态没变且已进人工队列：不重复判定、不重复堆审计行
-        block = "\n".join(
-            f"- {d.key}({d.name}): "
-            f"{', '.join(t for t in d.topics if t not in (getattr(d, 'disabled_topics', None) or []))}"
-            for d in taxonomy.dimensions.values()
-        )
-        summaries = "；".join(f"{r['summary']}" for r in rows[:5])
-        decision = llm.chat_json(ORPHAN_MERGE_SYSTEM, ORPHAN_MERGE_USER.format(
-            topic_new=topic_new, summaries=summaries, dimension_block=block), _MERGE_SCHEMA)
-        action = decision.get("action") or ""
-        is_merge = action == "merge_to" or action.startswith("merge_to:")  # 兼容 merge_to:<topic> 字面格式
-        is_new = action == "new_topic"
-        dim, topic = decision.get("dimension"), decision.get("topic")
-        if is_merge and not topic:
-            topic = action.split(":", 1)[1]
-        # 校验链（I1 修复）：action 白名单 → dimension 合法 → merge_to 目标必须在词表内
-        #（schema 是服务端软约束，本地不校验则词表外 merge_to 在 auto_activate=False 下绕过人工队列）
-        if (not is_merge and not is_new) or not dim or not topic or dim not in taxonomy.dimensions:
-            _queue_audit(conn, rows, now, note=f"invalid_decision: {decision}")
+        plans.append({"topic_new": topic_new, "rows": rows,
+                      "summaries": "；".join(f"{r['summary']}" for r in rows[:5])})
+    return plans, drop_plans
+
+
+def _judge_orphan_plans(llm, taxonomy, plans):
+    """阶段2（无锁）：逐组调 LLM 归并判定，decision 写回 plan；异常冒泡=本轮零写入。"""
+    seen_new: dict[str, set[str]] = {}
+    for p in plans:
+        if p.get("taboo_queue"):
             continue
-        if topic in (getattr(taxonomy.dimensions[dim], "disabled_topics", None) or []):
-            _queue_audit(conn, rows, now, note=f"disabled_topic: {dim}/{topic}")
+        p["decision"] = llm.chat_json(
+            ORPHAN_MERGE_SYSTEM,
+            ORPHAN_MERGE_USER.format(topic_new=p["topic_new"], summaries=p["summaries"],
+                                     dimension_block=_dimension_block(taxonomy, seen_new)),
+            _MERGE_SCHEMA)
+        decision = p["decision"]
+        if (decision.get("action") == "new_topic" and decision.get("dimension")
+                and decision.get("topic")):
+            seen_new.setdefault(decision["dimension"], set()).add(decision["topic"])
+
+
+def _apply_orphan_plans(conn, taxonomy, auto_activate, now, stats, appends,
+                        plans, drop_plans):
+    """阶段3（单写事务内调用）：应用处置计划完成全部落库。"""
+    for p in drop_plans:
+        if p["taboo"]:
+            _queue_audit(conn, p["rows"], now,
+                         note=f"taboo_orphan_expired: {p['topic_new']}")
+            continue  # taboo 词表外候选禁自动处置（不废弃、不建桶）
+        _physically_drop(conn, p["rows"])
+        stats["dropped_orphan"] += len(p["rows"])
+    for p in plans:
+        if p.get("taboo_queue"):
+            _queue_audit(conn, p["rows"], now, note=f"taboo_orphan: {p['topic_new']}")
             continue
-        if is_merge and topic not in (taxonomy.dimensions[dim].topics or []):
-            _queue_audit(conn, rows, now, note=f"merge_target_not_in_taxonomy: {dim}/{topic}")
-            continue
-        if _topic_is_sensitive(taxonomy.dimensions[dim], topic):
-            _queue_audit(conn, rows, now, note=f"sensitive_topic: {dim}/{topic}")
-            continue
-        if is_new:
-            if dim == "taboo":
-                # taboo 禁止运行期扩充（spec §7）：orphan 组不得建成 taboo 新桶，仅进人工队列
-                _queue_audit(conn, rows, now, note=f"taboo_new_topic_queued: {dim}/{topic}")
-                continue
-            if not auto_activate:
-                _queue_audit(conn, rows, now, note=f"new_topic_queued: {dim}/{topic}")
-                continue
-            _stage_taxonomy(taxonomy, dim, topic, rows, appends)
-        n = _rekey(conn, rows, dim, topic, now)
-        stats["activated"] += n
-        if is_merge:
-            stats["merged"] += n
+        _apply_orphan_decision(conn, taxonomy, auto_activate, now, stats, appends, p)
+
+
+def _apply_orphan_decision(conn, taxonomy, auto_activate, now, stats, appends, plan):
+    """单组判定应用：校验链（I1 修复）→ 白名单/sensitive/taboo 禁自动 → re-key 转正。"""
+    rows, decision, topic_new = plan["rows"], plan["decision"], plan["topic_new"]
+    action = decision.get("action") or ""
+    is_merge = action == "merge_to" or action.startswith("merge_to:")  # 兼容 merge_to:<topic> 字面格式
+    is_new = action == "new_topic"
+    dim, topic = decision.get("dimension"), decision.get("topic")
+    if is_merge and not topic:
+        topic = action.split(":", 1)[1]
+    # 校验链（I1 修复）：action 白名单 → dimension 合法 → merge_to 目标必须在词表内
+    #（schema 是服务端软约束，本地不校验则词表外 merge_to 在 auto_activate=False 下绕过人工队列）
+    if (not is_merge and not is_new) or not dim or not topic or dim not in taxonomy.dimensions:
+        _queue_audit(conn, rows, now, note=f"invalid_decision: {decision}")
+        return
+    if topic in (getattr(taxonomy.dimensions[dim], "disabled_topics", None) or []):
+        _queue_audit(conn, rows, now, note=f"disabled_topic: {dim}/{topic}")
+        return
+    if is_merge and topic not in (taxonomy.dimensions[dim].topics or []):
+        _queue_audit(conn, rows, now, note=f"merge_target_not_in_taxonomy: {dim}/{topic}")
+        return
+    if _topic_is_sensitive(taxonomy.dimensions[dim], topic):
+        _queue_audit(conn, rows, now, note=f"sensitive_topic: {dim}/{topic}")
+        return
+    if is_new:
+        if dim == "taboo":
+            # taboo 禁止运行期扩充（spec §7）：orphan 组不得建成 taboo 新桶，仅进人工队列
+            _queue_audit(conn, rows, now, note=f"taboo_new_topic_queued: {dim}/{topic}")
+            return
+        if not auto_activate:
+            _queue_audit(conn, rows, now, note=f"new_topic_queued: {dim}/{topic}")
+            return
+        _stage_taxonomy(taxonomy, dim, topic, topic_new, rows, appends)
+    n = _rekey(conn, rows, dim, topic, now)
+    stats["activated"] += n
+    if is_merge:
+        stats["merged"] += n
+        if n:
+            alias_edit = plan_topic_alias(
+                taxonomy, dim, _bare_topic(topic_new, taxonomy), topic)
+            if alias_edit is not None:
+                appends.append(alias_edit)
 
 
 def _topic_is_sensitive(dim, topic):
@@ -231,65 +293,32 @@ def _physically_drop(conn, rows):
             (r["user_source"], r["user_id"], r["dimension"], r["topic"], r["scope"]))
 
 
-def _stage_taxonomy(taxonomy, dim, topic, rows, appends):
-    """内存词表立即追加（同轮后续组要能 merge 到新 topic）；yaml 落盘交给 _flush_taxonomy。"""
+def _bare_topic(topic_new: str, taxonomy) -> str:
+    """topic_new 形如 "<dim>/<裸主题>"；仅首段是已知维度时剥前缀，否则整串当别名。"""
+    head, sep, tail = (topic_new or "").partition("/")
+    if sep and head in taxonomy.dimensions and tail:
+        return tail
+    return topic_new or ""
+
+
+def _stage_taxonomy(taxonomy, dim, topic, topic_new, rows, appends):
+    """内存词表立即追加（同轮后续组要能 merge 到新 topic）；yaml 落盘交给 flush_taxonomy_edits。"""
     d = taxonomy.dimensions[dim]
     added = topic not in d.topics
     if added:
         d.topics.append(topic)
-    appends.append({
+    append = {
         "dim": dim,
-        "topic": topic,
-        "added": added,
+        "topics": [topic] if added else [],
         "case": {"quote": rows[0]["body"],
                  "expect": {"dimension": dim, "topic": topic,
                             "scope": rows[0]["scope"], "kind": "inferred"}},
-    })
-
-
-def _flush_taxonomy(taxonomy, appends, *, backup_root=None, keep: int = 30):
-    """事务提交成功后 round-trip 写回（保留注释），返回新 Taxonomy；无追加返回 None。"""
-    if not appends:
-        return None
-    for attempt in range(2):
-        data, _text, version = read_yaml(taxonomy.path)
-        for a in appends:
-            for d in data.get("dimensions", []):
-                if d.get("key") == a["dim"]:
-                    topics = d.get("topics")
-                    if topics is None:
-                        d["topics"] = [a["topic"]]
-                    elif a["topic"] not in topics:
-                        topics.append(a["topic"])
-            cases = data.get("regression_cases")
-            if cases is None:
-                data["regression_cases"] = [a["case"]]
-            else:
-                cases.append(a["case"])
-        try:
-            write_config(
-                taxonomy.path,
-                dump_yaml(data),
-                expected_version=version,
-                backup_root=backup_root,
-                keep=keep,
-                label="taxonomy-activate",
-            )
-            return load_taxonomy(taxonomy.path)
-        except ConfigVersionConflict:
-            if attempt == 1:
-                raise
-    return None
-
-
-def _revert_taxonomy(taxonomy, appends):
-    """事务回滚时撤销本轮内存追加，避免内存词表领先于库与文件。"""
-    for a in reversed(appends):
-        if not a["added"]:
-            continue
-        topics = taxonomy.dimensions[a["dim"]].topics
-        if a["topic"] in topics:
-            topics.remove(a["topic"])
+    }
+    alias_edit = plan_topic_alias(taxonomy, dim, _bare_topic(topic_new, taxonomy), topic)
+    if alias_edit is not None:
+        append["aliases"] = alias_edit["aliases"]
+    appends.append(append)
+    return append
 
 
 def _decay(conn, now, degrade_days: int = 90, degrade_confidence: float = 0.7):

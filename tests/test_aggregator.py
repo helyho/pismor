@@ -7,6 +7,7 @@ import shutil
 from pathlib import Path
 
 import pytest
+import yaml
 
 from pismor.pipeline.aggregator import run_daily
 from pismor.core.taxonomy import load_taxonomy
@@ -271,6 +272,20 @@ def test_invalid_action_queued(conn, seeded_orphans_3, taxonomy, fake_llm_invali
     assert n == 3
 
 
+def test_llm_failure_leaves_no_writes(conn, seeded_orphans_3, taxonomy):
+    # F17：阶段2（无锁 LLM 判定）失败 → 本轮零写入：孤儿行原样保留、无审计行
+    class FailingLLM:
+        def chat_json(self, system, user, schema):
+            raise RuntimeError("llm down")
+
+    with pytest.raises(RuntimeError):
+        run_daily(conn, taxonomy, FailingLLM(), auto_activate=True, now=NOW)
+    assert conn.execute(
+        "SELECT COUNT(*) c FROM entries WHERE status='orphan_topic'").fetchone()["c"] == 3
+    assert conn.execute(
+        "SELECT COUNT(*) c FROM review_history").fetchone()["c"] == 0
+
+
 def test_decay_stale(conn, seeded_stale_active, taxonomy):
     stats = run_daily(conn, taxonomy, FakeLLM([]), True, now=NOW)
     assert stats["decayed"] == 1
@@ -458,3 +473,47 @@ def test_daily_opens_merge_task_only_over_threshold(conn, taxonomy):
               taboo_merge_threshold=40)
     row = conn.execute("SELECT COUNT(*) c FROM merge_tasks WHERE status='open'").fetchone()
     assert row["c"] == 1
+
+
+def test_merge_to_writes_alias(conn, taxonomy_writable, fake_llm_merge):
+    _seed_orphans(conn, topic_new="preference/回复要简短")
+    run_daily(conn, taxonomy_writable, fake_llm_merge, auto_activate=True, now=NOW)
+    pref = taxonomy_writable.dimensions["preference"]
+    assert pref.topic_aliases["回复要简短"] == "lang"
+    raw = yaml.safe_load(taxonomy_writable.path.read_text(encoding="utf-8"))
+    pref_raw = next(d for d in raw["dimensions"] if d["key"] == "preference")
+    assert pref_raw["topic_aliases"]["回复要简短"] == "lang"
+
+
+def test_new_topic_writes_alias(conn, taxonomy_writable, fake_llm_new_topic):
+    _seed_orphans(conn, topic_new="preference/回复要简短")
+    run_daily(conn, taxonomy_writable, fake_llm_new_topic, auto_activate=True, now=NOW)
+    pref = taxonomy_writable.dimensions["preference"]
+    assert pref.topic_aliases["回复要简短"] == "brevity"
+
+
+def test_merge_to_skips_shadow_alias(conn, taxonomy_writable, fake_llm_merge):
+    _seed_orphans(conn, topic_new="preference/lang")
+    stats = run_daily(conn, taxonomy_writable, fake_llm_merge, auto_activate=True, now=NOW)
+    assert stats["activated"] == 3
+    assert "lang" not in taxonomy_writable.dimensions["preference"].topic_aliases
+
+
+def test_unknown_prefix_kept_bare(conn, taxonomy_writable, fake_llm_merge):
+    _seed_orphans(conn, topic_new="unknown/回复要简短")
+    run_daily(conn, taxonomy_writable, fake_llm_merge, auto_activate=True, now=NOW)
+    assert "unknown/回复要简短" in taxonomy_writable.dimensions["preference"].topic_aliases
+
+
+def test_alias_reverted_when_transaction_fails(conn, taxonomy_writable,
+                                               fake_llm_new_topic, monkeypatch):
+    from pismor.pipeline import aggregator
+    _seed_orphans(conn, topic_new="preference/回复要简短")
+    conn.commit()
+    monkeypatch.setattr(aggregator, "_rekey", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
+    with pytest.raises(RuntimeError):
+        run_daily(conn, taxonomy_writable, fake_llm_new_topic, auto_activate=True, now=NOW)
+    assert "回复要简短" not in taxonomy_writable.dimensions["preference"].topic_aliases
+    raw = yaml.safe_load(taxonomy_writable.path.read_text(encoding="utf-8"))
+    pref_raw = next(d for d in raw["dimensions"] if d["key"] == "preference")
+    assert "回复要简短" not in (pref_raw.get("topic_aliases") or {})

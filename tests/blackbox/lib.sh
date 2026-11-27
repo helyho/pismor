@@ -166,3 +166,109 @@ skip_case() {
   printf '[SKIP] %s — %s\n' "$1" "$2"
   return 0
 }
+
+# --- 向量分支 helper（T26）--------------------------------------------------
+# settings 文件：run.sh 通过 BB_SETTINGS 传给用例；缺省按产品默认路径。
+BB_SETTINGS="${BB_SETTINGS:-config/settings.yaml}"
+
+urienc() { printf '%s' "$1" | jq -sRr @uri; }
+
+# need_embed：embedding 未启用、端点不可达、维度与配置不一致 → 2（SKIP）
+# 探测同时校验 data[0].embedding 维度，避免"端点通但模型/维度配错"被误判为覆盖。
+need_embed() {
+  local out rc
+  out=$(PYTHONPATH=src .venv/bin/python - <<'PY' 2>&1
+import os, sys
+from pathlib import Path
+import httpx
+from pismor.core.config import load_settings
+e = load_settings(Path(os.environ.get("BB_SETTINGS", "config/settings.yaml"))).embedding
+if not e.enabled:
+    print("embedding.enabled=false"); sys.exit(2)
+url = e.endpoint.rstrip("/")
+url = url if url.endswith("/embeddings") else url + "/embeddings"
+headers = {"Content-Type": "application/json"}
+key = os.environ.get(e.api_key_env)
+if key:
+    headers["Authorization"] = f"Bearer {key}"
+try:
+    r = httpx.post(url, headers=headers, json={"model": e.model, "input": ["probe"]}, timeout=8)
+except Exception as exc:
+    print(f"embed endpoint unreachable: {type(exc).__name__}: {exc}"); sys.exit(2)
+if not (200 <= r.status_code < 300):
+    print(f"embed endpoint returned {r.status_code}"); sys.exit(2)
+try:
+    dim = len(r.json()["data"][0]["embedding"])
+except Exception as exc:
+    print(f"embed endpoint bad body: {type(exc).__name__}: {exc}"); sys.exit(2)
+if dim != e.dimensions:
+    print(f"embed dim {dim} != config dimensions {e.dimensions}"); sys.exit(2)
+sys.exit(0)
+PY
+)
+  rc=$?
+  ((rc == 0)) && return 0
+  printf '%s\n' "$out"
+  return 2
+}
+
+# vec_count <user_id>：该用户 embeddings 行数。
+# embeddings 是 vec0 虚拟表，sqlite3 CLI 会报 "no such module: vec0"，
+# 必须走 pismor.core.db.get_conn（内部加载 sqlite_vec 扩展）。
+vec_count() {
+  PYTHONPATH=src .venv/bin/python - "${1:?vec_count 需要 user_id}" <<'PY'
+import sys
+from pathlib import Path
+from pismor.core.db import get_conn
+conn = get_conn(Path("./data/index.db"))
+sql = ("SELECT count(*) FROM embeddings v JOIN entries e"
+       " ON v.entry_id = e.user_source || char(31) || e.user_id || char(31)"
+       "    || e.dimension || char(31) || e.topic || char(31) || e.scope"
+       " WHERE e.user_source='bb' AND e.user_id=?")
+print(conn.execute(sql, (sys.argv[1],)).fetchone()[0])
+PY
+}
+
+# pick_semantic_query <body> → "<query>\t<cos>"；无可用候选输出空。
+# 候选需同时满足：与 body 的 jieba token 交集为空（词面召回必空）、
+# cosine ≥ min_similarity + 0.05（留余量，避免正文随机改写后擦线）。
+pick_semantic_query() {
+  PYTHONPATH=src .venv/bin/python - "${1:?pick_semantic_query 需要 body}" <<'PY'
+import math, os, sys
+from pathlib import Path
+import httpx, jieba
+from pismor.core.config import load_settings
+body = sys.argv[1]
+e = load_settings(Path(os.environ.get("BB_SETTINGS", "config/settings.yaml"))).embedding
+cands = ["平时做开发选哪种语言", "编程语言的选择习惯", "开发时倾向的编程语言",
+         "写程序时喜欢用的语言", "推荐的编程语言"]
+url = e.endpoint.rstrip("/")
+url = url if url.endswith("/embeddings") else url + "/embeddings"
+headers = {"Content-Type": "application/json"}
+key = os.environ.get(e.api_key_env)
+if key:
+    headers["Authorization"] = f"Bearer {key}"
+r = httpx.post(url, headers=headers, json={"model": e.model, "input": [body] + cands},
+               timeout=e.timeout_seconds)
+r.raise_for_status()
+data = r.json()["data"]
+if all(isinstance(x.get("index"), int) for x in data):
+    data = sorted(data, key=lambda x: x["index"])
+vecs = [x["embedding"] for x in data]
+def cos(a, b):
+    return sum(x * y for x, y in zip(a, b)) / (
+        math.sqrt(sum(x * x for x in a)) * math.sqrt(sum(y * y for y in b)))
+body_tokens = set(jieba.cut(body))
+best = None
+for cand, vec in zip(cands, vecs[1:]):
+    similarity = cos(vecs[0], vec)
+    if body_tokens & set(jieba.cut(cand)):
+        continue  # 词面有交集 → 无法判别是向量还是 BM25
+    if similarity < e.min_similarity + 0.05:
+        continue
+    if best is None or similarity > best[1]:
+        best = (cand, similarity)
+if best:
+    print(f"{best[0]}\t{best[1]:.3f}")
+PY
+}

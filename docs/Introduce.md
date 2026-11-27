@@ -269,13 +269,14 @@ stateDiagram-v2
 
 ```bash
 pytest                          # 单元+E2E（tests/，LLM/embedder 全部 fake 注入，不出网）
+bash tests/blackbox/run.sh      # 黑盒（真实服务+真实 LLM/embedding，默认清空 data/，勿指向开发库）
 python scripts/run_regression.py --settings config/settings.yaml   # 词表回归样例，真实 LLM
 python scripts/run_regression.py --dry                             # FakeLLM 回放自检，不出网
 ```
 
-- `tests/`：18 个模块级测试文件，含 `test_e2e.py` 全管线与 `test_api.py` 接口契约
+- `tests/`：21 个模块级测试文件，含 `test_e2e.py` 全管线与 `test_api.py` 接口契约
 - `scripts/run_regression.py`：跑 `taxonomy.yaml` 的 `regression_cases`（`expect.dimension: null` 断言零候选，`confidence_below` 断言低置信落复核），非全绿 exit 1
-- `bb_test/`：黑盒测试，`client.py` 走真实 LLM 网关，`transcripts/` 为回归对话素材（消耗真实额度，勿默认执行）
+- `tests/blackbox/`：黑盒测试（真实 HTTP + 真实 LLM 网关），入口 `bash tests/blackbox/run.sh`；参数 `--port N`、`--timeout S`、`--keep-data`、`--only 域1,域2`；默认用 `config/settings.example.yaml` 启动 `scripts/serve.py` 并清空 `data/`。七个域：`events`(T1-T8)、`assemble`(T9-T13)、`vector`(T26)、`lifecycle`(T14-T18)、`privacy`(T19-T20)、`injection`(T21-T23)、`resilience`(T24-T25)。缺 `LLM_API_KEY` 时相关用例 SKIP；`vector` 域另需 embedding 端点可达且返回维度与配置一致，否则 SKIP；T25 会在 serve.log 留下一条预期内的 `file is not a database` Traceback
 
 ## 文档索引
 

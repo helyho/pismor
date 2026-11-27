@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # pismor 黑盒测试入口
-# 用法: bash tests/blackbox/run.sh [--keep-data] [--port N] [--timeout S] [--only events,assemble,...]
+# 用法: bash tests/blackbox/run.sh [--keep-data] [--port N] [--timeout S] [--only events,assemble,vector,...]
 # 真实启动 scripts/serve.py（配置原样用 config/settings.example.yaml，不生成副本），
 # curl 打 HTTP，断言 = 响应 JSON(jq) + SQLite 落库(sqlite3 查 ./data/index.db)。
 # LLM_API_KEY 缺失时依赖 LLM 的用例标 [SKIP]，确定性用例照常跑。
@@ -17,7 +17,7 @@ while [[ $# -gt 0 ]]; do
     --port) PORT="${2:?--port 需要端口号}"; shift 2 ;;
     --timeout) TIMEOUT="${2:?--timeout 需要秒数}"; shift 2 ;;
     --only) ONLY="${2:?--only 需要域名列表}"; shift 2 ;;
-    *) echo "未知参数: $1（用法: run.sh [--keep-data] [--port N] [--timeout S] [--only events,assemble,lifecycle,privacy,injection,resilience]）" >&2; exit 2 ;;
+    *) echo "未知参数: $1（用法: run.sh [--keep-data] [--port N] [--timeout S] [--only events,assemble,vector,lifecycle,privacy,injection,resilience]）" >&2; exit 2 ;;
   esac
 done
 
@@ -45,13 +45,14 @@ if ((KEEP_DATA == 0)); then
   rm -rf data
 fi
 
+SETTINGS=config/settings.example.yaml
 MODE=real
 [[ -z "${LLM_API_KEY:-}" ]] && MODE=degraded
 echo "== pismor 黑盒测试 mode=$MODE port=$PORT =="
 
 # 服务启动：src 布局，venv 未 editable 安装，需 PYTHONPATH=src
 PYTHONPATH=src .venv/bin/python scripts/serve.py \
-  --settings config/settings.example.yaml --host 127.0.0.1 --port "$PORT" \
+  --settings "$SETTINGS" --host 127.0.0.1 --port "$PORT" \
   >tests/blackbox/serve.log 2>&1 &
 SVC_PID=$!
 cleanup() {
@@ -77,7 +78,7 @@ if ((ready == 0)); then
 fi
 echo "服务就绪 pid=$SVC_PID"
 
-export PORT TIMEOUT KEEP_DATA
+export PORT TIMEOUT KEEP_DATA BB_SETTINGS="$SETTINGS"
 # shellcheck source=lib.sh
 source tests/blackbox/lib.sh
 
@@ -93,7 +94,7 @@ SKIP=0
 RESULTS=()
 
 # 逐域执行（文件存在才 source；--only 过滤）
-for d in events assemble lifecycle privacy injection resilience; do
+for d in events assemble vector lifecycle privacy injection resilience; do
   if [[ -n "$ONLY" && ",$ONLY," != *",$d,"* ]]; then continue; fi
   f="tests/blackbox/cases_${d}.sh"
   [[ -f "$f" ]] || continue

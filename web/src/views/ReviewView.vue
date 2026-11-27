@@ -465,6 +465,7 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
           >
             <div class="queue-item-head">
               <el-tag size="small">{{ item.dimension }}</el-tag>
+              <el-tag size="small" type="info">{{ item.variant }}</el-tag>
             </div>
             <div class="user-cell queue-user-cell">
               <span class="source">{{ item.user_source }}</span>
@@ -540,6 +541,8 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
               </el-button>
             </el-descriptions-item>
             <el-descriptions-item label="维度">{{ detail.entry.dimension }}</el-descriptions-item>
+            <el-descriptions-item label="变体">{{ detail.entry.variant }}</el-descriptions-item>
+            <el-descriptions-item label="变体序号">{{ detail.entry.variant_seq }}</el-descriptions-item>
             <el-descriptions-item label="主题">
               <el-select
                 v-if="detail.allowed_topics.length"

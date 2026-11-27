@@ -129,6 +129,8 @@ function goUser(): void {
         </el-descriptions-item>
         <el-descriptions-item label="维度">{{ detail.entry.dimension }}</el-descriptions-item>
         <el-descriptions-item label="主题">{{ detail.entry.topic }}</el-descriptions-item>
+        <el-descriptions-item label="变体">{{ detail.entry.variant }}</el-descriptions-item>
+        <el-descriptions-item label="变体序号">{{ detail.entry.variant_seq }}</el-descriptions-item>
         <el-descriptions-item label="状态">{{ statusLabel(detail.entry.status) }}</el-descriptions-item>
         <el-descriptions-item label="置信度">{{ detail.entry.confidence.toFixed(2) }}</el-descriptions-item>
         <el-descriptions-item label="强化次数">{{ detail.entry.reinforcements }}</el-descriptions-item>

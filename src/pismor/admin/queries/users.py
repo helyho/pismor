@@ -128,10 +128,10 @@ def get_user_detail(
     entries = [
         dict(row)
         for row in conn.execute(
-            "SELECT e.id, e.dimension, e.topic, e.status, e.confidence,"
-            " e.summary, e.body, e.created_at, e.updated_at, e.last_reinforced_at,"
-            " e.degraded_reason, e.superseded_by, e.topic_new, e.conflict_with,"
-            " e.reinforcements, e.archived_at,"
+            "SELECT e.id, e.dimension, e.topic, e.variant, e.variant_seq,"
+            " e.status, e.confidence, e.summary, e.body, e.created_at,"
+            " e.updated_at, e.last_reinforced_at, e.degraded_reason, e.superseded_by,"
+            " e.topic_new, e.conflict_with, e.reinforcements, e.archived_at,"
             " (SELECT COUNT(*) FROM sources s WHERE s.user_source=e.user_source"
             "   AND s.user_id=e.user_id AND s.entry_id=e.id) AS sources_count"
             " FROM entries e WHERE e.user_source=? AND e.user_id=?"

@@ -371,7 +371,10 @@ async function purgeUser(): Promise<void> {
           </h3>
           <el-table :data="entries" size="small" border>
             <el-table-column prop="topic" label="主题" min-width="120" />
-                <el-table-column prop="summary" label="摘要" min-width="240" show-overflow-tooltip />
+            <el-table-column label="变体" width="110">
+              <template #default="{ row }">{{ row.variant }} #{{ row.variant_seq }}</template>
+            </el-table-column>
+            <el-table-column prop="summary" label="摘要" min-width="240" show-overflow-tooltip />
             <el-table-column label="状态" width="90">
               <template #default="{ row }">{{ statusLabel(row.status) }}</template>
             </el-table-column>

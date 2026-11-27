@@ -215,15 +215,14 @@ PY
 # vec_count <user_id>：该用户 embeddings 行数。
 # embeddings 是 vec0 虚拟表，sqlite3 CLI 会报 "no such module: vec0"，
 # 必须走 pismor.core.db.get_conn（内部加载 sqlite_vec 扩展）。
+# schema v2 起 embeddings.entry_id 就是 entries.id（32 位哈希），直接等值 JOIN。
 vec_count() {
   PYTHONPATH=src .venv/bin/python - "${1:?vec_count 需要 user_id}" <<'PY'
 import sys
 from pathlib import Path
 from pismor.core.db import get_conn
 conn = get_conn(Path("./data/index.db"))
-sql = ("SELECT count(*) FROM embeddings v JOIN entries e"
-       " ON v.entry_id = e.user_source || char(31) || e.user_id || char(31)"
-       "    || e.dimension || char(31) || e.topic"
+sql = ("SELECT count(*) FROM embeddings v JOIN entries e ON v.entry_id = e.id"
        " WHERE e.user_source='bb' AND e.user_id=?")
 print(conn.execute(sql, (sys.argv[1],)).fetchone()[0])
 PY

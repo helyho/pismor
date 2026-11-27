@@ -13,33 +13,41 @@ t9() {
   case_pass
 }
 # T10 taboo 入包（LLM）：taxonomy 回归样例，taboo 排包首位
-# 响应条目只有 {id,text,confidence,status}，维度经 id 前缀（dimension_topic）识别
+# schema v2 起条目 id 为 32 位哈希（variant keys），不再带 dimension_topic 前缀；
+# 维度只能从库里按 dimension 查 id，再断言该 id 在包内且位于首位。
 t10() {
   need_llm || return 2
-  local ev; ev=$(next_event_id t9e)
+  local ev eid; ev=$(next_event_id t9e)
   http POST /events "$(bb_event t9u "$ev" "别再给我生成 Excel 公式了, 用 Python")"
   expect_status 202 || return 1
   wait_db "SELECT 1 FROM entries e WHERE e.user_id='t9u' AND e.dimension='taboo'" 90 \
     || { case_fail "90s 内 taboo 条目未入库"; }
   activate_entry t9u taboo || return 1
+  eid=$(db "SELECT id FROM entries WHERE user_source='bb' AND user_id='t9u' AND dimension='taboo' AND status IN ('active','degraded') ORDER BY rowid DESC LIMIT 1")
+  [[ -n "$eid" ]] || { case_fail "没有生效的 taboo 条目"; }
   http GET /memory/bb/t9u
   expect_status 200 || return 1
-  expect_json '[.entries[] | select(.id | startswith("taboo"))] | length > 0' 'true' || return 1
-  expect_json '.entries[0].id | startswith("taboo")' 'true' || return 1
+  printf '%s' "$BODY" | jq -e --arg id "$eid" '[.entries[].id] | index($id) != null' >/dev/null \
+    || { case_fail "taboo 条目未入包：$(printf '%s' "$BODY" | jq -c '[.entries[].id]')"; }
+  printf '%s' "$BODY" | jq -e --arg id "$eid" '.entries[0].id == $id' >/dev/null \
+    || { case_fail "taboo 未置顶：$(printf '%s' "$BODY" | jq -c '[.entries[].id]')"; }
   case_pass
 }
-# T11 identity 入包（LLM）
+# T11 identity 入包（LLM）：id 取法同 T10（哈希 id，维度从库查）
 t11() {
   need_llm || return 2
-  local ev; ev=$(next_event_id t10e)
+  local ev eid; ev=$(next_event_id t10e)
   http POST /events "$(bb_event t10u "$ev" "我是一名后端工程师")"
   expect_status 202 || return 1
   wait_db "SELECT 1 FROM entries e WHERE e.user_id='t10u' AND e.dimension='identity'" 90 \
     || { case_fail "90s 内 identity 条目未入库"; }
   activate_entry t10u identity || return 1
+  eid=$(db "SELECT id FROM entries WHERE user_source='bb' AND user_id='t10u' AND dimension='identity' AND status IN ('active','degraded') ORDER BY rowid DESC LIMIT 1")
+  [[ -n "$eid" ]] || { case_fail "没有生效的 identity 条目"; }
   http GET /memory/bb/t10u
   expect_status 200 || return 1
-  expect_json '[.entries[] | select(.id | startswith("identity"))] | length > 0' 'true' || return 1
+  printf '%s' "$BODY" | jq -e --arg id "$eid" '[.entries[].id] | index($id) != null' >/dev/null \
+    || { case_fail "identity 条目未入包：$(printf '%s' "$BODY" | jq -c '[.entries[].id]')"; }
   case_pass
 }
 # T12 用户隔离：u 有记忆后，其他 user / 其他 source 均为空包
@@ -87,7 +95,7 @@ t13() {
   http GET "/memory/bb/t12u?query=python"
   expect_status 200 || return 1
   expect_json '.entries | length > 0' 'true' || return 1
-  # 命中条目正文（.text）而非 id——id 形如 preference_lang 会自命中"lang"造成同义反复
+  # 命中条目正文（.text）而非哈希 id：id 不带维度/主题语义，用正文才能验证召回确为内容相关
   expect_json '[.entries[] | select(.text | test("python"; "i"))] | length > 0' 'true' \
     || { case_fail "query=python 未召回正文含 Python 的条目"; }
   case_pass

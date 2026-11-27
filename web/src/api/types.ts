@@ -293,6 +293,8 @@ export interface UserEntry {
   superseded_by: string | null
   topic_new: string | null
   conflict_with: string | null
+  variant: string
+  variant_seq: number
   reinforcements: number
   archived_at: string | null
   sources_count: number
@@ -346,6 +348,8 @@ export interface EntryListItem {
   user_id: string
   dimension: string
   topic: string
+  variant: string
+  variant_seq: number
   summary: string
   status: string
   confidence: number

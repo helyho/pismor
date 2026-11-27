@@ -332,6 +332,9 @@ onBeforeUnmount(() => {
             </el-button>
           </template>
         </el-table-column>
+        <el-table-column label="变体" width="110">
+          <template #default="{ row }">{{ row.variant }} #{{ row.variant_seq }}</template>
+        </el-table-column>
         <el-table-column prop="summary" label="摘要" min-width="260" show-overflow-tooltip />
         <el-table-column label="状态" width="90">
           <template #default="{ row }">{{ statusLabel(row.status) }}</template>

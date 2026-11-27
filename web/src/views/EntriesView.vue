@@ -1,12 +1,13 @@
 <script setup lang="ts">
-import { computed, ref } from 'vue'
+import { computed, onBeforeUnmount, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { useQuery, useQueryClient } from '@tanstack/vue-query'
 import { Refresh, Search } from '@element-plus/icons-vue'
 
 import { api } from '@/api/client'
-import type { EntryFacets, EntryList, EntryListItem } from '@/api/types'
+import type { EntryConflictRow, EntryCreateResult, EntryFacets, EntryList, EntryListItem } from '@/api/types'
 import { useAuthStore } from '@/auth'
+import EntryCreateDialog from '@/components/EntryCreateDialog.vue'
 import EntryDetailDrawer from '@/components/EntryDetailDrawer.vue'
 import EntryEditDialog from '@/components/EntryEditDialog.vue'
 import { formatDateTime } from '@/utils/format'
@@ -154,6 +155,40 @@ async function onEditSaved(): Promise<void> {
   await Promise.all([entriesQuery.refetch(), facetsQuery.refetch()])
   void queryClient.invalidateQueries({ queryKey: ['overview'] })
 }
+
+const createVisible = ref(false)
+
+// 新建成功：回到第一页（新条目按 updated_desc 排最前）并短暂高亮新行
+const highlightId = ref<string | null>(null)
+let highlightTimer: ReturnType<typeof setTimeout> | undefined
+
+function rowClassName({ row }: { row: EntryListItem }): string {
+  return row.id === highlightId.value ? 'created-row-highlight' : ''
+}
+
+function onCreateSaved(result: EntryCreateResult): void {
+  page.value = 1
+  highlightId.value = result.id ?? null
+  if (highlightTimer) clearTimeout(highlightTimer)
+  highlightTimer = setTimeout(() => {
+    highlightId.value = null
+  }, 8000)
+  void Promise.all([entriesQuery.refetch(), facetsQuery.refetch()])
+  void queryClient.invalidateQueries({ queryKey: ['overview'] })
+}
+
+// 409 同键冲突“去编辑这条”：复用现有编辑抽屉（冲突行无用户上下文，取表单同键来源/用户）
+function onCreateGotoEdit(
+  existing: EntryConflictRow,
+  target: { user_source: string; user_id: string },
+): void {
+  editTarget.value = { ...target, entry_id: existing.id }
+  editVisible.value = true
+}
+
+onBeforeUnmount(() => {
+  if (highlightTimer) clearTimeout(highlightTimer)
+})
 </script>
 
 <template>
@@ -163,9 +198,18 @@ async function onEditSaved(): Promise<void> {
         <h2>记忆</h2>
         <p class="page-subtitle">跨用户检索记忆，点击维度、主题或作用域可直接筛选。</p>
       </div>
-      <el-button :icon="Refresh" :loading="entriesQuery.isLoading.value" @click="entriesQuery.refetch()">
-        刷新
-      </el-button>
+      <div class="head-actions">
+        <el-button
+          v-if="auth.can('memory.write')"
+          type="primary"
+          @click="createVisible = true"
+        >
+          新建记忆
+        </el-button>
+        <el-button :icon="Refresh" :loading="entriesQuery.isLoading.value" @click="entriesQuery.refetch()">
+          刷新
+        </el-button>
+      </div>
     </div>
 
     <el-card shadow="never" class="filter-card">
@@ -253,6 +297,7 @@ async function onEditSaved(): Promise<void> {
         v-loading="entriesQuery.isLoading.value"
         :data="items"
         size="small"
+        :row-class-name="rowClassName"
         @row-click="openEntry"
       >
         <el-table-column label="来源" width="110">
@@ -338,6 +383,12 @@ async function onEditSaved(): Promise<void> {
       :facets="facets"
       @saved="onEditSaved"
     />
+
+    <EntryCreateDialog
+      v-model="createVisible"
+      @saved="onCreateSaved"
+      @goto-edit="onCreateGotoEdit"
+    />
   </div>
 </template>
 
@@ -370,5 +421,9 @@ async function onEditSaved(): Promise<void> {
 
 :deep(.el-table__row) {
   cursor: pointer;
+}
+
+:deep(.el-table .created-row-highlight td.el-table__cell) {
+  background: var(--el-color-primary-light-9);
 }
 </style>

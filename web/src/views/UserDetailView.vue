@@ -8,8 +8,9 @@ import 'element-plus/es/components/message-box/style/css'
 import { Delete, Refresh } from '@element-plus/icons-vue'
 
 import { api, ApiError } from '@/api/client'
-import type { AssembleResult, UserDetail, UserEntry } from '@/api/types'
+import type { AssembleResult, EntryConflictRow, UserDetail, UserEntry } from '@/api/types'
 import { useAuthStore } from '@/auth'
+import EntryCreateDialog from '@/components/EntryCreateDialog.vue'
 import EntryDetailDrawer from '@/components/EntryDetailDrawer.vue'
 import EntryEditDialog from '@/components/EntryEditDialog.vue'
 import { formatDateTime } from '@/utils/format'
@@ -106,6 +107,19 @@ async function onEditSaved(): Promise<void> {
   await detailQuery.refetch()
   queryClient.invalidateQueries({ queryKey: ['users'] })
   queryClient.invalidateQueries({ queryKey: ['overview'] })
+}
+
+const createVisible = ref(false)
+// 预填当前用户上下文，创建对话框内来源/用户 ID 锁定
+const createTarget = computed(() => ({ user_source: source.value, user_id: userId.value }))
+
+// 409 同键冲突“去编辑这条”：复用现有编辑抽屉
+function onCreateGotoEdit(
+  existing: EntryConflictRow,
+  target: { user_source: string; user_id: string },
+): void {
+  editTarget.value = { ...target, entry_id: existing.id }
+  editVisible.value = true
 }
 
 const budget = ref(2000)
@@ -258,6 +272,13 @@ async function purgeUser(): Promise<void> {
         </div>
       </div>
       <div class="head-actions">
+        <el-button
+          v-if="detail && !detail.tombstone && auth.can('memory.write')"
+          type="primary"
+          @click="createVisible = true"
+        >
+          新建记忆
+        </el-button>
         <el-button :icon="Refresh" :loading="detailQuery.isLoading.value" @click="detailQuery.refetch()">
           刷新
         </el-button>
@@ -480,6 +501,12 @@ async function purgeUser(): Promise<void> {
       @edit="editCurrent"
     />
     <EntryEditDialog v-model="editVisible" :target="editTarget" @saved="onEditSaved" />
+    <EntryCreateDialog
+      v-model="createVisible"
+      :target="createTarget"
+      @saved="onEditSaved"
+      @goto-edit="onCreateGotoEdit"
+    />
   </div>
 </template>
 

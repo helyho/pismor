@@ -1,4 +1,5 @@
 """复核工作台管理 API：队列、筛选面、条目详情、判定。"""
+import logging
 from contextlib import closing
 from typing import Literal
 
@@ -15,7 +16,11 @@ from pismor.admin.schemas import (
     ReviewQueueOut,
 )
 from pismor.core.db import get_conn
+from pismor.core.taxonomy_edit import write_pending_alias
+from pismor.pipeline import writer
 from pismor.serving.review import apply_review_decision
+
+logger = logging.getLogger("mem.admin.review")
 
 
 router = APIRouter(prefix="/admin/api/review", tags=["admin-review"])
@@ -87,7 +92,17 @@ def decide(
     principal: Principal = Depends(require("review.decide")),
 ):
     settings = get_settings(request)
+    embedder = getattr(request.app.state, "embedder", None)
     with closing(get_conn(settings.db_path)) as conn:
+        # 向量在写事务外预计算（网络 IO 不持有 WAL 写锁）
+        vector = None
+        if payload.decision == "fix" and payload.body is not None and embedder is not None:
+            current = conn.execute(
+                "SELECT body FROM entries WHERE user_source=? AND user_id=? AND id=? AND scope=?",
+                (payload.user_source, payload.user_id, payload.entry_id, payload.scope),
+            ).fetchone()
+            if current is not None and payload.body.strip() != current["body"]:
+                vector = writer.compute_vector(embedder, payload.body)
         with conn:
             result = apply_review_decision(
                 conn,
@@ -102,6 +117,8 @@ def decide(
                 summary=payload.summary,
                 topic=payload.topic,
                 taxonomy=get_taxonomy(request),
+                vector=vector,
+                vector_requested=embedder is not None,
             )
             record_admin_audit(
                 conn, principal, "review.decision",
@@ -112,4 +129,21 @@ def decide(
                     "noop": result["noop"],
                 },
             )
-            return result
+        # 别名落盘在事务提交之后：文件写失败不影响已提交的复核结果
+        pending = result.pop("_pending_alias", None) if isinstance(result, dict) else None
+        if pending:
+            store = getattr(request.app.state, "taxonomy_store", None)
+            try:
+                new = write_pending_alias(
+                    get_taxonomy(request), pending,
+                    backup_root=settings.backup.root / "config", keep=settings.backup.keep)
+            except Exception:
+                logger.warning("topic alias write failed: %s", pending, exc_info=True)
+            else:
+                if new is not None and store is not None:
+                    store.replace(new)
+                elif new is not None:
+                    logger.warning(
+                        "taxonomy_store absent; alias written to %s only",
+                        settings.taxonomy_path)
+        return result

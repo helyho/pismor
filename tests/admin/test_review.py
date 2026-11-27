@@ -1,12 +1,17 @@
 import json
+import shutil
+import struct
 from contextlib import closing
 from pathlib import Path
 
+import yaml
 from fastapi.testclient import TestClient
 
 from pismor.admin.deps import Principal
 from pismor.core.config import EmbeddingSettings, LLMSettings, Settings
-from pismor.core.db import get_conn
+from pismor.core.db import get_conn, init_schema
+from pismor.core.keys import vec_key
+from pismor.core.taxonomy import load_taxonomy
 from pismor.serving.api import create_app
 
 
@@ -19,20 +24,30 @@ class FakeLLM:
         return {"candidates": []}
 
 
-def _settings(tmp_path: Path) -> Settings:
+class FakeEmbedder:
+    def embed(self, texts):
+        return [[0.1, 0.2, 0.3, 0.4] for _ in texts]
+
+
+def _settings(tmp_path: Path, *, embedding_enabled: bool = False,
+              taxonomy_path: Path | None = None) -> Settings:
     return Settings(
         db_path=tmp_path / "admin.db",
-        taxonomy_path=REPO / "config" / "taxonomy.yaml",
+        taxonomy_path=taxonomy_path or REPO / "config" / "taxonomy.yaml",
         llm=LLMSettings(endpoint="http://llm.test", model="m", api_key_env="LLM_API_KEY"),
         embedding=EmbeddingSettings(
-            enabled=False, endpoint="", model="", api_key_env="",
+            enabled=embedding_enabled, endpoint="", model="", api_key_env="",
             dimensions=4, batch_size=8,
         ),
     )
 
 
-def _make_app(tmp_path: Path):
-    app = create_app(_settings(tmp_path), llm=FakeLLM())
+def _make_app(tmp_path: Path, *, embedder=None, embedding_enabled: bool = False,
+              taxonomy_path: Path | None = None):
+    app = create_app(
+        _settings(tmp_path, embedding_enabled=embedding_enabled,
+                  taxonomy_path=taxonomy_path),
+        llm=FakeLLM(), embedder=embedder)
     return app, TestClient(app), tmp_path / "admin.db"
 
 
@@ -306,3 +321,98 @@ def test_merge_tasks_list_and_resolve(tmp_path):
     # 已消解任务重复操作 → 404
     res = client.post(f"/admin/api/merge-tasks/{tid}/resolve", json={"status": "done"})
     assert res.status_code == 404
+
+
+def test_fix_body_reembeds_vector(tmp_path):
+    app, client, db_path = _make_app(
+        tmp_path, embedder=FakeEmbedder(), embedding_enabled=True)
+    with closing(get_conn(db_path)) as conn:
+        entry_id = _insert_entry(conn, topic="style")
+        key = vec_key("webchat", "u1", "preference", "style", "global")
+        conn.execute(
+            "INSERT INTO embeddings (entry_id,user_source,user_id,embedding) VALUES (?,?,?,?)",
+            (key, "webchat", "u1", json.dumps([0.9, 0.9, 0.9, 0.9])),
+        )
+        conn.commit()
+    res = client.post("/admin/api/review/decision", json={
+        "user_source": "webchat", "user_id": "u1", "scope": "global",
+        "entry_id": entry_id, "decision": "fix", "entry_version": VERSION,
+        "body": "fixed body",
+    })
+    assert res.status_code == 200, res.text
+    assert res.json()["noop"] is False
+    with closing(get_conn(db_path)) as conn:
+        row = conn.execute(
+            "SELECT embedding FROM embeddings WHERE entry_id=?", (key,)
+        ).fetchone()
+    assert row is not None
+    raw = struct.unpack("<4f", row["embedding"])
+    expected = [0.1, 0.2, 0.3, 0.4]
+    norm = sum(v * v for v in expected) ** 0.5
+    assert all(abs(a - b / norm) < 1e-6 for a, b in zip(raw, expected))
+
+
+def test_fix_body_drops_vector_without_embedder(tmp_path):
+    app, client, db_path = _make_app(tmp_path)
+    with closing(get_conn(db_path)) as conn:
+        init_schema(conn, 4)
+        entry_id = _insert_entry(conn, topic="style")
+        key = vec_key("webchat", "u1", "preference", "style", "global")
+        conn.execute(
+            "INSERT INTO embeddings (entry_id,user_source,user_id,embedding) VALUES (?,?,?,?)",
+            (key, "webchat", "u1", json.dumps([0.9, 0.9, 0.9, 0.9])),
+        )
+        conn.commit()
+    res = client.post("/admin/api/review/decision", json={
+        "user_source": "webchat", "user_id": "u1", "scope": "global",
+        "entry_id": entry_id, "decision": "fix", "entry_version": VERSION,
+        "body": "fixed body",
+    })
+    assert res.status_code == 200, res.text
+    with closing(get_conn(db_path)) as conn:
+        assert conn.execute(
+            "SELECT 1 FROM embeddings WHERE entry_id=?", (key,)
+        ).fetchone() is None
+
+
+def test_confirm_rekey_moves_vector(tmp_path):
+    app, client, db_path = _make_app(tmp_path)
+    with closing(get_conn(db_path)) as conn:
+        init_schema(conn, 4)
+        eid = _insert_entry(conn, dimension="taboo", topic="不要表格", body="不要用表格")
+        old_key = vec_key("webchat", "u1", "taboo", "不要表格", "global")
+        conn.execute(
+            "INSERT INTO embeddings (entry_id,user_source,user_id,embedding) VALUES (?,?,?,?)",
+            (old_key, "webchat", "u1", json.dumps([0.1, 0.2, 0.3, 0.4])),
+        )
+        conn.commit()
+    res = _decide(client, eid, "output_format")
+    assert res.status_code == 200, res.text
+    assert res.json()["rekeyed_to"] == "output_format"
+    new_key = vec_key("webchat", "u1", "taboo", "output_format", "global")
+    with closing(get_conn(db_path)) as conn:
+        assert conn.execute(
+            "SELECT 1 FROM embeddings WHERE entry_id=?", (old_key,)
+        ).fetchone() is None
+        assert conn.execute(
+            "SELECT 1 FROM embeddings WHERE entry_id=?", (new_key,)
+        ).fetchone() is not None
+
+
+def test_admin_review_writes_alias(tmp_path):
+    tax_path = tmp_path / "taxonomy.yaml"
+    shutil.copy(REPO / "config" / "taxonomy.yaml", tax_path)
+    app, client, db_path = _make_app(tmp_path, taxonomy_path=tax_path)
+    canon = load_taxonomy(tax_path).dimensions["preference"].topics[0]
+    with closing(get_conn(db_path)) as conn:
+        eid = _insert_entry(conn, topic="手工模型", status="pending_review")
+    r = client.post("/admin/api/review/decision",
+                    json={"user_source": "webchat", "user_id": "u1", "scope": "global",
+                          "entry_id": eid, "decision": "confirm",
+                          "entry_version": VERSION, "topic": canon})
+    assert r.status_code == 200
+    raw = yaml.safe_load(tax_path.read_text(encoding="utf-8"))
+    pref = next(d for d in raw["dimensions"] if d["key"] == "preference")
+    assert pref["topic_aliases"]["手工模型"] == canon
+    store = client.app.state.taxonomy_store.current()
+    assert store.dimensions["preference"].topic_aliases["手工模型"] == canon

@@ -738,3 +738,58 @@ def test_memory_scope_param_validated(client):
     assert client.get("/memory/webchat/u1?scope=bad-scope").status_code == 422
     assert client.get("/memory/webchat/u1?scope=project:work").status_code == 200
 
+
+@pytest.fixture
+def writable_settings(tmp_path):
+    dst = tmp_path / "taxonomy.yaml"
+    shutil.copy(REPO / "config" / "taxonomy.yaml", dst)
+    return Settings(
+        db_path=tmp_path / "api.db",
+        taxonomy_path=dst,
+        llm=LLMSettings(endpoint="http://llm.test", model="m", api_key_env="LLM_API_KEY"),
+        embedding=EmbeddingSettings(enabled=False, endpoint="", model="",
+                                    api_key_env="", dimensions=4, batch_size=8))
+
+
+@pytest.fixture
+def writable_client(writable_settings, fake_llm, embedder_stub):
+    return TestClient(create_app(writable_settings, llm=fake_llm, embedder=embedder_stub))
+
+
+def test_review_decision_writes_alias(writable_client, writable_settings):
+    tax = load_taxonomy(writable_settings.taxonomy_path)
+    canon = tax.dimensions["preference"].topics[0]
+    with closing(get_conn(writable_settings.db_path)) as conn:
+        eid = _seed_entry(conn, "preference", "手工模型", "global", "pending_review",
+                          "b", "s", 0.9, now=NOW)
+    r = writable_client.post(
+        f"/review/webchat/u1/global/{eid}/decision",
+        json={"decision": "confirm", "entry_version": NOW, "topic": canon})
+    assert r.status_code == 200
+    assert "_pending_alias" not in r.json()
+    raw = yaml.safe_load(writable_settings.taxonomy_path.read_text(encoding="utf-8"))
+    pref = next(d for d in raw["dimensions"] if d["key"] == "preference")
+    assert pref["topic_aliases"]["手工模型"] == canon
+    store = writable_client.app.state.taxonomy_store.current()
+    assert store.dimensions["preference"].topic_aliases["手工模型"] == canon
+
+
+def test_alias_write_failure_does_not_fail_review(writable_client, writable_settings,
+                                                  monkeypatch):
+    monkeypatch.setattr("pismor.core.taxonomy_edit.write_config",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("disk")))
+    tax = load_taxonomy(writable_settings.taxonomy_path)
+    canon = tax.dimensions["preference"].topics[0]
+    with closing(get_conn(writable_settings.db_path)) as conn:
+        eid = _seed_entry(conn, "preference", "手工模型", "global", "pending_review",
+                          "b", "s", 0.9, now=NOW)
+    r = writable_client.post(
+        f"/review/webchat/u1/global/{eid}/decision",
+        json={"decision": "confirm", "entry_version": NOW, "topic": canon})
+    assert r.status_code == 200
+    assert r.json()["updated"] == 1
+    raw = yaml.safe_load(writable_settings.taxonomy_path.read_text(encoding="utf-8"))
+    pref = next(d for d in raw["dimensions"] if d["key"] == "preference")
+    assert "手工模型" not in (pref.get("topic_aliases") or {})
+    store = writable_client.app.state.taxonomy_store.current()
+    assert "手工模型" not in store.dimensions["preference"].topic_aliases

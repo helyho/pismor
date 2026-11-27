@@ -92,3 +92,28 @@ def revert_taxonomy_edits(taxonomy: Taxonomy, appends: list[dict]) -> None:
         for topic in a.get("topics") or []:
             if topic in dim.topics:
                 dim.topics.remove(topic)
+
+
+def write_pending_alias(
+    taxonomy: Taxonomy,
+    pending: dict | None,
+    *,
+    backup_root=None,
+    keep: int = 30,
+) -> Taxonomy | None:
+    """复核归一后的别名落盘：守卫交给 plan_topic_alias，无新增返回 None。
+
+    落盘失败时撤销内存追加并向上抛，调用方据此保留旧 store。
+    """
+    if not pending:
+        return None
+    edit = plan_topic_alias(
+        taxonomy, pending.get("dim"), pending.get("alias"), pending.get("canonical"))
+    if edit is None:
+        return None
+    try:
+        return flush_taxonomy_edits(
+            taxonomy, [edit], backup_root=backup_root, keep=keep, label="taxonomy-alias")
+    except Exception:
+        revert_taxonomy_edits(taxonomy, [edit])
+        raise

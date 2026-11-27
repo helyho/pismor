@@ -1,3 +1,10 @@
+import type {
+  EntryCreatePayload,
+  EntryCreateResult,
+  EntryValidateResult,
+  TopicMap,
+} from './types'
+
 export class ApiError extends Error {
   status: number
   detail: unknown
@@ -35,4 +42,24 @@ export async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
 
   if (response.status === 204) return undefined as T
   return (await response.json()) as T
+}
+
+export function validateCreateEntry(
+  payload: EntryCreatePayload,
+): Promise<EntryValidateResult> {
+  return api('/entries/validate-create', {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  })
+}
+
+export function createEntry(payload: EntryCreatePayload): Promise<EntryCreateResult> {
+  return api('/entries', {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  })
+}
+
+export function listEntryTopics(): Promise<TopicMap> {
+  return api('/entries/topics')
 }

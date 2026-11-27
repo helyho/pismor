@@ -185,6 +185,65 @@ export interface EntryEditResult {
   warnings: string[]
 }
 
+export interface FieldError {
+  field: string
+  code: string
+  message: string
+}
+
+export interface EntryConflictRow {
+  id: string
+  dimension: string
+  topic: string
+  status: string
+  summary: string
+  confidence?: number
+  updated_at?: string
+}
+
+export interface EntryCreatePayload {
+  user_source: string
+  user_id: string
+  dimension: string
+  topic: string
+  summary: string
+  body: string
+  quote: string
+  confidence: number
+  origin_ref?: string | null
+}
+
+export interface EntryCreateResult {
+  ok: boolean
+  id?: string | null
+  dimension: string
+  topic: string
+  status?: string | null
+  confidence?: number | null
+  warnings: string[]
+  conflicts: EntryConflictRow[]
+}
+
+export interface EntryValidateResult {
+  ok: boolean
+  normalized_topic: string
+  errors: FieldError[]
+  warnings: string[]
+  conflicts: EntryConflictRow[]
+}
+
+export type TopicMap = Record<string, string[]>
+
+/** 创建/校验失败时 ApiError.detail 的形状（400/409/422/503 各子集，字段均可选） */
+export interface EntryWriteErrorDetail {
+  ok?: boolean
+  code?: string
+  message?: string
+  errors?: Array<FieldError | string>
+  warnings?: string[]
+  existing?: EntryConflictRow
+}
+
 export interface UserListItem {
   user_source: string
   user_id: string

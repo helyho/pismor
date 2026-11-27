@@ -102,7 +102,9 @@ def test_users_list_detail_and_tombstones(tmp_path):
         {"dimension": "preference", "count": 1},
         {"dimension": "fact", "count": 1},
     ]
-    assert next(e for e in detail["entries"] if e["topic"] == "a")["sources_count"] == 1
+    entry_a = next(e for e in detail["entries"] if e["topic"] == "a")
+    assert entry_a["sources_count"] == 1
+    assert (entry_a["variant"], entry_a["variant_seq"]) == ("normal", 0)
 
     assert client.get("/admin/api/users/webchat/missing").status_code == 404
 
@@ -138,6 +140,7 @@ def test_entries_search_and_facets(tmp_path):
     res = client.get("/admin/api/entries", params={"q": "alpha"})
     assert res.status_code == 200
     assert res.json()["total"] == 1
+    assert (res.json()["items"][0]["variant"], res.json()["items"][0]["variant_seq"]) == ("normal", 0)
 
     res = client.get("/admin/api/entries", params={"dimension": "fact"})
     assert res.json()["total"] == 1

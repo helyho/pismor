@@ -39,6 +39,7 @@ class ReviewQueueItem(BaseModel):
     user_id: str
     dimension: str
     topic: str
+    variant: str
     summary: str
     confidence: float
     status: str
@@ -68,6 +69,8 @@ class ReviewEntryOut(BaseModel):
     user_id: str
     dimension: str
     topic: str
+    variant: str
+    variant_seq: int
     id: str
     confidence: float
     status: str
@@ -180,6 +183,8 @@ class UserEntryOut(BaseModel):
     id: str
     dimension: str
     topic: str
+    variant: str
+    variant_seq: int
     status: str
     confidence: float
     summary: str
@@ -279,6 +284,8 @@ class EntryListItem(BaseModel):
     user_id: str
     dimension: str
     topic: str
+    variant: str
+    variant_seq: int
     summary: str
     status: str
     confidence: float

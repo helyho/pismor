@@ -102,6 +102,7 @@ def test_queue_filters_and_pagination(tmp_path):
     assert body["page_size"] == 1
     assert len(body["items"]) == 1
     assert body["items"][0]["topic"] == "a"
+    assert body["items"][0]["variant"] == "normal"
 
     res = client.get("/admin/api/review/queue", params={"dimension": "preference"})
     assert res.json()["total"] == 2
@@ -154,6 +155,8 @@ def test_entry_detail_returns_evidence_history_and_conflict(tmp_path):
     assert res.status_code == 200
     body = res.json()
     assert body["entry"]["conflict_marks"] == ["preference_other"]
+    assert body["entry"]["variant"] == "normal"
+    assert body["entry"]["variant_seq"] == 0
     assert body["sources"][0]["quote"] == "我喜欢简洁"
     assert body["history"][0]["decision"] == "confirm"
     assert body["history"][0]["actor"] == "reviewer"

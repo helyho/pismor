@@ -15,7 +15,7 @@ import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
-from pismor.core.keys import entry_key
+from pismor.core.keys import entry_key, vec_key
 from pismor.core.schemas import _KEY_UNSAFE_CHARS
 from pismor.pipeline.safety import (
     has_sensitive_detail,
@@ -26,6 +26,7 @@ from pismor.pipeline.safety import (
     topics_near,
 )
 from pismor.pipeline import writer
+from pismor.pipeline.resolver import neighbor_candidates, neighbor_conflict
 
 
 STATUSES = frozenset({
@@ -536,4 +537,163 @@ def apply_entry_edit(
         "stale": False,
         "id": new_id,
         "updated_at": now,
+    }
+
+
+# ---------------------------------------------------------------------------
+# 手工录入创建（admin manual entry）
+# ---------------------------------------------------------------------------
+
+# check_entry_create 错误中直接映射 SafetyRejectedError 的安全码（422）；
+# user_deleted 映射 UserDeletedError（409）；其余为字段级错误（400）。
+_SAFETY_REJECT_CODES = frozenset({
+    "instruction_detected", "sensitive_detail", "quote_not_negated",
+})
+
+# 向量化失败告警（brief 固定文案）
+_VECTOR_FAILED_WARNING = (
+    "记忆已保存但向量化失败，语义召回可能找不到它；可编辑正文触发重新向量化"
+)
+
+
+class EntryExistsError(Exception):
+    """同键条目已存在（含 archived）→ 路由 409；existing 为 7 列冲突行。"""
+
+    def __init__(self, existing: dict, message: str = "相同主题的条目已存在"):
+        super().__init__(message)
+        self.existing = existing
+        self.message = message
+
+
+class UserDeletedError(Exception):
+    """用户已删除（墓碑未恢复）→ 路由 409。"""
+
+
+class SafetyRejectedError(Exception):
+    """安全规则拒绝或写入被拒 → 路由 422；errors 为 FieldError 列表。"""
+
+    def __init__(self, errors: list[FieldError]):
+        super().__init__("; ".join(e.message for e in errors) or "safety rejected")
+        self.errors = errors
+
+
+def create_entry(conn, taxonomy, *, user_source, user_id, dimension, topic,
+                 summary, body, quote, confidence, origin_ref, embedder, llm,
+                 now) -> dict:
+    """手工录入创建：校验 → 冲突决策 → 单动作落库 → 回读实际行。
+
+    返回 {ok, id, dimension, topic(实际值，可能带+), status, confidence,
+    warnings, conflicts, errors}。ok=False 时 errors 为字段级 FieldError
+    （路由 400），条目未写；同键抛 EntryExistsError、墓碑抛 UserDeletedError、
+    安全拒绝抛 SafetyRejectedError、近邻检查 LLM 不可用抛 LlmUnavailable，
+    均由路由映射状态码并留痕。调用方负责 audit（本函数不审计、不 commit
+    之外的连接操作——apply_actions 自带事务）。
+
+    冲突决策顺序：近似 taboo（topics_near，代码级恒胜）→ CONFLICT(("taboo", …))；
+    对端维度有候选行（taboo↔preference）→ neighbor_conflict(strict=True)，
+    LLM 判互斥 → CONFLICT(对端键)；同 topic taboo 不进 CONFLICT——writer._add
+    内部处理（新行 degraded ×0.8、conflict_lost）；否则 ADD。
+    """
+    checked = check_entry_create(
+        conn, taxonomy,
+        user_source=user_source, user_id=user_id, dimension=dimension,
+        topic=topic, summary=summary, body=body, quote=quote,
+        confidence=confidence,
+    )
+    normalized = checked.normalized_topic
+
+    safety_errors = [e for e in checked.errors if e.code in _SAFETY_REJECT_CODES]
+    if safety_errors:
+        raise SafetyRejectedError(safety_errors)
+    if any(e.code == "user_deleted" for e in checked.errors):
+        raise UserDeletedError("用户已删除，恢复后才能新建条目")
+    if checked.errors:
+        # 其余字段级错误：条目未写，交路由 400
+        return {"ok": False, "id": None, "dimension": dimension,
+                "topic": normalized, "status": None, "confidence": None,
+                "warnings": checked.warnings, "conflicts": [],
+                "errors": checked.errors}
+
+    existing = find_same_key(conn, user_source, user_id, dimension, normalized)
+    if existing is not None:
+        if existing["status"] == "archived":
+            raise EntryExistsError(existing, "相同主题的条目已归档，请走编辑恢复")
+        raise EntryExistsError(existing)
+
+    candidate = {
+        "dimension": dimension,
+        "topic": normalized,
+        "summary": (summary or "").strip(),
+        "body": (body or "").strip(),
+        "quote": (quote or "").strip(),
+        "confidence": float(confidence),
+        "kind": "explicit",  # 手工录入按显式证据，避开 inferred_cap 0.8
+    }
+    near = find_near_taboo(conn, user_source, user_id, dimension, normalized)
+    if near is not None:
+        action = {"op": "CONFLICT", "candidate": candidate,
+                  "target": ("taboo", near["topic"])}
+    elif neighbor_candidates(conn, user_source, user_id, dimension):
+        target = neighbor_conflict(conn, user_source, user_id, candidate, llm,
+                                   strict=True)
+        action = ({"op": "CONFLICT", "candidate": candidate, "target": target}
+                  if target is not None
+                  else {"op": "ADD", "candidate": candidate})
+    else:
+        action = {"op": "ADD", "candidate": candidate}
+
+    # 敏感主题置信上限（按归一后 canonical topic 查 topic_overrides）
+    candidate["confidence"] = min(
+        float(confidence), sensitive_cap(taxonomy, dimension, normalized) or 1.0)
+
+    try:
+        applied = writer.apply_actions(conn, user_source, user_id, [action],
+                                       embedder, "admin_manual", origin_ref, now)
+    except sqlite3.IntegrityError:
+        # 并发同键竞态：另一请求在本请求 find_same_key 之后先落库同一四元组。
+        # 重新查询给 409 带上 existing；条目未重复写入。
+        winner = find_same_key(conn, user_source, user_id, dimension, normalized)
+        raise EntryExistsError(winner or {}) from None
+    if not applied:
+        raise SafetyRejectedError([FieldError(
+            "body", "write_rejected", "条目未能写入：缺少原话引用，无法保存")])
+
+    # fetch_final：CONFLICT 双存落库 topic 带 "+" 前缀，裸键与变形键都可能命中
+    row = conn.execute(
+        "SELECT id, dimension, topic, status, confidence FROM entries"
+        " WHERE user_source=? AND user_id=? AND dimension=?"
+        " AND topic IN (?, '+' || ?)",
+        (user_source, user_id, dimension, normalized, normalized),
+    ).fetchone()
+    warnings = list(checked.warnings)
+    conflicts: list[dict] = []
+    if row is not None:
+        if row["status"] == "degraded":
+            warnings.append("记忆已保存，但与既有条目冲突，已降级并降低置信度")
+        marks = conn.execute(
+            "SELECT conflict_with FROM entries WHERE id=?", (row["id"],)
+        ).fetchone()
+        ids = json.loads(marks["conflict_with"]) if marks and marks["conflict_with"] else []
+        if ids:
+            placeholders = ",".join("?" * len(ids))
+            conflicts = [dict(r) for r in conn.execute(
+                f"SELECT {_conflict_columns()} FROM entries"
+                f" WHERE id IN ({placeholders})", ids)]
+        if writer.entry_has_vector(
+                conn, vec_key(user_source, user_id, row["dimension"], row["topic"])
+        ) is False:
+            # None（表未启用）不算故障，不告警；键为 vec_key 组合键——
+            # embeddings.entry_id 存四元组键而非 entries.id（writer 既有约定）
+            warnings.append(_VECTOR_FAILED_WARNING)
+
+    return {
+        "ok": row is not None,
+        "id": row["id"] if row else None,
+        "dimension": row["dimension"] if row else dimension,
+        "topic": row["topic"] if row else normalized,
+        "status": row["status"] if row else None,
+        "confidence": row["confidence"] if row else None,
+        "warnings": warnings,
+        "conflicts": conflicts,
+        "errors": [],
     }

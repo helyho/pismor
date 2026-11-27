@@ -343,6 +343,56 @@ class EntryEditOut(BaseModel):
     warnings: list[str] = Field(default_factory=list)
 
 
+class FieldErrorOut(BaseModel):
+    """字段级校验错误（entry_service.FieldError 的出参形状）。"""
+    field: str
+    code: str
+    message: str
+
+
+class EntryCreateIn(BaseModel):
+    # confidence 无 pydantic 约束：越界走 check_content 的 out_of_range
+    # FieldError → 400（业务校验单一出口），pydantic 拦截会变成 422
+    user_source: str
+    user_id: str
+    dimension: str
+    topic: str
+    summary: str
+    body: str
+    quote: str
+    confidence: float
+    origin_ref: str | None = None
+
+
+class EntryConflictRow(BaseModel):
+    id: str
+    dimension: str
+    topic: str
+    status: str
+    summary: str
+    confidence: float
+    updated_at: str
+
+
+class EntryCreateOut(BaseModel):
+    ok: bool
+    id: str | None = None
+    dimension: str
+    topic: str
+    status: str | None = None
+    confidence: float | None = None
+    warnings: list[str] = Field(default_factory=list)
+    conflicts: list[EntryConflictRow] = Field(default_factory=list)
+
+
+class EntryValidateOut(BaseModel):
+    ok: bool
+    normalized_topic: str
+    errors: list[FieldErrorOut] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+    conflicts: list[EntryConflictRow] = Field(default_factory=list)
+
+
 class ConfigWriteIn(BaseModel):
     expected_version: str
     yaml: str | None = None

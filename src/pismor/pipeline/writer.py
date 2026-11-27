@@ -601,3 +601,21 @@ def _write_vectors(conn, us, uid, vectors, precomputed):
         except (json.JSONDecodeError, TypeError, sqlite3.Error):
             # 降级（spec §20）：该条目跳过向量行，条目行保留；维度配错等 sqlite 错误同样不阻断
             continue
+
+
+def entry_has_vector(conn, entry_key: str) -> bool | None:
+    """条目是否有向量行；表结构细节封在本写入器内。
+
+    entry_key 是条目在 embeddings 表中的键位——writer 既有约定：该表
+    entry_id 列存 vec_key 四元组组合键（非 entries.id），调用方（如
+    create_entry）用 vec_key(user_source, user_id, dimension, topic) 构造。
+
+    返回 True/False 仅在 embeddings 表存在时有意义：False = 表存在但该条目
+    无向量行（如嵌入失败被降级跳过）。表未启用 → None，调用方据此整体跳过
+    向量化告警（"未启用"不是故障，不该提示用户修复）。
+    """
+    if not _has_embeddings_table(conn):
+        return None
+    return conn.execute(
+        "SELECT 1 FROM embeddings WHERE entry_id=?", (entry_key,)
+    ).fetchone() is not None

@@ -11,6 +11,8 @@ import yaml
 
 from pismor.pipeline.aggregator import run_daily
 from pismor.core.taxonomy import load_taxonomy
+from pismor.pipeline.extractor import extract as _extract
+from pismor.pipeline.normalize import normalize
 
 REPO = Path(__file__).resolve().parent.parent
 NOW = "2026-12-24T10:00:00+08:00"
@@ -517,3 +519,49 @@ def test_alias_reverted_when_transaction_fails(conn, taxonomy_writable,
     raw = yaml.safe_load(taxonomy_writable.path.read_text(encoding="utf-8"))
     pref_raw = next(d for d in raw["dimensions"] if d["key"] == "preference")
     assert "回复要简短" not in (pref_raw.get("topic_aliases") or {})
+
+
+
+class ExtractLLM:
+    """抽取阶段的假 LLM：返回固定 candidates。"""
+
+    def __init__(self, candidates):
+        self.reply = {"candidates": candidates}
+        self.calls = []
+
+    def chat_json(self, system, user, schema):
+        self.calls.append((system, user, schema))
+        return self.reply
+
+
+def test_alias_converges_next_extraction(conn, taxonomy_writable, fake_llm_merge):
+    """spec 测试计划 5：日批写别名后，同说法再抽取命中 canonical，不再进观察区。"""
+    _seed_orphans(conn, topic_new="preference/回复要简短")
+    run_daily(conn, taxonomy_writable, fake_llm_merge, auto_activate=True, now=NOW)
+    pref = taxonomy_writable.dimensions["preference"]
+    assert pref.topic_aliases["回复要简短"] == "lang"
+
+    llm = ExtractLLM([{
+        "dimension": "preference", "topic": "回复要简短", "scope": "global",
+        "body": "偏好简短回复", "summary": "简短回复", "confidence": 0.9,
+        "kind": "explicit", "quote": "回复简短点", "topic_new": None,
+    }])
+    ev = {"event_type": "text", "source": "d", "user_ref": "u",
+          "content": "回复简短点", "ts": "t"}
+    out = _extract(normalize(ev), taxonomy_writable, llm, known_ids=[])
+
+    assert len(out) == 1
+    assert out[0]["dimension"] == "preference"
+    assert out[0]["topic"] == "lang"
+    assert "status" not in out[0]  # 命中白名单，不再进 orphan
+
+
+def test_new_topic_same_as_bare_skips_alias(conn, taxonomy_writable):
+    """桶名与裸主题相同时不写别名（alias == canonical 守卫）。"""
+    llm = FakeLLM({"action": "new_topic", "dimension": "preference", "topic": "回复要简短"})
+    _seed_orphans(conn, topic_new="preference/回复要简短")
+    run_daily(conn, taxonomy_writable, llm, auto_activate=True, now=NOW)
+
+    pref = taxonomy_writable.dimensions["preference"]
+    assert "回复要简短" in pref.topics
+    assert "回复要简短" not in pref.topic_aliases

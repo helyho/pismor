@@ -298,7 +298,11 @@ def create_entry_endpoint(
                 now=now,
             )
         except SafetyRejectedError as exc:
-            _audit_rejected(conn, principal, payload, "safety_rejected",
+            # write_rejected 是写入层基建失败（applied 为空），与安全规则拒绝分开留痕
+            reason = ("write_rejected"
+                      if exc.errors and exc.errors[0].code == "write_rejected"
+                      else "safety_rejected")
+            _audit_rejected(conn, principal, payload, reason,
                             entry_key(payload.dimension, payload.topic))
             raise HTTPException(
                 status_code=422,

@@ -87,6 +87,18 @@ const panelWarnings = computed<string[] | null>(() => {
   return httpWarnings.value
 })
 
+// validate-create 的同键冲突行（409 的冲突走 existing 单独展示，不经此面板）
+const panelConflicts = computed<EntryConflictRow[] | null>(() => {
+  if (validate.value) return validate.value.conflicts
+  return null
+})
+
+// validate ok=false 且无字段错误但同键冲突：保存必然被拒，需明确提示
+const keyConflict = computed(() => {
+  const v = validate.value
+  return Boolean(v && !v.ok && !v.errors.length && v.conflicts.length)
+})
+
 function resetFeedback(): void {
   validate.value = null
   httpErrors.value = null
@@ -243,7 +255,20 @@ watch(
           class="create-alert"
         />
 
-        <ConflictPanel :errors="panelErrors" :warnings="panelWarnings" />
+        <el-alert
+          v-if="keyConflict"
+          title="同键记忆已存在，保存将被拒绝"
+          type="warning"
+          :closable="false"
+          show-icon
+          class="create-alert"
+        />
+
+        <ConflictPanel
+          :errors="panelErrors"
+          :warnings="panelWarnings"
+          :conflicts="panelConflicts"
+        />
 
         <div v-if="isConflict && existing" class="existing-box">
           <h4>同键记忆已存在</h4>

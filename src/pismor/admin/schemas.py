@@ -352,7 +352,7 @@ class FieldErrorOut(BaseModel):
 
 class EntryCreateIn(BaseModel):
     # confidence 无 pydantic 约束：越界走 check_content 的 out_of_range
-    # FieldError → 400（业务校验单一出口），pydantic 拦截会变成 422
+    # FieldError → 400（业务校验单一出口），pydantic 拦截会变成 422；缺省 1.0
     user_source: str
     user_id: str
     dimension: str
@@ -360,7 +360,7 @@ class EntryCreateIn(BaseModel):
     summary: str
     body: str
     quote: str
-    confidence: float
+    confidence: float = 1.0
     origin_ref: str | None = None
 
 

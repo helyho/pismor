@@ -114,7 +114,7 @@ async function onEditSaved(): Promise<void> {
 
 const budget = ref(2000)
 const dimensions = ref<string[]>([])
-const includeProfile = ref(true)
+const includeMemory = ref(true)
 const queryText = ref('')
 const assembleResult = ref<AssembleResult | null>(null)
 
@@ -124,7 +124,7 @@ const assembleMutation = useMutation<AssembleResult, Error, void>({
   mutationFn: () => {
     const params = new URLSearchParams({
       budget: String(budget.value),
-      include_profile: String(includeProfile.value),
+      include_memory: String(includeMemory.value),
     })
     if (dimensions.value.length) params.set('dimensions', dimensions.value.join(','))
     if (queryText.value.trim()) params.set('query', queryText.value.trim())
@@ -275,7 +275,7 @@ async function purgeUser(): Promise<void> {
           删除用户
         </el-button>
         <el-button
-          v-if="detail?.tombstone && !detail.tombstone.purged_at && auth.can('profile.write')"
+          v-if="detail?.tombstone && !detail.tombstone.purged_at && auth.can('memory.write')"
           type="success"
           :loading="restoring"
           @click="restoreUser"
@@ -283,7 +283,7 @@ async function purgeUser(): Promise<void> {
           恢复用户
         </el-button>
         <el-button
-          v-if="detail?.tombstone && !detail.tombstone.purged_at && auth.can('profile.delete')"
+          v-if="detail?.tombstone && !detail.tombstone.purged_at && auth.can('memory.delete')"
           type="danger"
           :icon="Delete"
           :loading="purging"
@@ -371,7 +371,7 @@ async function purgeUser(): Promise<void> {
               <template #default="{ row }">
                 <el-button link type="primary" @click="openEntry(row)">查看</el-button>
                 <el-button
-                  v-if="auth.can('profile.write') && !detail.tombstone"
+                  v-if="auth.can('memory.write') && !detail.tombstone"
                   link
                   type="primary"
                   @click="openEdit(row)"
@@ -407,7 +407,7 @@ async function purgeUser(): Promise<void> {
             </el-select>
           </el-form-item>
           <el-form-item label="注入记忆">
-            <el-switch v-model="includeProfile" />
+            <el-switch v-model="includeMemory" />
           </el-form-item>
           <el-form-item label="话题">
             <el-input
@@ -481,7 +481,7 @@ async function purgeUser(): Promise<void> {
     <EntryDetailDrawer
       v-model="drawerVisible"
       :target="drawerTarget"
-      :editable="auth.can('profile.write') && !detail?.tombstone"
+      :editable="auth.can('memory.write') && !detail?.tombstone"
       @edit="editCurrent"
     />
     <EntryEditDialog v-model="editVisible" :target="editTarget" @saved="onEditSaved" />

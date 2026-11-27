@@ -10,6 +10,7 @@ import type {
   ConfigWriteResult,
 } from '@/api/types'
 import ConfigField from '@/components/ConfigField.vue'
+import KeywordListEditor from '@/components/KeywordListEditor.vue'
 import TopicAliasesEditor from '@/components/TopicAliasesEditor.vue'
 import TopicOverridesEditor from '@/components/TopicOverridesEditor.vue'
 import ValidationPanel from '@/components/ValidationPanel.vue'
@@ -76,15 +77,14 @@ function isReadonly(path: string): boolean {
   return readonlyPaths.has(path)
 }
 
-function arrayText(value: unknown): string {
-  return Array.isArray(value) ? value.join('\n') : ''
-}
-
-function setArray(section: string, key: string, text: string): void {
-  sectionData(section)[key] = text
-    .split('\n')
-    .map((item) => item.trim())
-    .filter(Boolean)
+function firstEmptyListField(): string | null {
+  for (const section of sections) {
+    const data = sectionData(section)
+    for (const [key, value] of Object.entries(data)) {
+      if (Array.isArray(value) && value.length === 0) return `${section}.${key}`
+    }
+  }
+  return null
 }
 
 function errorText(value: unknown): string {
@@ -181,6 +181,13 @@ async function validateTaxonomy(): Promise<void> {
 
 async function saveSettings(): Promise<void> {
   if (!settingsDoc.value) return
+  if (settingsMode.value === 'form') {
+    const empty = firstEmptyListField()
+    if (empty) {
+      error.value = `${empty} 至少保留一个取值`
+      return
+    }
+  }
   saving.value = true
   error.value = ''
   message.value = ''
@@ -408,8 +415,23 @@ onMounted(refreshAll)
               :readonly="isReadonly(`${section}.${key}`)"
               :wide="Array.isArray(fieldValue(section, key))"
             >
-              <span v-if="isReadonly(`${section}.${key}`)" class="config-value">
-                {{ fieldValue(section, key) }}
+              <span
+                v-if="isReadonly(`${section}.${key}`)"
+                class="config-value"
+                :class="{ 'config-value--tags': Array.isArray(fieldValue(section, key)) }"
+              >
+                <template v-if="Array.isArray(fieldValue(section, key))">
+                  <el-tag
+                    v-for="item in fieldValue(section, key)"
+                    :key="item"
+                    size="small"
+                    type="info"
+                    disable-transitions
+                  >
+                    {{ item }}
+                  </el-tag>
+                </template>
+                <template v-else>{{ fieldValue(section, key) }}</template>
               </span>
               <el-switch
                 v-else-if="typeof fieldValue(section, key) === 'boolean'"
@@ -423,12 +445,10 @@ onMounted(refreshAll)
                 controls-position="right"
                 @update:model-value="(value) => setField(section, key, value)"
               />
-              <el-input
+              <KeywordListEditor
                 v-else-if="Array.isArray(fieldValue(section, key))"
-                type="textarea"
-                :rows="4"
-                :model-value="arrayText(fieldValue(section, key))"
-                @update:model-value="(value) => setArray(section, key, String(value))"
+                :model-value="fieldValue(section, key)"
+                @update:model-value="(items) => setField(section, key, items)"
               />
               <el-input
                 v-else
@@ -711,6 +731,14 @@ onMounted(refreshAll)
   font-size: 13px;
   line-height: 1.6;
   word-break: break-all;
+}
+.config-value--tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.config-value--tags :deep(.el-tag) {
+  max-width: 100%;
 }
 .section-name {
   margin-left: 8px;

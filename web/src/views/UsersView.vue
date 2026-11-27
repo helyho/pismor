@@ -287,7 +287,7 @@ async function purgeTombstone(row: unknown): Promise<void> {
               <template #default="{ row }">
                 <el-button link type="primary" @click="openUser(row)">查看</el-button>
                 <el-button
-                  v-if="!row.purged_at && auth.can('profile.write')"
+                  v-if="!row.purged_at && auth.can('memory.write')"
                   link
                   type="success"
                   @click="restoreTombstone(row)"
@@ -295,7 +295,7 @@ async function purgeTombstone(row: unknown): Promise<void> {
                   恢复
                 </el-button>
                 <el-button
-                  v-if="!row.purged_at && auth.can('profile.delete')"
+                  v-if="!row.purged_at && auth.can('memory.delete')"
                   link
                   type="danger"
                   @click="purgeTombstone(row)"

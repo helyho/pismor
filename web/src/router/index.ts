@@ -26,19 +26,19 @@ const router = createRouter({
           path: 'users',
           name: 'users',
           component: () => import('@/views/UsersView.vue'),
-          meta: { title: '用户', capability: 'profile.read' },
+          meta: { title: '用户', capability: 'memory.read' },
         },
         {
           path: 'users/:source/:user',
           name: 'user-detail',
           component: () => import('@/views/UserDetailView.vue'),
-          meta: { title: '用户记忆', capability: 'profile.read' },
+          meta: { title: '用户记忆', capability: 'memory.read' },
         },
         {
           path: 'entries',
           name: 'entries',
           component: () => import('@/views/EntriesView.vue'),
-          meta: { title: '记忆', capability: 'profile.read' },
+          meta: { title: '记忆', capability: 'memory.read' },
         },
         {
           path: 'system',

@@ -26,8 +26,8 @@ const navGroups = [
   {
     label: '数据',
     items: [
-      { path: '/users', label: '用户', icon: User, capability: 'profile.read' },
-      { path: '/entries', label: '记忆', icon: Collection, capability: 'profile.read' },
+      { path: '/users', label: '用户', icon: User, capability: 'memory.read' },
+      { path: '/entries', label: '记忆', icon: Collection, capability: 'memory.read' },
     ],
   },
   {

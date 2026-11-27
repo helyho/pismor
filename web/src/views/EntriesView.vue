@@ -328,7 +328,7 @@ async function onEditSaved(): Promise<void> {
           <template #default="{ row }">
             <el-button link type="primary" @click.stop="openEntry(row)">查看</el-button>
             <el-button
-              v-if="auth.can('profile.write')"
+              v-if="auth.can('memory.write')"
               link
               type="primary"
               @click.stop="openEdit(row)"
@@ -354,7 +354,7 @@ async function onEditSaved(): Promise<void> {
     <EntryDetailDrawer
       v-model="drawerVisible"
       :target="drawerTarget"
-      :editable="auth.can('profile.write')"
+      :editable="auth.can('memory.write')"
       @edit="editCurrent"
     />
 

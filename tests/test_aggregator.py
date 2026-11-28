@@ -145,6 +145,18 @@ def seeded_degraded_old(conn):
 
 
 @pytest.fixture
+def seeded_degraded_old_conflict(conn):
+    # degraded 冲突副本 180 天无更新：不占 normal 槽位，归档规则不应改动它
+    entry_id = _entry(conn, dim="preference", topic="format", status="degraded",
+                      confidence=0.5, created="2026-05-01T09:00:00+08:00",
+                      updated="2026-05-01T09:00:00+08:00",
+                      body="偏好 markdown 输出", summary="markdown")
+    conn.execute(
+        "UPDATE entries SET variant='conflict', variant_seq=1 WHERE id=?", (entry_id,))
+    return entry_id
+
+
+@pytest.fixture
 def seeded_old_pending_review(conn):
     return _entry(conn, dim="preference", topic="style", status="pending_review",
                   created="2026-12-04T09:00:00+08:00",
@@ -356,6 +368,21 @@ def test_degraded_archived_after_180d(conn, seeded_degraded_old, taxonomy):
     # 归档让出 normal 唯一槽位（不再以 normal 形态占位）
     assert conn.execute(
         "SELECT COUNT(*) c FROM entries WHERE variant='normal'").fetchone()["c"] == 0
+
+
+def test_degraded_conflict_not_archived(conn, seeded_degraded_old_conflict, taxonomy):
+    """归档只针对 normal：degraded 的 conflict 行保持原形态与状态，也不计入 stats。"""
+    before = conn.execute(
+        "SELECT variant, variant_seq, status, updated_at, archived_at FROM entries"
+    ).fetchone()
+    stats = run_daily(conn, taxonomy, FakeLLM([]), True, now=NOW)
+    assert stats["archived"] == 0
+    after = conn.execute(
+        "SELECT variant, variant_seq, status, updated_at, archived_at FROM entries"
+    ).fetchone()
+    assert dict(after) == dict(before)
+    assert after["variant"] == "conflict" and after["status"] == "degraded"
+    assert after["archived_at"] is None
 
 
 def test_archived_entry_releases_slot_for_same_topic(conn, seeded_degraded_old, taxonomy):

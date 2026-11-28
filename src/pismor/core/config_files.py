@@ -10,7 +10,6 @@ import fcntl
 import hashlib
 import os
 import re
-import shutil
 import tempfile
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -245,31 +244,6 @@ def write_config(
             backup_config(path, backup_root, keep=keep, label=label)
         write_text_atomic(path, text)
         return file_version(path)
-
-
-def restore_config(
-    path: Path,
-    backup_root: Path,
-    backup_id: str,
-    *,
-    expected_version: str | None = None,
-    keep: int = 30,
-) -> str:
-    src = backup_path(backup_root, backup_id)
-    text = src.read_text(encoding="utf-8")
-    return write_config(
-        path,
-        text,
-        expected_version=expected_version,
-        backup_root=backup_root,
-        keep=keep,
-        label="rollback",
-    )
-
-
-def copy_file(src: Path, dst: Path) -> None:
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(src, dst)
 
 
 def as_plain(data: Any) -> Any:

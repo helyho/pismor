@@ -9,10 +9,18 @@ import os
 from pathlib import Path
 from typing import Any
 
-from pismor.core.config import Settings, parse_settings
+from pismor.core.config import (
+    Settings,
+    numeric_rules,
+    parse_settings_strict,
+    path_fields,
+    readonly_fields,
+    restart_fields,
+)
 
-READONLY_SETTINGS = {"db_path", "taxonomy_path", "embedding.dimensions"}
-PATH_SETTINGS = {"db_path", "taxonomy_path", "backup.root"}
+# 字段约束与分类只在 core.config 的 field metadata 声明一次，这里派生使用。
+READONLY_SETTINGS = readonly_fields()
+PATH_SETTINGS = path_fields()
 UNUSED_TAXONOMY_META = {"id_pattern", "entry_language", "scenario"}
 
 
@@ -67,18 +75,14 @@ def _num_errors(data: dict, path: str, *, lo=None, hi=None, integer=False) -> li
 
 
 def _settings_restart_paths(changes: list[dict]) -> list[str]:
-    restart = []
-    for change in changes:
-        path = change["path"]
-        if path in READONLY_SETTINGS:
-            continue
-        if path.startswith("llm."):
-            restart.append(path)
-        elif path.startswith("embedding.") and path != "embedding.min_similarity":
-            restart.append(path)
-        elif path in {"db_path", "taxonomy_path", "assembler.tokenizer"}:
-            restart.append(path)
-    return sorted(set(restart))
+    restart = restart_fields()
+    return sorted(
+        {
+            change["path"]
+            for change in changes
+            if change["path"] in restart and change["path"] not in READONLY_SETTINGS
+        }
+    )
 
 
 def validate_settings(
@@ -98,8 +102,11 @@ def validate_settings(
             "restart_required": [],
             "applied": [],
         }
+    unknown: list[str] = []
     try:
-        new_settings = parse_settings(raw, path=config_path or current.config_path)
+        new_settings, unknown = parse_settings_strict(
+            raw, path=config_path or current.config_path
+        )
     except Exception as exc:  # noqa: BLE001 - 校验阶段把所有解析错误转成字段提示
         return {
             "ok": False,
@@ -110,30 +117,17 @@ def validate_settings(
             "applied": [],
         }
 
-    errors += _num_errors(raw, "gate.auto_min", lo=0, hi=1)
-    errors += _num_errors(raw, "gate.review_min", lo=0, hi=1)
-    errors += _num_errors(raw, "gate.inferred_cap", lo=0, hi=1)
-    errors += _num_errors(raw, "assembler.taboo_budget_share", lo=0, hi=1)
-    errors += _num_errors(raw, "assembler.related_top_k", lo=1, integer=True)
-    errors += _num_errors(raw, "assembler.half_life_days", lo=0.1)
-    errors += _num_errors(raw, "assembler.clarify_ttl_days", lo=0, integer=True)
-    errors += _num_errors(raw, "pipeline.known_ids_limit", lo=1, integer=True)
-    errors += _num_errors(raw, "pipeline.reinforce_top_k", lo=1, integer=True)
-    errors += _num_errors(raw, "pipeline.trigger_long_message", lo=1, integer=True)
-    errors += _num_errors(raw, "pipeline.max_body_chars", lo=1, integer=True)
-    errors += _num_errors(raw, "intake.max_content_chars", lo=1, integer=True)
-    errors += _num_errors(raw, "intake.max_messages", lo=1, integer=True)
-    errors += _num_errors(raw, "intake.max_message_chars", lo=1, integer=True)
-    errors += _num_errors(raw, "intake.max_total_chars", lo=1, integer=True)
-    errors += _num_errors(raw, "backup.keep", lo=0, integer=True)
-    errors += _num_errors(raw, "serve.daily_interval_seconds", lo=1)
-    errors += _num_errors(raw, "serve.max_request_bytes", lo=1024, integer=True)
-    errors += _num_errors(raw, "llm.timeout_seconds", lo=0.1)
-    errors += _num_errors(raw, "llm.retries", lo=0, integer=True)
-    errors += _num_errors(raw, "llm.log_preview_chars", lo=0, integer=True)
-    errors += _num_errors(raw, "embedding.dimensions", lo=1, integer=True)
-    errors += _num_errors(raw, "embedding.batch_size", lo=1, integer=True)
-    errors += _num_errors(raw, "embedding.min_similarity", lo=-1, hi=1)
+    for path, rule in numeric_rules():
+        errors += _num_errors(
+            raw,
+            path,
+            lo=rule.get("min"),
+            hi=rule.get("max"),
+            integer=bool(rule.get("integer")),
+        )
+
+    for path in unknown:
+        warnings.append(f"{path}: 未知配置项，已忽略（原文件中的该键会保留）")
 
     gate = raw.get("gate") or {}
     if (

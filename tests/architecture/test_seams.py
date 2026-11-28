@@ -134,3 +134,32 @@ def test_assemble_binding_is_centralized():
                     "recall_conflicts=", "taboo_merge_threshold=", "related_top_k="):
             assert key not in args, f"{rel} 的 assemble 调用仍在搬运 {key}"
         assert "policy=" in args, f"{rel} 的 assemble 调用未传 policy"
+
+# ---------------------------------------------------------------------------
+# 配置：字段规则只在 core.config，保存/恢复编排只在 admin.config_flow
+# ---------------------------------------------------------------------------
+
+# config_files 定义并实现；config_flow 是保存/恢复编排；
+# taxonomy_edit 写待审 alias 文件（独立用途，不是保存/恢复）。
+CONFIG_WRITE_OWNERS = {
+    "core/config_files.py",
+    "admin/config_flow.py",
+    "core/taxonomy_edit.py",
+}
+_WRITE_CONFIG = re.compile(r"\bwrite_config\s*\(", re.I)
+
+
+def test_config_writes_go_through_flow():
+    offenders = sorted(set(_hits(_WRITE_CONFIG)) - CONFIG_WRITE_OWNERS)
+    assert offenders == [], f"保存/恢复编排越界，改走 admin.config_flow: {offenders}"
+
+
+def test_config_numeric_rules_are_derived():
+    text = (SRC / "admin" / "config_service.py").read_text(encoding="utf-8")
+    assert "numeric_rules()" in text, "validate_settings 应从 core.config.numeric_rules() 派生范围"
+    assert '_num_errors(raw, "' not in text, "不得再手写字面量路径声明范围"
+
+
+def test_dead_config_helpers_stay_deleted():
+    hits = _hits(re.compile(r"\b(?:restore_config|copy_file)\s*\(", re.I))
+    assert hits == {}, f"未使用的旧实现不得回潮: {hits}"

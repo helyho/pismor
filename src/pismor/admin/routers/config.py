@@ -5,26 +5,22 @@ from contextlib import closing
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 
+from pismor.admin import config_flow
 from pismor.admin.audit import record_admin_audit
 from pismor.admin.config_service import settings_to_data, validate_settings
 from pismor.admin.deps import Principal, get_settings, require
 from pismor.admin.schemas import ConfigBackupOut, ConfigValidateIn, ConfigWriteIn, ConfigWriteOut
 from pismor.core.comments import collect_comments_from_data
 from pismor.core.config import parse_settings
-from pismor.core.db import get_conn
 from pismor.core.config_files import (
     ConfigFileNotFound,
-    ConfigInvalid,
     ConfigVersionConflict,
     as_plain,
-    backup_path,
-    dump_yaml,
     list_backups,
-    merge_roundtrip,
     read_yaml,
     roundtrip_yaml,
-    write_config,
 )
+from pismor.core.db import get_conn
 
 router = APIRouter(prefix="/admin/api/config/settings", tags=["admin-config"])
 
@@ -49,12 +45,38 @@ def _audit(settings, principal: Principal, action: str, target: str, detail) -> 
         pass
 
 
+def _target(request: Request, settings, principal: Principal) -> config_flow.ConfigTarget:
+    path = settings.config_path
+
+    def publish(new) -> None:
+        request.app.state.settings_store.replace(new)
+        request.app.state.settings = new
+
+    return config_flow.ConfigTarget(
+        kind="settings",
+        noun="运行配置",
+        path=path,
+        backup_root=settings.backup.root / "config",
+        backup_keep=settings.backup.keep,
+        label="settings",
+        rollback_label="settings-rollback",
+        validate=lambda raw: validate_settings(raw, settings, config_path=path),
+        load=lambda p: parse_settings(as_plain(read_yaml(p)[0]), path=p),
+        publish=publish,
+        audit=lambda action, tgt, detail: _audit(settings, principal, action, tgt, detail),
+    )
+
+
+def _require_path(settings) -> None:
+    if settings.config_path is None:
+        raise HTTPException(status_code=404, detail="settings.yaml 路径未配置")
+
+
 @router.get("")
 def get_config(request: Request, _=Depends(require("settings.read"))):
     settings = get_settings(request)
+    _require_path(settings)
     path = settings.config_path
-    if path is None:
-        raise HTTPException(status_code=404, detail="settings.yaml 路径未配置")
     try:
         data, text, version = read_yaml(path)
     except ConfigFileNotFound:
@@ -88,53 +110,32 @@ def save(
 ):
     store = request.app.state.settings_store
     settings = store.current()
+    _require_path(settings)
     path = settings.config_path
-    if path is None:
-        raise HTTPException(status_code=404, detail="settings.yaml 路径未配置")
     raw, yaml_text = _parse_payload(payload)
-    report = validate_settings(raw, settings, config_path=path)
-    if not report["ok"]:
+    try:
+        result = config_flow.save(
+            _target(request, settings, principal),
+            raw=raw,
+            yaml_text=yaml_text,
+            expected_version=payload.expected_version,
+        )
+    except config_flow.ConfigRejected as exc:
         raise HTTPException(
             status_code=422,
-            detail={"message": "运行配置校验失败", "errors": report["errors"], "warnings": report["warnings"]},
+            detail={
+                "message": exc.message,
+                "errors": exc.report["errors"],
+                "warnings": exc.report["warnings"],
+            },
         )
-    if yaml_text is None:
-        rt_data, _old_text, _version = read_yaml(path)
-        merged = merge_roundtrip(rt_data, raw)
-        yaml_text = dump_yaml(merged)
-    backup_root = settings.backup.root / "config"
-    try:
-        version = write_config(
-            path,
-            yaml_text,
-            expected_version=payload.expected_version,
-            backup_root=backup_root,
-            keep=settings.backup.keep,
-            label="settings",
-        )
-        config, _text, _new_version = read_yaml(path)
-        new_settings = parse_settings(as_plain(config), path=path)
     except ConfigVersionConflict:
         raise HTTPException(status_code=409, detail="运行配置已被其他操作修改，请刷新后重试")
     except ConfigFileNotFound:
         raise HTTPException(status_code=404, detail=f"配置文件不存在: {path}")
-    except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=422, detail=f"运行配置写入失败: {exc}")
-    store.replace(new_settings)
-    request.app.state.settings = new_settings
-    _audit(settings, principal, "settings.save", str(path), {
-        "version": version,
-        "applied": report["applied"],
-        "restart_required": report["restart_required"],
-    })
-    return ConfigWriteOut(
-        ok=True,
-        version=version,
-        applied=report["applied"],
-        restart_required=report["restart_required"],
-        warnings=report["warnings"],
-        backup=None,
-    ).model_dump()
+    except config_flow.ConfigFailure as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    return ConfigWriteOut(**result).model_dump()
 
 
 @router.get("/backups", response_model=list[ConfigBackupOut])
@@ -155,37 +156,15 @@ def restore(
 ):
     store = request.app.state.settings_store
     settings = store.current()
-    path = settings.config_path
-    if path is None:
-        raise HTTPException(status_code=404, detail="settings.yaml 路径未配置")
-    root = settings.backup.root / "config"
+    _require_path(settings)
     try:
-        src = backup_path(root, backup_id)
-    except (ConfigFileNotFound, ConfigInvalid):
+        return config_flow.restore(_target(request, settings, principal), backup_id=backup_id)
+    except config_flow.ConfigBackupNotFound:
         raise HTTPException(status_code=404, detail="备份不存在")
-    text = src.read_text(encoding="utf-8")
-    raw = roundtrip_yaml().load(text)
-    if raw is None:
-        raw = {}
-    report = validate_settings(as_plain(raw), settings, config_path=path)
-    if not report["ok"]:
+    except config_flow.ConfigRejected as exc:
         raise HTTPException(
             status_code=422,
-            detail={"message": "备份配置校验失败", "errors": report["errors"]},
+            detail={"message": exc.message, "errors": exc.report["errors"]},
         )
-    try:
-        version = write_config(
-            path,
-            text,
-            backup_root=root,
-            keep=settings.backup.keep,
-            label="settings-rollback",
-        )
-        config, _new_text, _v = read_yaml(path)
-        new_settings = parse_settings(as_plain(config), path=path)
-    except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=422, detail=f"运行配置恢复失败: {exc}")
-    store.replace(new_settings)
-    request.app.state.settings = new_settings
-    _audit(settings, principal, "settings.restore", str(path), {"backup": backup_id, "version": version})
-    return {"ok": True, "version": version, "restored": backup_id}
+    except config_flow.ConfigFailure as exc:
+        raise HTTPException(status_code=422, detail=str(exc))

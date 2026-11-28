@@ -13,11 +13,11 @@
 - 任何异常只记日志不上抛：后台任务失败不得破坏 POST /events 的 202 语义；
   失败时撤销 intake 的 events_seen 标记并返回 False，调用方重发同一事件即可重放（审查 #1）。
 """
-import json
 import logging
 import sqlite3
 from datetime import datetime, timezone
 
+from pismor.core import conflict_marks
 from pismor.core.lifecycle import (
     IllegalTransition, check_transition, is_tombstoned, recallable_sql,
 )
@@ -167,11 +167,7 @@ def _clarify_pair_rows(conn, us, uid, conflicting_ids) -> list:
                 rows.append(r)
     # 扩展对端：行上的 conflict_with 标记（精确解析）指向的存活行
     for r in list(rows):
-        try:
-            marks = json.loads(r["conflict_with"]) if r["conflict_with"] else []
-        except (TypeError, ValueError):
-            marks = []
-        for m in marks:
+        for m in conflict_marks.decode_or_empty(r["conflict_with"]):
             other = conn.execute(
                 "SELECT * FROM entries WHERE user_source=? AND user_id=? AND id=?"
                 " AND status IN ('active','degraded')", (us, uid, str(m))).fetchone()

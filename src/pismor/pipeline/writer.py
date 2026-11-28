@@ -25,6 +25,7 @@ import logging
 import math
 import sqlite3
 
+from pismor.core import conflict_marks
 from pismor.core.lifecycle import IllegalTransition, check_transition
 from pismor.llm.embedder import EmbedUnavailable, l2_normalize
 from pismor.core.keys import (
@@ -263,21 +264,12 @@ def _rekey_conflict_marks(conn, us, uid, old_id, new_id):
         " WHERE user_source=? AND user_id=? AND conflict_with IS NOT NULL",
         (us, uid)).fetchall()
     for row in rows:
-        marks = _load_marks(row["conflict_with"])
-        if not marks or old_id not in [str(m) for m in marks]:
+        raw = row["conflict_with"]
+        if not conflict_marks.contains(raw, old_id):
             continue
-        rewritten = [new_id if str(m) == old_id else m for m in marks]
         conn.execute(
             "UPDATE entries SET conflict_with=? WHERE id=?",
-            (json.dumps(rewritten, ensure_ascii=False), row["id"]))
-
-
-def _load_marks(value):
-    try:
-        marks = json.loads(value) if value else []
-    except (TypeError, ValueError):
-        return None
-    return marks if isinstance(marks, list) else None
+            (conflict_marks.rekey(raw, old_id, new_id), row["id"]))
 
 
 def resolve_conflicts(conn, us, uid, entry_id, now, *, revive=False, clear_pending=True):
@@ -295,20 +287,10 @@ def resolve_conflicts(conn, us, uid, entry_id, now, *, revive=False, clear_pendi
         " AND status IN ('active','degraded') AND conflict_with IS NOT NULL",
         (us, uid)).fetchall()
     for o in rows:
-        marks = _load_marks(o["conflict_with"])
-        if marks is None:
+        raw = o["conflict_with"]
+        if not conflict_marks.contains(raw, entry_id):
             continue
-        keep = []
-        hit = False
-        for m in marks:
-            # 行键（裸 id）精确匹配
-            if str(m) == entry_id:
-                hit = True
-            else:
-                keep.append(m)
-        if not hit:
-            continue
-        new_conflict = json.dumps(keep, ensure_ascii=False) if keep else None
+        new_conflict = conflict_marks.remove(raw, [entry_id])
         if revive and o["status"] == "degraded" and o["degraded_reason"] == "conflict_lost":
             conn.execute(
                 "UPDATE entries SET conflict_with=?, status='active', degraded_reason=NULL,"
@@ -326,11 +308,7 @@ def _clear_pending_for(conn, us, uid, entry_id):
     for row in conn.execute(
             "SELECT conflicting_ids FROM pending_clarifications"
             " WHERE user_source=? AND user_id=?", (us, uid)).fetchall():
-        try:
-            ids = json.loads(row["conflicting_ids"])
-        except (TypeError, ValueError):
-            continue
-        if any(str(m) == entry_id for m in ids):
+        if entry_id in conflict_marks.decode_or_empty(row["conflicting_ids"]):
             conn.execute(
                 "DELETE FROM pending_clarifications"
                 " WHERE user_source=? AND user_id=? AND conflicting_ids=?",
@@ -386,7 +364,7 @@ def _conflict(conn, us, uid, c, target, now, origin_type, origin_ref, vectors) -
         # 旧行是 taboo：只互标 conflict_with，不降置信不降状态
         conn.execute(
             "UPDATE entries SET conflict_with=?,updated_at=? WHERE id=?",
-            (json.dumps(_merge_conflict(old["conflict_with"], new_mark), ensure_ascii=False),
+            (conflict_marks.merge(old["conflict_with"], new_mark),
              now, old["id"]))
     else:
         if old["status"] != "degraded":
@@ -394,7 +372,7 @@ def _conflict(conn, us, uid, c, target, now, origin_type, origin_ref, vectors) -
         conn.execute(
             "UPDATE entries SET conflict_with=?,confidence=confidence*0.8,status='degraded',"
             "degraded_reason='conflict_lost',updated_at=?,last_reinforced_at=? WHERE id=?",
-            (json.dumps(_merge_conflict(old["conflict_with"], new_mark), ensure_ascii=False),
+            (conflict_marks.merge(old["conflict_with"], new_mark),
              now, now, old["id"]))
     if taboo:
         _append_conflict_mark(conn, taboo, new_mark)
@@ -449,7 +427,7 @@ def _insert_entry(conn, us, uid, c, *, status, now, origin_type, origin_ref,
         (us, uid, c["dimension"], c["topic"], entry_id, variant, variant_seq,
          confidence, status, c["body"], c["summary"] or "", now, now, now,
          degraded_reason, None, c.get("topic_new"),
-         json.dumps(conflict_with, ensure_ascii=False) if conflict_with else None, 0, None))
+         conflict_marks.encode(conflict_with), 0, None))
     conn.execute(
         "INSERT INTO sources (entry_id,user_source,user_id,origin_type,origin_ref,quote,kind)"
         " VALUES (?,?,?,?,?,?,?)",
@@ -458,18 +436,11 @@ def _insert_entry(conn, us, uid, c, *, status, now, origin_type, origin_ref,
     return entry_id
 
 
-def _merge_conflict(existing, mark_value):
-    ids = json.loads(existing) if existing else []
-    if mark_value not in ids:
-        ids.append(mark_value)
-    return ids
-
-
 def _append_conflict_mark(conn, taboo_row, other_mark):
     """taboo 恒胜：taboo 行只补 conflict_with，不降置信不降状态。"""
     conn.execute(
         "UPDATE entries SET conflict_with=? WHERE id=?",
-        (json.dumps(_merge_conflict(taboo_row["conflict_with"], other_mark), ensure_ascii=False),
+        (conflict_marks.merge(taboo_row["conflict_with"], other_mark),
          taboo_row["id"]))
 
 

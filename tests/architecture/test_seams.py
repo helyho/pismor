@@ -72,3 +72,22 @@ def test_status_writers_import_the_rule():
         if "check_transition" not in text:
             missing.append(rel)
     assert missing == [], f"白名单文件没有接状态机校验: {missing}"
+
+
+# 直接对 entries.conflict_with 做 JSON 解析/序列化的文件白名单：只有值类型自己。
+CONFLICT_MARK_OWNER = "core/conflict_marks.py"
+
+_JSON_ON_CONFLICT = re.compile(r"json\.(?:loads|dumps)\s*\([^\n]*conflict_with", re.I)
+
+# 各模块曾各自复制的标记辅助函数名；回潮即失败。
+_OLD_MARK_HELPERS = re.compile(r"def\s+_(?:load|parse|replace)_marks\s*\(")
+
+
+def test_conflict_marks_json_is_confined():
+    offenders = sorted(set(_hits(_JSON_ON_CONFLICT)) - {CONFLICT_MARK_OWNER})
+    assert offenders == [], f"conflict_with 的 JSON 读写越界，改走 core.conflict_marks: {offenders}"
+
+
+def test_no_conflict_mark_helper_copies():
+    hits = _hits(_OLD_MARK_HELPERS)
+    assert hits == {}, f"标记集合的解析/改写只能有 core.conflict_marks 一份: {hits}"

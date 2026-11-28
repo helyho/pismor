@@ -13,8 +13,8 @@ violations 每条附 entry 定位（四元组），供 flag_violations 落复核
 停用主题仍保留在 topics 中，审计不做词表外判定：存量条目按原状态保留。
 run_audit 只读；标记动作由 flag_violations 显式执行（spec §6 审计标记）。
 """
-import json
 
+from pismor.core import conflict_marks
 from pismor.core.lifecycle import IllegalTransition, check_transition, is_tombstoned
 from pismor.core.keys import display_key
 from pismor.llm.prompts import INSTRUCTION_RE
@@ -102,12 +102,8 @@ def _adjudicated(tb, pf):
     """
     if pf["degraded_reason"] == "conflict_lost":
         return True
-    try:
-        tb_marks = set(json.loads(tb["conflict_with"] or "[]"))
-        pf_marks = set(json.loads(pf["conflict_with"] or "[]"))
-    except (TypeError, ValueError):
-        return False
-    return tb["id"] in pf_marks or pf["id"] in tb_marks
+    return (conflict_marks.contains(pf["conflict_with"], tb["id"])
+            or conflict_marks.contains(tb["conflict_with"], pf["id"]))
 
 
 def _conflict_json(conn):
@@ -115,11 +111,7 @@ def _conflict_json(conn):
     for r in conn.execute(
             "SELECT user_source, user_id, dimension, topic, id, variant, variant_seq,"
             " conflict_with FROM entries WHERE conflict_with IS NOT NULL").fetchall():
-        try:
-            marks = json.loads(r["conflict_with"])
-            if not isinstance(marks, list):
-                raise ValueError("not a list")
-        except (TypeError, ValueError):
+        if conflict_marks.decode(r["conflict_with"]) is None:
             out.append(_violation("conflict_with_json", r,
                                   f"{_loc(r)} conflict_with 非合法 JSON 数组"))
     return out

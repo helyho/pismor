@@ -10,7 +10,6 @@
 """
 from __future__ import annotations
 
-import json
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -24,6 +23,7 @@ from pismor.pipeline.safety import (
     sensitive_cap,
     topics_near,
 )
+from pismor.core import conflict_marks
 from pismor.core.lifecycle import (
     STATUSES, IllegalTransition, check_transition, is_tombstoned,
 )
@@ -346,27 +346,6 @@ def check_entry_edit(
     }
 
 
-def _replace_marks(value: str | None, old_id: str, new_id: str) -> str | None:
-    if not value:
-        return value
-    try:
-        items = json.loads(value)
-    except (TypeError, json.JSONDecodeError):
-        return value
-    if not isinstance(items, list):
-        return value
-    changed = False
-    out: list = []
-    for item in items:
-        text = str(item)
-        if text == old_id:
-            out.append(new_id)
-            changed = True
-        else:
-            out.append(item)
-    return json.dumps(sorted(set(out)), ensure_ascii=False) if changed else value
-
-
 def _rename_references(
     conn,
     *,
@@ -394,8 +373,8 @@ def _rename_references(
         " WHERE user_source=? AND user_id=? AND conflict_with IS NOT NULL",
         (user_source, user_id),
     ).fetchall():
-        replaced = _replace_marks(item["conflict_with"], old_id, new_id)
-        if replaced != item["conflict_with"]:
+        replaced = conflict_marks.rekey(item["conflict_with"], old_id, new_id)
+        if replaced is not None and replaced != item["conflict_with"]:
             conn.execute(
                 "UPDATE entries SET conflict_with=? WHERE user_source=? AND user_id=?"
                 " AND id=?",
@@ -407,8 +386,8 @@ def _rename_references(
         " WHERE user_source=? AND user_id=?",
         (user_source, user_id),
     ).fetchall():
-        replaced = _replace_marks(item["conflicting_ids"], old_id, new_id)
-        if replaced == item["conflicting_ids"]:
+        replaced = conflict_marks.rekey(item["conflicting_ids"], old_id, new_id)
+        if replaced is None or replaced == item["conflicting_ids"]:
             continue
         try:
             conn.execute(
@@ -669,7 +648,7 @@ def create_entry(conn, taxonomy, *, user_source, user_id, dimension, topic,
         marks = conn.execute(
             "SELECT conflict_with FROM entries WHERE id=?", (row["id"],)
         ).fetchone()
-        ids = json.loads(marks["conflict_with"]) if marks and marks["conflict_with"] else []
+        ids = conflict_marks.decode_or_empty(marks["conflict_with"] if marks else None)
         if ids:
             placeholders = ",".join("?" * len(ids))
             conflicts = [dict(r) for r in conn.execute(

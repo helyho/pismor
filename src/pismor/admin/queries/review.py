@@ -1,7 +1,7 @@
 """复核工作台的只读查询：队列、筛选面、条目详情与证据链。"""
-import json
 import sqlite3
 
+from pismor.core import conflict_marks
 from pismor.core.lifecycle import alive_sql, queue_condition
 
 
@@ -94,14 +94,6 @@ def get_facets(conn: sqlite3.Connection) -> dict:
     return {"dimensions": dimensions, "sources": sources}
 
 
-def _parse_marks(value: str | None) -> list[str]:
-    try:
-        marks = json.loads(value) if value else []
-    except (TypeError, ValueError):
-        return []
-    return [str(mark) for mark in marks] if isinstance(marks, list) else []
-
-
 def get_entry_detail(
     conn: sqlite3.Connection,
     *,
@@ -117,7 +109,7 @@ def get_entry_detail(
     if row is None:
         return None
     entry = dict(row)
-    marks = _parse_marks(row["conflict_with"])
+    marks = conflict_marks.decode_or_empty(row["conflict_with"])
     entry["conflict_marks"] = marks
 
     sources = [
@@ -144,7 +136,7 @@ def get_entry_detail(
         (user_source, user_id),
     ):
         try:
-            ids = json.loads(item["conflicting_ids"])
+            ids = conflict_marks.decode_or_empty(item["conflicting_ids"])
         except (TypeError, ValueError):
             ids = []
         clarifications.append({

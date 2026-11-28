@@ -1,8 +1,8 @@
 """用户列表、删除记录与用户记忆详情查询。"""
-import json
 import sqlite3
 
 from pismor.admin.queries.common import like_pattern
+from pismor.core import conflict_marks
 from pismor.core.lifecycle import alive_sql
 
 
@@ -160,12 +160,8 @@ def get_user_detail(
         " WHERE user_source=? AND user_id=? ORDER BY issued_at DESC",
         (user_source, user_id),
     ):
-        try:
-            ids = json.loads(item["conflicting_ids"])
-        except (TypeError, ValueError):
-            ids = []
         clarifications.append({
-            "conflicting_ids": [str(v) for v in ids] if isinstance(ids, list) else [],
+            "conflicting_ids": conflict_marks.decode_or_empty(item["conflicting_ids"]),
             "question": item["question"],
             "issued_at": item["issued_at"],
             "ttl_days": item["ttl_days"],

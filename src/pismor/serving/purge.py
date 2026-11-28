@@ -5,18 +5,10 @@
 """
 from __future__ import annotations
 
-import json
 from datetime import datetime, timezone
 
+from pismor.core import conflict_marks
 from pismor.serving.merge_task import taboo_count
-
-
-def _load_marks(value):
-    try:
-        marks = json.loads(value) if value else []
-    except (TypeError, ValueError):
-        return None
-    return marks if isinstance(marks, list) else None
 
 
 def _utcnow() -> str:
@@ -178,10 +170,7 @@ def _drop_clarifications(conn, user_source: str, user_id: str,
         (user_source, user_id),
     ).fetchall()
     for row in rows:
-        try:
-            ids = json.loads(row["conflicting_ids"])
-        except (TypeError, ValueError):
-            continue
+        ids = conflict_marks.decode_or_empty(row["conflicting_ids"])
         if any(str(i) in deleted for i in ids):
             conn.execute(
                 "DELETE FROM pending_clarifications"
@@ -200,15 +189,15 @@ def _clear_conflict_marks(conn, user_source: str, user_id: str,
         (user_source, user_id),
     ).fetchall()
     for row in rows:
-        marks = _load_marks(row["conflict_with"])
-        if marks is None:
+        raw = row["conflict_with"]
+        if conflict_marks.decode(raw) is None:
             continue
-        kept = [m for m in marks if str(m) not in deleted]
-        if len(kept) == len(marks):
+        kept = conflict_marks.remove(raw, deleted)
+        if kept == raw:
             continue
         conn.execute(
             "UPDATE entries SET conflict_with=? WHERE id=?",
-            (json.dumps(kept, ensure_ascii=False) if kept else None, row["id"]),
+            (kept, row["id"]),
         )
 
 

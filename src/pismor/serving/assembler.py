@@ -9,6 +9,7 @@ import math
 import sqlite3
 from datetime import datetime, timezone
 
+from pismor.core import conflict_marks
 from pismor.core.lifecycle import is_tombstoned, recallable_sql
 from pismor.pipeline.clarifier import QUESTION_TMPL as _CLARIFY_QUESTION
 from pismor.pipeline.clarifier import issue_many as _clarify_issues
@@ -265,11 +266,7 @@ def _clarifications(conn, user_source, user_id, *, ttl_days: int = 7,
     for r in rows:
         key = r["id"]
         by_key.setdefault(key, r)
-        try:
-            marks = json.loads(r["conflict_with"])
-        except (TypeError, ValueError):
-            continue
-        parsed[key] = marks if isinstance(marks, list) else []
+        parsed[key] = conflict_marks.decode_or_empty(r["conflict_with"])
     found: list[tuple[list, dict]] = []
     done = set()
     for r in rows:

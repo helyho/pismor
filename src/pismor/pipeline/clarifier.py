@@ -6,9 +6,9 @@ pending_clarifications 一行 = 一个待澄清矛盾对；conflicting_ids 存�
 TTL 默认 7 天（行级 ttl_days），未过期判定与过期删除均按行级 ttl_days 用 SQLite
 julianday 差值计算，issued_at 存 UTC ISO。
 """
-import json
 from datetime import datetime, timezone
 
+from pismor.core import conflict_marks
 from pismor.core.keys import canonical_ids
 from pismor.llm.prompts import CLARIFY_CHECK_SYSTEM, CLARIFY_CHECK_USER
 
@@ -67,7 +67,7 @@ def _issue_one(conn, user_source, user_id, conflicting_ids, summaries, ttl_days)
             "   AND julianday('now') - julianday(issued_at) <= ttl_days"
             " ORDER BY issued_at DESC", (user_source, user_id)).fetchall():
         try:
-            if canonical_ids(json.loads(row["conflicting_ids"])) == key:
+            if canonical_ids(conflict_marks.decode_or_empty(row["conflicting_ids"])) == key:
                 return row["question"]
         except (TypeError, ValueError):
             continue  # 坏行不影响新问题发出
@@ -102,7 +102,7 @@ def match_incoming(conn, user_source, user_id, text, llm) -> dict | None:
         question=row["question"], message=text), ANSWER_CHECK_SCHEMA)
     if not decision.get("is_answer"):
         return None
-    return {"conflicting_ids": json.loads(row["conflicting_ids"]),
+    return {"conflicting_ids": conflict_marks.decode_or_empty(row["conflicting_ids"]),
             "pending_key": row["conflicting_ids"], "answer": text}
 
 
@@ -114,7 +114,7 @@ def consume(conn, user_source, user_id, conflicting_ids, *, commit: bool = True)
             "SELECT conflicting_ids FROM pending_clarifications"
             " WHERE user_source=? AND user_id=?", (user_source, user_id)).fetchall():
         try:
-            if canonical_ids(json.loads(row["conflicting_ids"])) == wanted:
+            if canonical_ids(conflict_marks.decode_or_empty(row["conflicting_ids"])) == wanted:
                 conn.execute(
                     "DELETE FROM pending_clarifications"
                     " WHERE user_source=? AND user_id=? AND conflicting_ids=?",

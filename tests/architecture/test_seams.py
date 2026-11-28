@@ -91,3 +91,20 @@ def test_conflict_marks_json_is_confined():
 def test_no_conflict_mark_helper_copies():
     hits = _hits(_OLD_MARK_HELPERS)
     assert hits == {}, f"标记集合的解析/改写只能有 core.conflict_marks 一份: {hits}"
+
+# 复核判定的编排只允许在 serving/review_flow.py：两个入口不得各自拼事务。
+_REVIEW_CALL = re.compile(r"\bapply_review_decision\s*\(", re.I)
+
+
+def test_review_decision_call_is_confined():
+    hits = set(_hits(_REVIEW_CALL)) - {"serving/review_flow.py", "serving/review.py"}
+    assert hits == set(), f"复核判定编排只能有 review_flow 一份: {sorted(hits)}"
+
+
+# 别名落盘只允许在 review_flow（事务提交后），入口不得再直接调用。
+_ALIAS_CALL = re.compile(r"\bwrite_pending_alias\s*\(", re.I)
+
+
+def test_alias_write_is_confined():
+    hits = set(_hits(_ALIAS_CALL)) - {"serving/review_flow.py", "core/taxonomy_edit.py"}
+    assert hits == set(), f"别名落盘只在 review_flow 的提交后钩子里: {sorted(hits)}"

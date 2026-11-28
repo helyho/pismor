@@ -25,16 +25,14 @@ from pismor.serving.static import mount_admin
 from pismor.core import tokenizer
 from pismor.core.config import Settings
 from pismor.serving.merge_task import DbMergeTaskSink
-from pismor.serving.review import apply_review_decision
+from pismor.serving.review_flow import DecisionRequest, ReviewRuntime, execute_decision
 from pismor.core.db import get_conn, init_schema
 from pismor.core.lifecycle import queue_condition
 from pismor.core.stores import SettingsStore, TaxonomyStore
 from pismor.llm.embedder import Embedder
 from pismor.llm.client import LLMClient
 from pismor.pipeline.runner import run_pipeline
-from pismor.pipeline import writer
 from pismor.core.taxonomy import load_taxonomy
-from pismor.core.taxonomy_edit import write_pending_alias
 
 logger = logging.getLogger("mem.api")
 
@@ -216,44 +214,13 @@ def create_app(settings: Settings, llm=None, embedder=None) -> FastAPI:
         with closing(get_conn(s.db_path)) as conn:
             if is_tombstoned(conn, user_source, user_id):
                 return JSONResponse({"detail": "memory deleted"}, status_code=410)
-            # 向量在写事务外预计算（网络 IO 不持有 WAL 写锁）
-            vector = None
-            if payload.decision == "fix" and payload.body is not None and embedder is not None:
-                current = conn.execute(
-                    "SELECT body FROM entries WHERE user_source=? AND user_id=? AND id=?",
-                    (user_source, user_id, entry_id),
-                ).fetchone()
-                if current is not None and payload.body.strip() != current["body"]:
-                    vector = writer.compute_vector(embedder, payload.body)
-            with conn:  # 判定+版本推进+矛盾收尾同事务：先到者生效、后到者版本失配 noop
-                result = apply_review_decision(
-                    conn,
-                    user_source=user_source,
-                    user_id=user_id,
-                    entry_id=entry_id,
-                    decision=payload.decision,
-                    entry_version=payload.entry_version,
-                    note=payload.note,
-                    body=payload.body,
-                    summary=payload.summary,
-                    topic=payload.topic,
-                    taxonomy=taxonomy_store.current(),
-                    vector=vector,
-                    vector_requested=embedder is not None,
-                    taboo_merge_threshold=s.assembler.taboo_merge_threshold,
-                )
-            # 别名落盘在事务提交之后：文件写失败不影响已提交的复核结果
-            pending = result.pop("_pending_alias", None) if isinstance(result, dict) else None
-            if pending:
-                try:
-                    new = write_pending_alias(
-                        taxonomy_store.current(), pending,
-                        backup_root=s.backup.root / "config", keep=s.backup.keep)
-                    if new is not None:
-                        taxonomy_store.replace(new)
-                except Exception:
-                    logger.warning("topic alias write failed: %s", pending, exc_info=True)
-        return result
+            request_ctx = DecisionRequest(
+                user_source=user_source, user_id=user_id, entry_id=entry_id,
+                **payload.model_dump())
+            runtime = ReviewRuntime.from_settings(
+                s, taxonomy=taxonomy_store.current(), embedder=embedder,
+                taxonomy_store=taxonomy_store)
+            return execute_decision(conn, request_ctx, runtime)
 
     @app.delete("/memory/{source}/{native_id}")
     def delete_memory(source: str, native_id: str, request: Request):

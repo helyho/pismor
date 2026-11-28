@@ -16,9 +16,7 @@ from pismor.admin.schemas import (
     ReviewQueueOut,
 )
 from pismor.core.db import get_conn
-from pismor.core.taxonomy_edit import write_pending_alias
-from pismor.pipeline import writer
-from pismor.serving.review import apply_review_decision
+from pismor.serving.review_flow import DecisionRequest, ReviewRuntime, execute_decision
 
 logger = logging.getLogger("mem.admin.review")
 
@@ -91,57 +89,25 @@ def decide(
 ):
     settings = get_settings(request)
     embedder = getattr(request.app.state, "embedder", None)
+    store = getattr(request.app.state, "taxonomy_store", None)
+
+    def audit(conn, result):
+        record_admin_audit(
+            conn, principal, "review.decision",
+            f"{payload.user_source}/{payload.user_id}/{payload.entry_id}",
+            {
+                "decision": payload.decision,
+                "entry_version": payload.entry_version,
+                "noop": result["noop"],
+            },
+        )
+
+    runtime = ReviewRuntime.from_settings(
+        settings,
+        taxonomy=get_taxonomy(request),
+        embedder=embedder,
+        taxonomy_store=store,
+        in_txn=audit,
+    )
     with closing(get_conn(settings.db_path)) as conn:
-        # 向量在写事务外预计算（网络 IO 不持有 WAL 写锁）
-        vector = None
-        if payload.decision == "fix" and payload.body is not None and embedder is not None:
-            current = conn.execute(
-                "SELECT body FROM entries WHERE user_source=? AND user_id=? AND id=?",
-                (payload.user_source, payload.user_id, payload.entry_id),
-            ).fetchone()
-            if current is not None and payload.body.strip() != current["body"]:
-                vector = writer.compute_vector(embedder, payload.body)
-        with conn:
-            result = apply_review_decision(
-                conn,
-                user_source=payload.user_source,
-                user_id=payload.user_id,
-                entry_id=payload.entry_id,
-                decision=payload.decision,
-                entry_version=payload.entry_version,
-                note=payload.note,
-                body=payload.body,
-                summary=payload.summary,
-                topic=payload.topic,
-                taxonomy=get_taxonomy(request),
-                vector=vector,
-                vector_requested=embedder is not None,
-                taboo_merge_threshold=settings.assembler.taboo_merge_threshold,
-            )
-            record_admin_audit(
-                conn, principal, "review.decision",
-                f"{payload.user_source}/{payload.user_id}/{payload.entry_id}",
-                {
-                    "decision": payload.decision,
-                    "entry_version": payload.entry_version,
-                    "noop": result["noop"],
-                },
-            )
-        # 别名落盘在事务提交之后：文件写失败不影响已提交的复核结果
-        pending = result.pop("_pending_alias", None) if isinstance(result, dict) else None
-        if pending:
-            store = getattr(request.app.state, "taxonomy_store", None)
-            try:
-                new = write_pending_alias(
-                    get_taxonomy(request), pending,
-                    backup_root=settings.backup.root / "config", keep=settings.backup.keep)
-            except Exception:
-                logger.warning("topic alias write failed: %s", pending, exc_info=True)
-            else:
-                if new is not None and store is not None:
-                    store.replace(new)
-                elif new is not None:
-                    logger.warning(
-                        "taxonomy_store absent; alias written to %s only",
-                        settings.taxonomy_path)
-        return result
+        return execute_decision(conn, DecisionRequest(**payload.model_dump()), runtime)

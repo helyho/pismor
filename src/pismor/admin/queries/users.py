@@ -1,7 +1,7 @@
 """用户列表、删除记录与用户记忆详情查询。"""
 import sqlite3
 
-from pismor.admin.queries.common import like_pattern
+from pismor.admin.queries.common import like_any, like_pattern
 from pismor.core import conflict_marks
 from pismor.core.lifecycle import alive_sql
 
@@ -20,9 +20,7 @@ def _users_where(*, q: str | None = None, user_source: str | None = None) -> tup
         params.append(user_source)
     if q:
         pattern = like_pattern(q)
-        clauses.append(
-            "(user_id LIKE ? ESCAPE '\\' OR user_source LIKE ? ESCAPE '\\')"
-        )
+        clauses.append(f"({like_any('user_id', 'user_source')})")
         params.extend([pattern, pattern])
     return " AND ".join(clauses), params
 
@@ -76,9 +74,7 @@ def list_tombstones(
     params: list[str] = []
     if q:
         pattern = like_pattern(q)
-        clauses.append(
-            "(user_id LIKE ? ESCAPE '\\' OR user_source LIKE ? ESCAPE '\\')"
-        )
+        clauses.append(f"({like_any('user_id', 'user_source')})")
         params.extend([pattern, pattern])
     where = " AND ".join(clauses)
     total = conn.execute(

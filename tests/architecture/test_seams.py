@@ -163,3 +163,15 @@ def test_config_numeric_rules_are_derived():
 def test_dead_config_helpers_stay_deleted():
     hits = _hits(re.compile(r"\b(?:restore_config|copy_file)\s*\(", re.I))
     assert hits == {}, f"未使用的旧实现不得回潮: {hits}"
+
+
+# LIKE 转义符只在 common.py 声明；各查询用 like_expr / like_any 生成片段。
+LIKE_OWNER = "admin/queries/common.py"
+_LIKE_ESCAPE = re.compile(r"ESCAPE\s+'\\\\'", re.I)
+
+
+def test_like_escape_is_declared_once():
+    offenders = sorted(set(_hits(_LIKE_ESCAPE)) - {LIKE_OWNER})
+    assert offenders == [], (
+        f"LIKE ESCAPE 只在 common.py 声明，改用 like_expr/like_any: {offenders}"
+    )

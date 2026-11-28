@@ -2,14 +2,11 @@
 import sqlite3
 
 from pismor.core import conflict_marks
+from pismor.admin.queries.common import like_any, like_pattern
 from pismor.core.lifecycle import alive_sql, queue_condition
 
 
 QUEUE_CONDITION = queue_condition("entries")
-
-
-def _escape_like(value: str) -> str:
-    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
 def queue_where(
@@ -31,11 +28,8 @@ def queue_where(
         where += " AND user_id=?"
         params.append(user_id)
     if q:
-        like = f"%{_escape_like(q)}%"
-        where += (
-            " AND (summary LIKE ? ESCAPE '\\' OR body LIKE ? ESCAPE '\\'"
-            " OR topic LIKE ? ESCAPE '\\' OR user_id LIKE ? ESCAPE '\\')"
-        )
+        like = like_pattern(q)
+        where += f" AND ({like_any('summary', 'body', 'topic', 'user_id')})"
         params.extend([like, like, like, like])
     return where, tuple(params)
 

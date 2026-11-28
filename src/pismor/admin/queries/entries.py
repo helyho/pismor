@@ -1,7 +1,7 @@
 """跨用户条目检索。"""
 import sqlite3
 
-from pismor.admin.queries.common import like_pattern
+from pismor.admin.queries.common import like_any, like_expr, like_pattern
 from pismor.core.lifecycle import alive_sql
 
 
@@ -36,14 +36,11 @@ def _entries_where(
         clauses.append("user_id=?")
         params.append(user_id)
     if topic:
-        clauses.append("topic LIKE ? ESCAPE '\\'")
+        clauses.append(like_expr("topic"))
         params.append(like_pattern(topic))
     if q:
         pattern = like_pattern(q)
-        clauses.append(
-            "(summary LIKE ? ESCAPE '\\' OR body LIKE ? ESCAPE '\\'"
-            " OR topic LIKE ? ESCAPE '\\' OR user_id LIKE ? ESCAPE '\\')"
-        )
+        clauses.append(f"({like_any('summary', 'body', 'topic', 'user_id')})")
         params.extend([pattern, pattern, pattern, pattern])
     if confidence_min is not None:
         clauses.append("confidence >= ?")

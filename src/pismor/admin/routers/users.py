@@ -88,27 +88,15 @@ def user_assemble(
 ):
     settings = get_settings(request)
     dims = [d.strip() for d in dimensions.split(",") if d.strip()] if dimensions else None
-    a = settings.assembler
     with closing(get_conn(settings.db_path)) as conn:
+        policy = assembler.AssemblePolicy.from_settings(
+            settings, taxonomy=get_taxonomy(request), budget=budget,
+            dimensions=dims, include_memory=include_memory, query=query,
+            write_clarifications=False)
         return assembler.assemble(
-            conn,
-            request.app.state.embedder,
-            user_source,
-            user_id,
-            budget=budget,
-            dimensions=dims,
-            include_memory=include_memory,
-            query=query,
+            conn, request.app.state.embedder, user_source, user_id,
+            policy=policy,
             audit_sink=DbMergeTaskSink(settings.db_path, user_source, user_id),
-            dimension_order=get_taxonomy(request).priority_order(),
-            taboo_budget_share=a.taboo_budget_share,
-            taboo_merge_threshold=a.taboo_merge_threshold,
-            related_top_k=a.related_top_k,
-            half_life_days=a.half_life_days,
-            clarify_ttl_days=a.clarify_ttl_days,
-            recall_conflicts=a.recall_conflicts,
-            min_similarity=settings.embedding.min_similarity,
-            write_clarifications=False,
         )
 
 

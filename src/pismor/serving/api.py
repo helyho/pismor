@@ -172,20 +172,12 @@ def create_app(settings: Settings, llm=None, embedder=None) -> FastAPI:
         s = settings_store.current()
         with closing(get_conn(s.db_path)) as conn:
             # 降级链（主查询→必带集→空包）在 assembler 内，永不 5xx；tombstone → 空包
-            a = s.assembler
-            return assembler.assemble(conn, embedder, source, native_id, budget=budget,
-                                      dimensions=dims, include_memory=include_memory,
-                                      query=query,
-                                      audit_sink=DbMergeTaskSink(s.db_path, source,
-                                                                 native_id),
-                                      dimension_order=taxonomy_store.current().priority_order(),
-                                      taboo_budget_share=a.taboo_budget_share,
-                                      taboo_merge_threshold=a.taboo_merge_threshold,
-                                      related_top_k=a.related_top_k,
-                                      half_life_days=a.half_life_days,
-                                      clarify_ttl_days=a.clarify_ttl_days,
-                                      recall_conflicts=a.recall_conflicts,
-                                      min_similarity=s.embedding.min_similarity)
+            policy = assembler.AssemblePolicy.from_settings(
+                s, taxonomy=taxonomy_store.current(), budget=budget,
+                dimensions=dims, include_memory=include_memory, query=query)
+            return assembler.assemble(
+                conn, embedder, source, native_id, policy=policy,
+                audit_sink=DbMergeTaskSink(s.db_path, source, native_id))
 
     @app.get("/review/queue")
     def review_queue():

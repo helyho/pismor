@@ -37,7 +37,7 @@ def test_bm25_orders_by_relevance(conn):
     _entry(conn, "b", "咖啡豆 拿铁")                # 低频
     _entry(conn, "c", "完全是别的话题")
     conn.commit()
-    pack = assembler.assemble(conn, None, "w", "u1", budget=2000, query="咖啡豆")
+    pack = assembler.assemble(conn, None, "w", "u1", policy=assembler.AssemblePolicy(budget=2000, query="咖啡豆"))
     ids = [e["id"] for e in pack["entries"]]
     assert ids == ["preference_a", "preference_b"]  # c 不召回；a 的 TF 高排前
 

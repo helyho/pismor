@@ -7,6 +7,7 @@ tombstone → 必带集(taboo+identity 全量) → 相关集(向量/词面) → 
 import json
 import math
 import sqlite3
+from dataclasses import dataclass
 from datetime import datetime, timezone
 
 from pismor.core import conflict_marks
@@ -44,44 +45,81 @@ def _dimension_rank(dimension: str, order: dict[str, int]) -> int:
     return 0 if dimension == "taboo" else order.get(dimension, len(order))
 
 
-def assemble(conn, embedder, user_source, user_id, budget=2000, dimensions=None,
-             include_memory=True, query=None, audit_sink=None, *,
-             taboo_budget_share=0.6, related_top_k=20, half_life_days=30.0,
-             clarify_ttl_days=7, min_similarity=0.5,
-             write_clarifications=True, dimension_order=None,
-             recall_conflicts=False,
-             taboo_merge_threshold=_TABOO_MERGE_THRESHOLD) -> dict:
+@dataclass(frozen=True)
+class AssemblePolicy:
+    """一次装配的全部可调参数：settings、taxonomy 与请求覆盖在此合成。"""
+
+    budget: int = 2000
+    dimensions: list[str] | None = None
+    include_memory: bool = True
+    query: str | None = None
+    taboo_budget_share: float = 0.6
+    related_top_k: int = 20
+    half_life_days: float = 30.0
+    clarify_ttl_days: int = 7
+    min_similarity: float = 0.5
+    write_clarifications: bool = True
+    dimension_order: list[str] | None = None
+    recall_conflicts: bool = False
+    taboo_merge_threshold: int = _TABOO_MERGE_THRESHOLD
+
+    @classmethod
+    def from_settings(cls, settings, *, taxonomy, budget: int = 2000,
+                      dimensions: list[str] | None = None,
+                      include_memory: bool = True, query: str | None = None,
+                      write_clarifications: bool = True) -> "AssemblePolicy":
+        """把 AssemblerSettings / EmbeddingSettings / taxonomy 一次绑定。"""
+        a = settings.assembler
+        return cls(
+            budget=budget,
+            dimensions=list(dimensions) if dimensions else None,
+            include_memory=include_memory,
+            query=query,
+            taboo_budget_share=a.taboo_budget_share,
+            related_top_k=a.related_top_k,
+            half_life_days=a.half_life_days,
+            clarify_ttl_days=a.clarify_ttl_days,
+            min_similarity=settings.embedding.min_similarity,
+            write_clarifications=write_clarifications,
+            dimension_order=list(taxonomy.priority_order()),
+            recall_conflicts=a.recall_conflicts,
+            taboo_merge_threshold=a.taboo_merge_threshold,
+        )
+
+
+def assemble(conn, embedder, user_source, user_id, *, policy=None,
+             audit_sink=None) -> dict:
     """装配用户记忆包。
 
-    dimensions: 维度白名单（None=全部）；query: 对话话题文本，驱动相关集召回；
-    dimension_order: 注入/预算顺序（taxonomy.priority_order()）；None 回落内置顺序；
-    include_memory=False: entries=[] 其余照常（A/B 对照）；
-    audit_sink: merge_task 触发时回调 record_merge_task()（审计/聚合消费）；
-    预算/召回/时效参数由 settings.assembler 配置（AssemblerSettings）。
+    policy: AssemblePolicy，生产入口用 from_settings 一次绑定；
+    audit_sink: merge_task 触发时回调 record_merge_task()（审计/聚合消费）。
     任何库故障不抛出：按降级链降级为部分结果或空包。
     """
+    p = policy or AssemblePolicy()
     now = datetime.now(timezone.utc)
     try:
         if is_tombstoned(conn, user_source, user_id):
             return _empty_pack()
         try:
-            must = _must_have(conn, user_source, user_id, dimension_order,
-                              recall_conflicts=recall_conflicts)
-            related = _related(conn, embedder, user_source, user_id, query, dimensions,
-                               top_k=related_top_k, min_similarity=min_similarity,
-                               recall_conflicts=recall_conflicts)
+            must = _must_have(conn, user_source, user_id, p.dimension_order,
+                              recall_conflicts=p.recall_conflicts)
+            related = _related(conn, embedder, user_source, user_id, p.query,
+                               p.dimensions, top_k=p.related_top_k,
+                               min_similarity=p.min_similarity,
+                               recall_conflicts=p.recall_conflicts)
         except sqlite3.Error:
-            must = _must_have(conn, user_source, user_id, dimension_order,
-                              recall_conflicts=recall_conflicts)  # 只回必带集
+            must = _must_have(conn, user_source, user_id, p.dimension_order,
+                              recall_conflicts=p.recall_conflicts)  # 只回必带集
             related = []
-        pack = _build(must, related, budget, now, user_id, include_memory, audit_sink,
-                      taboo_budget_share=taboo_budget_share, half_life_days=half_life_days,
-                      dimension_order=dimension_order,
-                      taboo_merge_threshold=taboo_merge_threshold)
+        pack = _build(must, related, p.budget, now, user_id, p.include_memory,
+                      audit_sink, taboo_budget_share=p.taboo_budget_share,
+                      half_life_days=p.half_life_days,
+                      dimension_order=p.dimension_order,
+                      taboo_merge_threshold=p.taboo_merge_threshold)
         try:
             pack["clarification_needed"] = _clarifications(
-                conn, user_source, user_id, ttl_days=clarify_ttl_days,
-                write=write_clarifications)
+                conn, user_source, user_id, ttl_days=p.clarify_ttl_days,
+                write=p.write_clarifications)
         except sqlite3.Error:
             pack["clarification_needed"] = []
         return pack

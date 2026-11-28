@@ -108,3 +108,29 @@ _ALIAS_CALL = re.compile(r"\bwrite_pending_alias\s*\(", re.I)
 def test_alias_write_is_confined():
     hits = set(_hits(_ALIAS_CALL)) - {"serving/review_flow.py", "core/taxonomy_edit.py"}
     assert hits == set(), f"别名落盘只在 review_flow 的提交后钩子里: {sorted(hits)}"
+
+
+def _call_args(source: str, callee: str) -> str:
+    """取一次调用的括号内文本（括号平衡，够单层嵌套用）。"""
+    start = source.index(callee) + len(callee)
+    depth = 1
+    i = start
+    while i < len(source) and depth:
+        if source[i] == "(":
+            depth += 1
+        elif source[i] == ")":
+            depth -= 1
+        i += 1
+    return source[start:i - 1]
+
+
+def test_assemble_binding_is_centralized():
+    """生产入口只构造 AssemblePolicy，不再逐个搬运 settings 字段。"""
+    for rel in ("serving/api.py", "admin/routers/users.py"):
+        source = (SRC / rel).read_text(encoding="utf-8")
+        assert "AssemblePolicy.from_settings(" in source, f"{rel} 未使用 AssemblePolicy"
+        args = _call_args(source, "assembler.assemble(")
+        for key in ("taboo_budget_share=", "half_life_days=", "min_similarity=",
+                    "recall_conflicts=", "taboo_merge_threshold=", "related_top_k="):
+            assert key not in args, f"{rel} 的 assemble 调用仍在搬运 {key}"
+        assert "policy=" in args, f"{rel} 的 assemble 调用未传 policy"

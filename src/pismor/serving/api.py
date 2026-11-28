@@ -38,6 +38,65 @@ from pismor.core.taxonomy_edit import write_pending_alias
 logger = logging.getLogger("mem.api")
 
 
+class _BodyTooLarge(Exception):
+    pass
+
+
+async def _reject_too_large(send) -> None:
+    body = b'{"detail":"request body too large"}'
+    await send({"type": "http.response.start", "status": 413,
+                "headers": [(b"content-type", b"application/json"),
+                            (b"content-length", str(len(body)).encode()),
+                            (b"connection", b"close")]})
+    await send({"type": "http.response.body", "body": body})
+
+
+class _BodyLimitMiddleware:
+    """按 Content-Length 与累计实收字节拦截超大请求（uvicorn 本身无 body 上限）。"""
+
+    def __init__(self, app, max_bytes: int):
+        self.app = app
+        self.max_bytes = max_bytes
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        for key, value in scope.get("headers") or []:
+            if key == b"content-length":
+                try:
+                    declared = int(value)
+                except ValueError:
+                    declared = self.max_bytes + 1
+                if declared > self.max_bytes:
+                    await _reject_too_large(send)
+                    return
+        received = 0
+        started = False
+
+        async def tracked_send(message):
+            nonlocal started
+            if message["type"] == "http.response.start":
+                started = True
+            await send(message)
+
+        async def limited_receive():
+            nonlocal received
+            message = await receive()
+            if message["type"] == "http.request":
+                received += len(message.get("body") or b"")
+                if received > self.max_bytes:
+                    raise _BodyTooLarge
+            return message
+
+        try:
+            await self.app(scope, limited_receive, tracked_send)
+        except _BodyTooLarge:
+            # 应用尚未发响应头时才回 413，避免二次 http.response.start
+            if not started:
+                await _reject_too_large(send)
+
+
 def _pipeline_task(settings_store: SettingsStore, taxonomy_store: TaxonomyStore,
                    event: dict, llm, embedder) -> None:
     settings = settings_store.current()
@@ -63,6 +122,8 @@ def create_app(settings: Settings, llm=None, embedder=None) -> FastAPI:
         init_schema(conn, vec_dimensions)
 
     app = FastAPI(title="mem")
+    app.add_middleware(_BodyLimitMiddleware,
+                       max_bytes=settings.serve.max_request_bytes)
     app.state.settings_store = settings_store
     app.state.taxonomy_store = taxonomy_store
     app.state.settings = settings
@@ -76,6 +137,11 @@ def create_app(settings: Settings, llm=None, embedder=None) -> FastAPI:
         # 事件 schema 校验失败（intake 校验先于落库）→ 422，不进管线
         return JSONResponse(status_code=422, content={"detail": str(exc)})
 
+    @app.exception_handler(intake.ContentTooLong)
+    async def _content_too_long(request: Request, exc: intake.ContentTooLong):
+        # conversation 事件的条数/单条/总量超限：先于 events_seen 落库 → 422
+        return JSONResponse(status_code=422, content={"detail": str(exc)})
+
     @app.post("/events")
     def post_events(event: dict, background: BackgroundTasks):
         s = settings_store.current()
@@ -85,7 +151,11 @@ def create_app(settings: Settings, llm=None, embedder=None) -> FastAPI:
                 return JSONResponse({"detail": "memory deleted"}, status_code=410)
             try:
                 ok, ack = intake.intake_event(
-                    conn, event, max_content_chars=s.intake.max_content_chars)
+                    conn, event,
+                    max_content_chars=s.intake.max_content_chars,
+                    max_messages=s.intake.max_messages,
+                    max_message_chars=s.intake.max_message_chars,
+                    max_total_chars=s.intake.max_total_chars)
             except ValidationError:
                 raise  # 畸形事件：全局 handler 转 422（含 content 超限）
         if not ok:

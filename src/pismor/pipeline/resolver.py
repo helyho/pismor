@@ -10,7 +10,7 @@
 
 近邻互斥检测（spec §11 第八轮：矛盾判定从"同 key"扩展到"语义互斥"）：
 - 仅 taboo↔preference 配对（黑盒 A5 高发型：preference_style vs taboo_tone）；
-- 同用户全量近邻；对端行非同 key（同 key 已走决策器）；
+- 同用户最近 5 条近邻候选（`neighbor_candidates` 的 SQL LIMIT 5）；对端行非同 key（同 key 已走决策器）；
 - LLM 判互斥 → 走既有 CONFLICT 双存：conflict 变体行 + conflict_with 互标行 id，
   装配 clarification_needed 与复核队列按标记配对（机制零新增）。
 """

@@ -123,3 +123,36 @@ def test_default_event_type_written_back(conn):
     ev = {k: v for k, v in CONV.items() if k != "event_type"} | {"event_id": "e28"}
     ok, _ = intake_event(conn, ev)
     assert ok and ev["event_type"] == "conversation"
+
+
+# ---- P1-4：对话消息体积上限（防止放大 LLM 成本与落库体积） ----
+
+def _conversation(messages, event_id="e30"):
+    return dict(CONV, event_id=event_id, messages=messages)
+
+
+def test_too_many_messages_rejected(conn):
+    from pismor.pipeline.intake import ContentTooLong
+    msgs = [{"role": "user", "text": f"第{i}条"} for i in range(101)]
+    with pytest.raises(ContentTooLong, match="超过上限"):
+        intake_event(conn, _conversation(msgs))
+    assert conn.execute("SELECT COUNT(*) c FROM events_seen").fetchone()["c"] == 0
+
+
+def test_message_too_long_rejected(conn):
+    from pismor.pipeline.intake import ContentTooLong
+    msgs = [{"role": "user", "text": "x" * 8193}]
+    with pytest.raises(ContentTooLong, match="超过上限"):
+        intake_event(conn, _conversation(msgs))
+    assert conn.execute("SELECT COUNT(*) c FROM events_seen").fetchone()["c"] == 0
+
+
+def test_total_message_chars_rejected(conn):
+    from pismor.pipeline.intake import ContentTooLong
+    msgs = [{"role": "user", "text": "x" * 300} for _ in range(3)]
+    with pytest.raises(ContentTooLong, match="超过上限"):
+        intake_event(conn, _conversation(msgs), max_total_chars=500)
+    assert conn.execute("SELECT COUNT(*) c FROM events_seen").fetchone()["c"] == 0
+    # 边界值放行：总量恰等于上限
+    ok, _ = intake_event(conn, _conversation(msgs, event_id="e31"), max_total_chars=900)
+    assert ok

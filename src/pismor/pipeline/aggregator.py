@@ -5,9 +5,9 @@
   （orphan_topic/active/degraded/pending_review）都不命中；conflict 行按 status 参与。
 - 时间统一以注入 now 参数与 SQLite julianday 混算：julianday 对带时区后缀（+08:00）与
   纯日期的 ISO 字符串均归一到 UTC，混算安全——tests/test_aggregator.py 边界用例钉死。
-- orphan 聚合（30 天窗口统一口径，修复轮 1 裁决）：GROUP BY topic_new；窗口内（created_at
-  >= now-30d）行数 >=3 → 归并判定；窗口内零行 → 整组物理删除（taboo 组除外，只进人工队列）；
-  窗口内 1~2 行 → 保留等复现。
+- orphan 聚合（30 天窗口，按用户隔离，修复轮 2）：GROUP BY user_source,user_id,topic_new；
+  窗口内（created_at >= now-30d）行数 >=3 → 归并判定；窗口内零行 → 整组物理删除
+  （taboo 组除外，只进人工队列）；窗口内 1~2 行 → 保留等复现。
 - 归并判定 LLM 输出 {action: merge_to|new_topic, dimension, topic}；merge_to 直接 re-key 转
   active（dimension/topic 按 LLM 指定、清 topic_new、id 与 sources.entry_id 同步跟随）；
   new_topic 且 auto_activate → 追加 taxonomy.yaml topics + 自动生成回归样例（round-trip
@@ -89,22 +89,25 @@ def run_daily(conn, taxonomy, llm, auto_activate: bool, now: str, *,
 
 
 def _fetch_groups(conn, now):
-    """观察区分组（30 天窗口统一口径）：窗口内行数>=3 → 启用判定；窗口内零行 → 整组废弃；
-    窗口内 1~2 行 → 保留等复现（消除"COUNT>=3 且 MIN 超窗"的滞留不变集）。"""
+    """观察区分组（30 天窗口，按用户隔离）：同一用户窗口内行数>=3 → 启用判定；
+    窗口内零行 → 该用户整组废弃；窗口内 1~2 行 → 保留等复现。"""
     rows = conn.execute(
-        "SELECT topic_new,"
+        "SELECT user_source, user_id, topic_new,"
         " SUM(CASE WHEN julianday(created_at) >= julianday(?) - 30 THEN 1 ELSE 0 END) AS recent"
         f" FROM entries WHERE {_ALIVE} AND status='orphan_topic' AND topic_new IS NOT NULL"
-        " GROUP BY topic_new", (now,)).fetchall()
-    activate = [r["topic_new"] for r in rows if r["recent"] >= 3]
-    drop = [r["topic_new"] for r in rows if r["recent"] == 0]
+        " GROUP BY user_source, user_id, topic_new", (now,)).fetchall()
+    activate = [(r["user_source"], r["user_id"], r["topic_new"])
+                for r in rows if r["recent"] >= 3]
+    drop = [(r["user_source"], r["user_id"], r["topic_new"])
+            for r in rows if r["recent"] == 0]
     return activate, drop
 
 
-def _group_rows(conn, topic_new):
+def _group_rows(conn, user_source, user_id, topic_new):
     return conn.execute(
-        f"SELECT * FROM entries WHERE {_ALIVE} AND status='orphan_topic' AND topic_new=?",
-        (topic_new,)).fetchall()
+        f"SELECT * FROM entries WHERE {_ALIVE} AND status='orphan_topic'"
+        " AND user_source=? AND user_id=? AND topic_new=?",
+        (user_source, user_id, topic_new)).fetchall()
 
 
 def _dimension_block(taxonomy, extra_new: dict[str, set[str]] | None = None) -> str:
@@ -129,13 +132,13 @@ def _collect_orphan_plans(conn, taxonomy, now):
     """
     activate_groups, drop_groups = _fetch_groups(conn, now)
     drop_plans = []
-    for topic_new in drop_groups:
-        rows = _group_rows(conn, topic_new)
+    for user_source, user_id, topic_new in drop_groups:
+        rows = _group_rows(conn, user_source, user_id, topic_new)
         drop_plans.append({"topic_new": topic_new, "rows": rows,
                            "taboo": any(r["dimension"] == "taboo" for r in rows)})
     plans = []
-    for topic_new in activate_groups:
-        rows = _group_rows(conn, topic_new)
+    for user_source, user_id, topic_new in activate_groups:
+        rows = _group_rows(conn, user_source, user_id, topic_new)
         if any(r["dimension"] == "taboo" for r in rows):
             plans.append({"topic_new": topic_new, "rows": rows, "taboo_queue": True})
             continue

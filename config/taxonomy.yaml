@@ -168,7 +168,7 @@ dimensions:  # 维度定义；key 与 priority 必须唯一
 invariants:  # 文档性不变量；当前版本不参与运行逻辑
   - taboo_first: "装配顺序中 taboo 恒为第一"
   - taboo_no_overlap: "taboo 与 preference 同主题互斥时 taboo 恒胜"
-  - unique_key: "同 (用户, 维度, 主题) 唯一"
+  - unique_key: "同 (用户, 维度, 主题, variant, variant_seq) 唯一；每个键的 normal 形态最多 1 行"
   - quote_required: "sources[0].quote 非空且可在原始日志中定位"
   - inferred_cap: "inferred 类条目 confidence <= 0.8"
   - taboo_no_time_decay: "taboo 不参与时间衰减(见 §11)"

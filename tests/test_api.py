@@ -790,3 +790,19 @@ def test_alias_write_failure_does_not_fail_review(writable_client, writable_sett
     assert "手工模型" not in (pref.get("topic_aliases") or {})
     store = writable_client.app.state.taxonomy_store.current()
     assert "手工模型" not in store.dimensions["preference"].topic_aliases
+
+
+# ---- P1-4：请求体硬顶（ASGI 中间件，content-length 与实收字节双检） ----
+
+def test_request_body_too_large_rejected(tmp_path):
+    from dataclasses import replace
+    from pismor.core.config import ServeSettings
+
+    settings = replace(fake_settings.__wrapped__(tmp_path),
+                       serve=ServeSettings(max_request_bytes=1024))
+    app = create_app(settings, llm=FakeLLM(), embedder=None)
+    with TestClient(app) as c:
+        res = c.post("/events", content=b"x" * 2048,
+                     headers={"content-type": "application/json"})
+        assert res.status_code == 413
+        assert res.json()["detail"] == "request body too large"

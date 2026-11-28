@@ -63,7 +63,10 @@ class AssemblerSettings:
 
 @dataclass(frozen=True)
 class IntakeSettings:
-    max_content_chars: int = 8192   # 事件 content 上限
+    max_content_chars: int = 8192   # text 事件 content 上限
+    max_messages: int = 100         # conversation 事件消息条数上限
+    max_message_chars: int = 8192   # 单条消息 text 上限
+    max_total_chars: int = 65536    # 全部消息 text 总长上限
 
 @dataclass(frozen=True)
 class BackupSettings:
@@ -73,6 +76,7 @@ class BackupSettings:
 @dataclass(frozen=True)
 class ServeSettings:
     daily_interval_seconds: float = 86400.0  # 日批循环间隔
+    max_request_bytes: int = 1_048_576       # 单个 HTTP 请求体上限（1 MiB）
 
 @dataclass(frozen=True)
 class Settings:

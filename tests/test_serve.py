@@ -84,15 +84,19 @@ def test_daily_once_reads_auto_activate_from_taxonomy_meta(tmp_path):
     settings = _settings(tmp_path, taxonomy_path)
     conn = get_conn(settings.db_path)
     init_schema(conn, None)
-    for i in range(3):
-        _seed(conn, uid=f"u{i}", dim="preference", topic=f"orphan{i}",
-              status="orphan_topic", body="偏好简短", topic_new="回复要简短",
-              created="2026-12-10T09:00:00+08:00")
+    # orphan 观察区按用户隔离：每用户需各自复现 >=3 次才启用
+    for u in range(3):
+        for i in range(3):
+            _seed(conn, uid=f"u{u}", dim="preference", topic=f"orphan{u * 3 + i}",
+                  status="orphan_topic", body="偏好简短", topic_new="回复要简短",
+                  created="2026-12-10T09:00:00+08:00")
     stats = serve.daily_once(conn, settings, taxonomy,
                              FakeLLM({"action": "new_topic", "dimension": "preference",
                                       "topic": "brevity"}),
                              NOW, tmp_path / "bk")
     assert stats["activated"] == 3  # meta.auto_activate=true 生效（非硬编码 False）
-    row = conn.execute("SELECT topic, status FROM entries").fetchone()
+    assert conn.execute(
+        "SELECT COUNT(*) FROM entries WHERE status='orphan_topic'").fetchone()[0] == 6
+    row = conn.execute("SELECT topic, status FROM entries WHERE status='active'").fetchone()
     assert (row["topic"], row["status"]) == ("brevity", "active")
     conn.close()

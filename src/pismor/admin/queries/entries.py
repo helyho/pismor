@@ -4,6 +4,12 @@ import sqlite3
 from pismor.admin.queries.common import like_pattern
 
 
+_ALIVE = (
+    "NOT EXISTS (SELECT 1 FROM tombstones t"
+    " WHERE t.user_source=entries.user_source AND t.user_id=entries.user_id)"
+)
+
+
 def _entries_where(
     *,
     dimension: str | None = None,
@@ -112,6 +118,7 @@ def get_entry_facets(conn: sqlite3.Connection) -> dict:
             {"value": row["value"], "count": row["count"]}
             for row in conn.execute(
                 f"SELECT {column} AS value, COUNT(*) AS count FROM entries"
+                f" WHERE {_ALIVE}"
                 f" GROUP BY {column} ORDER BY count DESC, value"
             )
         ]

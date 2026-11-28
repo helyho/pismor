@@ -46,7 +46,8 @@ def restore_memory(conn, *, user_source: str, user_id: str) -> str | None:
 def hard_delete_memory(conn, *, user_source: str, user_id: str,
                         requested_by: str) -> None:
     """彻底删除记忆数据；保留 tombstone 并标记 purged_at，继续拦截新事件。"""
-    for table in ("entries", "sources", "review_history", "pending_clarifications"):
+    for table in ("entries", "sources", "review_history", "pending_clarifications",
+                  "merge_tasks"):
         conn.execute(f"DELETE FROM {table} WHERE user_source=? AND user_id=?",
                      (user_source, user_id))
     if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table'"

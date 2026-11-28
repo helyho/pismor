@@ -84,6 +84,7 @@ sequenceDiagram
 
 - 角色只有 `user` / `assistant`；`system`、`tool`、`function` 消息不要上报，会 422。
 - 只有 `user` 文本能成为记忆证据；`assistant` 消息用于提供上下文，可带可不带。
+- 单事件最多 `intake.max_messages` 条（默认 100），单条 `text` 最多 `intake.max_message_chars`（默认 8192 字符），全部 `text` 合计最多 `intake.max_total_chars`（默认 65536 字符）；超限 422，不截断。
 - 一轮一条，不要把整段历史每轮重复上报——去重键是 `event_id`，重复内容会反复消耗抽取成本。
 
 ### 3.2 text 事件
@@ -141,7 +142,8 @@ text 事件跳过触发分级、直通抽取。内容默认视为用户本人的
 | `202` | `{"event_id": "..."}` | 已登记，后台处理 | 正常继续 |
 | `200` | `{"deduplicated": true}` | 重复事件 | 视为成功，忽略 |
 | `410` | `{"detail": "memory deleted"}` | 用户已行使删除权 | 停止上报该用户 |
-| `422` | `{"detail": "<校验错误文本>"}` | 字段不合法 | 不要重试，修数据后换新请求 |
+| `413` | `{"detail":"request body too large"}` | 请求体超过 `serve.max_request_bytes`（默认 1 MiB） | 拆分后重发，不要重试 |
+| `422` | `{"detail": "<校验错误文本>"}` | 字段不合法或事件超长 | 不要重试，修数据后换新请求 |
 | `5xx` | — | 服务异常 | 指数退避重试，保持同 `event_id` |
 
 重试建议：网络错误 / 5xx 最多重试 3–5 次（如 1s、2s、4s）；422 修数据；410 不再上报，直到管理后台恢复该用户。

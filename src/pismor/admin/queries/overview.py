@@ -35,7 +35,7 @@ def get_overview(conn: sqlite3.Connection, db_path: Path) -> dict:
             conn,
             f"SELECT COUNT(*) FROM (SELECT DISTINCT user_source, user_id FROM entries WHERE {_ALIVE})",
         ),
-        "entries": _scalar(conn, "SELECT COUNT(*) FROM entries"),
+        "entries": _scalar(conn, f"SELECT COUNT(*) FROM entries WHERE {_ALIVE}"),
         "pending_review": _scalar(
             conn, f"SELECT COUNT(*) FROM entries WHERE status='pending_review' AND {_ALIVE}"
         ),

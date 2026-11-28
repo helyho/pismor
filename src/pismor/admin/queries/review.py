@@ -113,7 +113,9 @@ def get_entry_detail(
     entry_id: str,
 ) -> dict | None:
     row = conn.execute(
-        "SELECT * FROM entries WHERE user_source=? AND user_id=? AND id=?",
+        "SELECT * FROM entries WHERE user_source=? AND user_id=? AND id=?"
+        " AND NOT EXISTS (SELECT 1 FROM tombstones t"
+        "   WHERE t.user_source=entries.user_source AND t.user_id=entries.user_id)",
         (user_source, user_id, entry_id),
     ).fetchone()
     if row is None:

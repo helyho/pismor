@@ -1,10 +1,11 @@
 """事务写入器：Action 列表 → entries + sources + embeddings 单事务落库（spec §6/§11/§12/§20）。
 
 形状裁决（计划裁决 5/6 + 上游裁决 a/b/c）：
-- 主键 (user_source,user_id,dimension,topic) 不含 status，"旧行保留+新行插入"不可行：
-  UPDATE = 原行覆盖写入新值（status 恢复 active），旧行完整内容另存 archived 轨迹行，
-  轨迹行 topic 加 "~" 前缀保证主键唯一（装配查 active/degraded 不受影响，审计按 status 过滤）。
-- CONFLICT 同 key 双存受主键唯一约束：新行 topic 加 "+" 前缀变形落库；
+- 唯一键 (user_source,user_id,dimension,topic,variant,variant_seq)；normal 每键最多 1 行，
+  conflict/trace/snapshot 按 variant_seq 递增共存，topic 不再做前缀变形：
+  UPDATE = 原 normal 行覆盖写入新值（status 恢复 active），旧值复制为 trace 变体
+  （superseded_by 指向原 id，sources 迁到 trace），审计与装配按 variant/status 过滤。
+- CONFLICT 同 key 双存：新建 conflict 变体行并双向 conflict_with；
   对方是 taboo 时 taboo 恒胜（spec §11）：taboo 行只补 conflict_with（§13 装配
   "taboo 出全句、对方曾观察"依赖双向标记），不降置信不降状态；preference 侧直接 degraded。
 - 行键为稳定 id（keys.new_id）：entries.id = sources.entry_id；topic/variant 仅业务字段；

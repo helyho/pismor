@@ -52,9 +52,15 @@ def _entry(conn, *, us="w", uid="u1", dim="preference", topic="orphan",
 
 
 def _seed_orphans(conn, topic_new="回复要简短", n=3, dim="preference",
-                  created="2026-12-10T09:00:00+08:00", uid_base=1):
+                  created="2026-12-10T09:00:00+08:00", uid_base=1,
+                  same_user=True, uid="u1", topic_start=0, summary="简短回复"):
     for i in range(n):
-        _entry(conn, uid=f"u{uid_base + i}", dim=dim, topic_new=topic_new, created=created)
+        # same_user=True 时同用户多条观察各占不同 topic，避免撞唯一键；
+        # same_user=False 时每条一个用户，用于跨用户隔离用例。
+        user = uid if same_user else f"u{uid_base + i}"
+        topic = f"orphan{topic_start + i}" if same_user else "orphan"
+        _entry(conn, uid=user, dim=dim, topic=topic, topic_new=topic_new,
+               created=created, summary=summary)
     return conn
 
 
@@ -161,23 +167,29 @@ def taxonomy_writable(tmp_path):
 
 def test_orphan_activated_after_threshold(conn, seeded_orphans_3, taxonomy, fake_llm_merge):
     stats = run_daily(conn, taxonomy, fake_llm_merge, auto_activate=True, now=NOW)
-    assert stats["activated"] == 3  # 同 topic_new 复现≥3次/30天 → re-key 转 active
-    assert stats["merged"] == 3
-    assert conn.execute("SELECT status FROM entries WHERE status='orphan_topic'").fetchone() is None
-    row = conn.execute("SELECT status, topic, dimension, id, topic_new FROM entries").fetchone()
+    # 单用户复现≥3次/30天 → 该用户组整体进入判定；同键只能留 1 条 normal，其余排队
+    assert stats["activated"] == 1
+    assert stats["merged"] == 1
+    assert conn.execute(
+        "SELECT COUNT(*) c FROM entries WHERE status='orphan_topic'").fetchone()["c"] == 2
+    row = conn.execute(
+        "SELECT status, topic, dimension, id, topic_new FROM entries WHERE status='active'"
+    ).fetchone()
     assert row["status"] == "active" and row["topic"] == "lang" and row["topic_new"] is None
     assert row["dimension"] == "preference" and len(row["id"]) == 32
     # re-key 只改 dimension/topic，id 稳定，证据链 entry_id 不变
-    src = conn.execute("SELECT entry_id FROM sources").fetchone()
-    assert src["entry_id"] == row["id"]
+    assert conn.execute(
+        "SELECT COUNT(*) c FROM sources WHERE entry_id=?", (row["id"],)
+    ).fetchone()["c"] == 1
 
 
 def test_orphan_new_topic_activated_and_yaml(conn, taxonomy_writable, fake_llm_new_topic):
     _seed_orphans(conn)
     before = taxonomy_writable.path.read_text(encoding="utf-8")
     stats = run_daily(conn, taxonomy_writable, fake_llm_new_topic, auto_activate=True, now=NOW)
-    assert stats["activated"] == 3
-    row = conn.execute("SELECT status, topic, dimension FROM entries").fetchone()
+    assert stats["activated"] == 1
+    row = conn.execute(
+        "SELECT status, topic, dimension FROM entries WHERE status='active'").fetchone()
     assert (row["status"], row["topic"], row["dimension"]) == ("active", "brevity", "preference")
     import yaml
     raw = yaml.safe_load(taxonomy_writable.path.read_text(encoding="utf-8"))
@@ -223,13 +235,38 @@ def test_orphan_old_group_dropped(conn, taxonomy, fake_llm_merge):
 
 
 def test_orphan_stale_majority_group_kept(conn, taxonomy, fake_llm_merge):
-    # 3 行中仅 1 行在窗口内：窗口口径计数 1 < 3 且未归零 → 保留等复现
-    _seed_orphans(conn, n=2, created="2026-10-01T09:00:00+08:00")
-    _seed_orphans(conn, n=1, uid_base=9)
+    # 同一用户 3 行中仅 1 行在窗口内：窗口口径计数 1 < 3 且未归零 → 保留等复现
+    _seed_orphans(conn, n=2, created="2026-10-01T09:00:00+08:00", topic_start=0)
+    _seed_orphans(conn, n=1, topic_start=2)
     stats = run_daily(conn, taxonomy, fake_llm_merge, auto_activate=True, now=NOW)
     assert stats["activated"] == 0 and stats["dropped_orphan"] == 0
     c = conn.execute("SELECT COUNT(*) c FROM entries WHERE status='orphan_topic'").fetchone()["c"]
     assert c == 3
+
+
+def test_cross_user_same_topic_new_does_not_activate(conn, taxonomy, fake_llm_merge):
+    # 3 个不同用户各 1 条同 topic_new：按用户隔离后都不足 3 次，不触发也不调 LLM
+    _seed_orphans(conn, n=3, same_user=False)
+    stats = run_daily(conn, taxonomy, fake_llm_merge, auto_activate=True, now=NOW)
+    assert stats["activated"] == 0 and stats["dropped_orphan"] == 0
+    assert conn.execute(
+        "SELECT COUNT(*) c FROM entries WHERE status='orphan_topic'").fetchone()["c"] == 3
+    assert fake_llm_merge.calls == []  # 连归并判定都不该发起
+
+
+def test_orphan_prompt_isolated_per_user(conn, taxonomy, fake_llm_new_topic):
+    # 两个用户各自复现 3 次：分两组判定，每个 prompt 只含本用户 summary
+    _seed_orphans(conn, topic_new="甲主题", n=3, uid="u1",
+                  summary="甲用户的观察")
+    _seed_orphans(conn, topic_new="乙主题", n=3, uid="u2",
+                  summary="乙用户的观察")
+    run_daily(conn, taxonomy, fake_llm_new_topic, auto_activate=True, now=NOW)
+    prompts = [call[1] for call in fake_llm_new_topic.calls]
+    assert len(prompts) == 2
+    jia = next(p for p in prompts if "甲主题" in p)
+    yi = next(p for p in prompts if "乙主题" in p)
+    assert "甲用户的观察" in jia and "乙用户的观察" not in jia
+    assert "乙用户的观察" in yi and "甲用户的观察" not in yi
 
 
 def test_taboo_orphan_never_auto_activate(conn, seeded_taboo_orphan, taxonomy, fake_llm_merge):
@@ -498,7 +535,7 @@ def test_new_topic_writes_alias(conn, taxonomy_writable, fake_llm_new_topic):
 def test_merge_to_skips_shadow_alias(conn, taxonomy_writable, fake_llm_merge):
     _seed_orphans(conn, topic_new="preference/lang")
     stats = run_daily(conn, taxonomy_writable, fake_llm_merge, auto_activate=True, now=NOW)
-    assert stats["activated"] == 3
+    assert stats["activated"] == 1
     assert "lang" not in taxonomy_writable.dimensions["preference"].topic_aliases
 
 

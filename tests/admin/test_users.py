@@ -163,9 +163,14 @@ def test_entries_search_and_facets(tmp_path):
 
 
 def test_delete_user_writes_tombstone_and_requires_capability(tmp_path):
+    from pismor.serving.merge_task import upsert_open
+
     app, client, db_path = _make_app(tmp_path)
     with closing(get_conn(db_path)) as conn:
         _insert_entry(conn, topic="a")
+        upsert_open(conn, "webchat", "u1", count=40,
+                    proposal={"free_topics": ["个人主题"]})
+        conn.commit()
 
     res = client.delete("/admin/api/users/webchat/u1")
     assert res.status_code == 200 and res.json()["mode"] == "soft"
@@ -192,6 +197,9 @@ def test_delete_user_writes_tombstone_and_requires_capability(tmp_path):
     assert client.delete("/admin/api/users/webchat/u1/permanent").json() == {"purged": True}
     with closing(get_conn(db_path)) as conn:
         assert conn.execute("SELECT COUNT(*) FROM entries").fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT COUNT(*) FROM merge_tasks WHERE user_source='webchat' AND user_id='u1'"
+        ).fetchone()[0] == 0  # 彻底删除必须清掉含 free_topics 的合并提案
         purged = conn.execute(
             "SELECT purged_at FROM tombstones WHERE user_source='webchat' AND user_id='u1'"
         ).fetchone()
@@ -204,3 +212,27 @@ def test_delete_user_writes_tombstone_and_requires_capability(tmp_path):
     assert client.delete("/admin/api/users/webchat/u2").status_code == 403
     assert client.post("/admin/api/users/webchat/u1/restore").status_code == 403
     assert client.delete("/admin/api/users/webchat/u1/permanent").status_code == 403
+
+
+def test_soft_deleted_user_hidden_from_facets_overview_and_detail(tmp_path):
+    app, client, db_path = _make_app(tmp_path)
+    with closing(get_conn(db_path)) as conn:
+        entry_id = _insert_entry(conn, topic="a", summary="alpha")
+
+    assert client.get("/admin/api/overview").json()["entries"] == 1
+    assert client.get("/admin/api/system/health").json()["entries"] == 1
+
+    assert client.delete("/admin/api/users/webchat/u1").status_code == 200
+
+    facets = client.get("/admin/api/entries/facets").json()
+    assert "webchat" not in {item["value"] for item in facets["sources"]}
+
+    params = {"user_source": "webchat", "user_id": "u1", "entry_id": entry_id}
+    assert client.get("/admin/api/entries/detail", params=params).status_code == 404
+    assert client.get("/admin/api/review/entry", params=params).status_code == 404
+
+    # 两处统计口径一致，且都不含软删用户
+    assert client.get("/admin/api/overview").json()["entries"] == 0
+    assert client.get("/admin/api/system/health").json()["entries"] == 0
+    # 删除记录与用户详情仍可见（恢复入口）
+    assert client.get("/admin/api/users/webchat/u1").status_code == 200

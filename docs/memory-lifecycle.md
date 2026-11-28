@@ -564,7 +564,7 @@ status='degraded' AND julianday(updated_at) < julianday(now) - 180
 ### 12.1 删除权
 
 - `DELETE /memory/{source}/{native_id}` 默认**软删除**：只写 tombstone，返回 `mode='soft'`；可 restore。
-- 硬删除：清空条目、证据、审计、澄清、向量，保留 tombstone 并写 `purged_at`；之后 restore 返回 `purged`。
+- 硬删除：清空条目、证据、澄清、归并任务（`merge_tasks`）与向量；`admin_audit` 审计与 `events_seen` 幂等记录刻意保留。保留 tombstone 并写 `purged_at`；之后 restore 返回 `purged`。
 - tombstone 生效后：写入管线跳过且不调 LLM；装配返回空包；事件接口 410。
 - 备份中的旧数据最多滞留 30 天（由保留份数控制）。
 - 条目级物理删除：管理端 `GET /admin/api/entries/delete-preview` 预览目标与同维度同主题的全部 conflict 副本，`DELETE /admin/api/entries` 执行；公开 `DELETE /memory/{source}/{user_id}/entries/{entry_id}` 默认同样级联，目标不存在返回 204。
@@ -582,7 +582,7 @@ status='degraded' AND julianday(updated_at) < julianday(now) - 180
 | `conflict_with_json` | 标记必须是合法 JSON 数组；坏 JSON 只报违规，不中断审计 |
 | `quote_required` | 非 `~` 行必须至少有一条证据 |
 | `inferred_cap` | inferred 证据的条目置信不得 > 0.8 |
-| `unique_key` | 四元组不得重复 |
+| `unique_key` | 六元组 (用户, 维度, 主题, variant, variant_seq) 不得重复；normal 每键最多一行 |
 | `status_consistency` | 8 条静态断言（原因、归档时间、topic_new、前缀与状态的对应） |
 | `instruction_pattern` | 正文命中指令注入模式 |
 
@@ -626,7 +626,7 @@ status='degraded' AND julianday(updated_at) < julianday(now) - 180
 | 写入/状态机 | `src/pismor/pipeline/writer.py` | `apply_actions`、`_add`、`_update`、`_conflict`、`_orphan`、`merge_entries`、`resolve_conflicts` |
 | 编排 | `src/pismor/pipeline/runner.py` | `run_pipeline`、`_run`、`_apply`、`_apply_clarification`、`_settle_pair` |
 | 澄清 | `src/pismor/pipeline/clarifier.py` | `issue_many`、`match_incoming`、`consume`、`expire` |
-| 日批 | `src/pismor/pipeline/aggregator.py` | `run_daily`、`_activate_orphans`、`_decay`、`_archive`、`_open_merge_tasks` |
+| 日批 | `src/pismor/pipeline/aggregator.py` | `run_daily`、`_collect_orphan_plans`、`_apply_orphan_plans`、`_decay`、`_archive`、`_open_merge_tasks` |
 | 装配 | `src/pismor/serving/assembler.py` | `assemble`、`_must_have`、`_related`、`_build`、`_clarifications` |
 | 复核 | `src/pismor/serving/review.py` | `apply_review_decision` |
 | 归并任务 | `src/pismor/serving/merge_task.py` | `DbMergeTaskSink`、`upsert_open`、`resolve` |

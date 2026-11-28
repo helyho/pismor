@@ -5,6 +5,7 @@
 """
 from datetime import datetime, timezone
 
+from pismor.core.lifecycle import IllegalTransition, check_transition
 from pismor.pipeline import writer
 
 
@@ -94,6 +95,10 @@ def apply_review_decision(
     else:
         # orphan 候选 confirm → 观察区（spec §8.2 启用链入口），其余 → active
         new_status = "orphan_topic" if row["dimension"] == "orphan" else "active"
+        try:
+            check_transition("manual", row["status"], new_status)
+        except IllegalTransition:
+            return {"noop": True}
         # 人工归一：把自由 topic 收敛到白名单（taboo 禁止运行期扩充的唯一入口）
         if topic is not None and topic != row["topic"]:
             dim = taxonomy.dimensions.get(row["dimension"]) if taxonomy else None
@@ -163,6 +168,10 @@ def apply_review_decision(
                     " WHERE user_source=? AND user_id=? AND dimension=? AND topic=?"
                     " AND variant='trace'",
                     (user_source, user_id, row["dimension"], row["topic"])).fetchone()[0]
+                try:
+                    check_transition("manual", row["status"], "archived")
+                except IllegalTransition:
+                    return {"noop": True}
                 cur = conn.execute(
                     "UPDATE entries SET variant='trace', variant_seq=?, status='archived',"
                     " archived_at=?, conflict_with=NULL, degraded_reason='superseded',"

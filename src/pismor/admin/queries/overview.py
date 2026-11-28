@@ -1,11 +1,10 @@
 from pathlib import Path
 import sqlite3
 
+from pismor.core.lifecycle import alive_sql
 
-_ALIVE = (
-    "NOT EXISTS (SELECT 1 FROM tombstones t"
-    " WHERE t.user_source=entries.user_source AND t.user_id=entries.user_id)"
-)
+
+_ALIVE = alive_sql("entries")
 
 
 def _scalar(conn: sqlite3.Connection, sql: str, params: tuple = ()) -> int:

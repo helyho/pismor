@@ -2,13 +2,10 @@
 import json
 import sqlite3
 
+from pismor.core.lifecycle import alive_sql, queue_condition
 
-QUEUE_CONDITION = (
-    "NOT EXISTS (SELECT 1 FROM tombstones t"
-    " WHERE t.user_source=entries.user_source AND t.user_id=entries.user_id)"
-    " AND (status='pending_review' OR (variant='conflict' AND status IN ('active','degraded')"
-    " AND conflict_with IS NOT NULL))"
-)
+
+QUEUE_CONDITION = queue_condition("entries")
 
 
 def _escape_like(value: str) -> str:
@@ -114,8 +111,7 @@ def get_entry_detail(
 ) -> dict | None:
     row = conn.execute(
         "SELECT * FROM entries WHERE user_source=? AND user_id=? AND id=?"
-        " AND NOT EXISTS (SELECT 1 FROM tombstones t"
-        "   WHERE t.user_source=entries.user_source AND t.user_id=entries.user_id)",
+        f" AND {alive_sql('entries')}",
         (user_source, user_id, entry_id),
     ).fetchone()
     if row is None:

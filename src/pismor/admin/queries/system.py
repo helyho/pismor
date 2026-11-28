@@ -3,11 +3,10 @@ import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from pismor.core.lifecycle import alive_sql
 
-_ALIVE = (
-    "NOT EXISTS (SELECT 1 FROM tombstones t"
-    " WHERE t.user_source=entries.user_source AND t.user_id=entries.user_id)"
-)
+
+_ALIVE = alive_sql("entries")
 
 
 def _scalar(conn: sqlite3.Connection, sql: str, params: tuple = ()) -> int:
@@ -130,9 +129,7 @@ def get_stats(conn: sqlite3.Connection) -> dict:
         for row in conn.execute(
             "SELECT substr(ts, 1, 10) AS day, COUNT(*) AS count"
             " FROM review_history WHERE substr(ts, 1, 10) >= ?"
-            " AND NOT EXISTS (SELECT 1 FROM tombstones t"
-            "   WHERE t.user_source=review_history.user_source"
-            "     AND t.user_id=review_history.user_id)"
+            f" AND {alive_sql('review_history')}"
             " GROUP BY day",
             (days[0],),
         )

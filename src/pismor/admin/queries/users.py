@@ -3,6 +3,7 @@ import json
 import sqlite3
 
 from pismor.admin.queries.common import like_pattern
+from pismor.core.lifecycle import alive_sql
 
 
 _DIMENSION_ORDER = (
@@ -12,10 +13,7 @@ _DIMENSION_ORDER = (
 
 
 def _users_where(*, q: str | None = None, user_source: str | None = None) -> tuple[str, list]:
-    clauses = [
-        "NOT EXISTS (SELECT 1 FROM tombstones t"
-        " WHERE t.user_source=entries.user_source AND t.user_id=entries.user_id)"
-    ]
+    clauses = [alive_sql("entries")]
     params: list[str] = []
     if user_source:
         clauses.append("user_source=?")

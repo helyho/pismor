@@ -9,6 +9,7 @@ import math
 import sqlite3
 from datetime import datetime, timezone
 
+from pismor.core.lifecycle import is_tombstoned, recallable_sql
 from pismor.pipeline.clarifier import QUESTION_TMPL as _CLARIFY_QUESTION
 from pismor.pipeline.clarifier import issue_many as _clarify_issues
 from pismor.llm.embedder import EmbedUnavailable, l2_normalize
@@ -23,15 +24,13 @@ _MUST_COLS = ("id, dimension, topic, variant, variant_seq, body, confidence, sta
               " updated_at, reinforcements")
 
 
-def _recall_filter(recall_conflicts: bool) -> str:
+def _recall_filter(recall_conflicts: bool, alias: str = "entries") -> str:
     """召回行过滤：variant 表形态，conflict_with 表争议状态。
 
     默认只注入已收尾/无争议的行；recall_conflicts=True 退回旧行为（不看 conflict_with）。
     """
-    sql = " AND status IN ('active','degraded') AND variant IN ('normal','conflict')"
-    if not recall_conflicts:
-        sql += " AND conflict_with IS NULL"
-    return sql
+    mode = "all" if recall_conflicts else "settled"
+    return " AND " + recallable_sql(alias, conflict_mode=mode)
 
 
 def _empty_pack() -> dict:
@@ -62,8 +61,7 @@ def assemble(conn, embedder, user_source, user_id, budget=2000, dimensions=None,
     """
     now = datetime.now(timezone.utc)
     try:
-        if conn.execute("SELECT 1 FROM tombstones WHERE user_source=? AND user_id=?",
-                        (user_source, user_id)).fetchone():
+        if is_tombstoned(conn, user_source, user_id):
             return _empty_pack()
         try:
             must = _must_have(conn, user_source, user_id, dimension_order,
@@ -144,7 +142,7 @@ def _vector_recall(conn, vec_json, user_source, user_id, dimensions, *,
     sql = ("SELECT {} FROM embeddings v JOIN entries e ON v.entry_id = e.id"
            " WHERE v.embedding MATCH ? AND v.k = {} AND v.distance <= ?"
            " AND e.user_source = ? AND e.user_id = ?").format(_MUST_COLS, top_k)
-    sql += _recall_filter(recall_conflicts)
+    sql += _recall_filter(recall_conflicts, "e")
     args = [vec_json, _cos_to_l2(min_similarity), user_source, user_id]
     if dimensions:
         sql += " AND e.dimension IN ({})".format(",".join("?" * len(dimensions)))
@@ -165,7 +163,7 @@ def _lexical(conn, user_source, user_id, query_tokens, dimensions, *,
     sql = ("SELECT {}, bm25(mem_fts) AS _bm25 FROM entries e JOIN mem_fts f"
            " ON f.rowid = e.rowid WHERE mem_fts MATCH ?"
            " AND e.user_source=? AND e.user_id=?").format(_MUST_COLS)
-    sql += _recall_filter(recall_conflicts)
+    sql += _recall_filter(recall_conflicts, "e")
     args = [fts.match_expr(query_tokens), user_source, user_id]
     if dimensions:
         sql += " AND e.dimension IN ({})".format(",".join("?" * len(dimensions)))

@@ -1,17 +1,11 @@
 """用户记忆删除：软删除、恢复、彻底删除；供公开 API 与管理后台共用。"""
 from datetime import datetime, timezone
 
+from pismor.core.lifecycle import is_tombstoned  # noqa: F401 (re-export)
+
 
 def utcnow() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="microseconds")
-
-
-def is_tombstoned(conn, user_source: str, user_id: str) -> bool:
-    """该用户是否处于删除状态；软删除与彻底删除都算。"""
-    return conn.execute(
-        "SELECT 1 FROM tombstones WHERE user_source=? AND user_id=?",
-        (user_source, user_id),
-    ).fetchone() is not None
 
 
 def soft_delete_memory(conn, *, user_source: str, user_id: str,

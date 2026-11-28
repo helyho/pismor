@@ -27,6 +27,7 @@ from pismor.core.config import Settings
 from pismor.serving.merge_task import DbMergeTaskSink
 from pismor.serving.review import apply_review_decision
 from pismor.core.db import get_conn, init_schema
+from pismor.core.lifecycle import queue_condition
 from pismor.core.stores import SettingsStore, TaxonomyStore
 from pismor.llm.embedder import Embedder
 from pismor.llm.client import LLMClient
@@ -197,11 +198,7 @@ def create_app(settings: Settings, llm=None, embedder=None) -> FastAPI:
             rows = conn.execute(
                 "SELECT id AS entry_id, user_source, user_id, dimension, topic, summary,"
                 " confidence, status, updated_at AS entry_version, degraded_reason AS note"
-                " FROM entries WHERE NOT EXISTS (SELECT 1 FROM tombstones t"
-                "   WHERE t.user_source=entries.user_source AND t.user_id=entries.user_id)"
-                " AND (status='pending_review'"
-                "    OR (variant='conflict' AND status IN ('active','degraded')"
-                "        AND conflict_with IS NOT NULL))"
+                f" FROM entries WHERE {queue_condition()}"
                 " ORDER BY updated_at").fetchall()
         return {"items": [dict(r) for r in rows]}
 

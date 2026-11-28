@@ -18,6 +18,9 @@ import logging
 import sqlite3
 from datetime import datetime, timezone
 
+from pismor.core.lifecycle import (
+    IllegalTransition, check_transition, is_tombstoned, recallable_sql,
+)
 from pismor.pipeline import clarifier, extractor, gate, resolver, trigger, writer
 from pismor.pipeline.normalize import normalize
 from pismor.serving import assembler
@@ -68,8 +71,7 @@ def _forget_event(conn, event):
 
 def _run(conn, settings: Settings, event, taxonomy, llm, embedder) -> None:
     us, uid = event["source"], event["user_ref"]
-    if conn.execute("SELECT 1 FROM tombstones WHERE user_source=? AND user_id=?",
-                    (us, uid)).fetchone():
+    if is_tombstoned(conn, us, uid):
         # 删除权（spec §16#4）：tombstone 为永久口径——删除后不再收集新记忆条目，也不调 LLM
         logger.info("pipeline skip for deleted user %s/%s", us, uid)
         return
@@ -80,9 +82,8 @@ def _run(conn, settings: Settings, event, taxonomy, llm, embedder) -> None:
     known_ids = [display_key(r["dimension"], r["topic"], r["variant"], r["variant_seq"])
                  for r in conn.execute(
                      "SELECT DISTINCT dimension, topic, variant, variant_seq FROM entries"
-                     " WHERE user_source=? AND user_id=?"
-                     " AND status IN ('active','degraded')"
-                     " AND variant IN ('normal','conflict') LIMIT ?",
+                     f" WHERE user_source=? AND user_id=?"
+                     f" AND {recallable_sql(conflict_mode='all')} LIMIT ?",
                      (us, uid, settings.pipeline.known_ids_limit)).fetchall()]
 
     if ev.is_dialogue:
@@ -229,12 +230,24 @@ def _settle_pair(conn, us, uid, pair_rows, applied_keys, now) -> None:
             if (row["variant"] == "conflict" and row["status"] in ("active", "degraded")
                     and not (row["dimension"] == "taboo" and row["status"] == "active")):
                 # 冲突副本：裁决后归档（保留 conflict_with 供审计）；taboo 胜出方保留
+                try:
+                    check_transition("auto", row["status"], "archived")
+                except IllegalTransition:
+                    logger.warning(
+                        "skip illegal transition %s -> archived for %s", row["status"], row["id"])
+                    continue
                 conn.execute(
                     "UPDATE entries SET status='archived', archived_at=?, updated_at=?"
                     " WHERE id=?", (now, now, row["id"]))
             elif (row["variant"] == "normal" and row["status"] == "active"
                   and row["dimension"] != "taboo" and key not in applied_keys):
                 # 单侧降级：回答揭示该条目不再成立；taboo 恒胜，不因澄清被降级
+                try:
+                    check_transition("auto", row["status"], "degraded")
+                except IllegalTransition:
+                    logger.warning(
+                        "skip illegal transition %s -> degraded for %s", row["status"], row["id"])
+                    continue
                 conn.execute(
                     "UPDATE entries SET conflict_with=NULL, updated_at=?,"
                     " status='degraded', degraded_reason='conflict_lost'"

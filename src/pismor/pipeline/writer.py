@@ -25,6 +25,7 @@ import logging
 import math
 import sqlite3
 
+from pismor.core.lifecycle import IllegalTransition, check_transition
 from pismor.llm.embedder import EmbedUnavailable, l2_normalize
 from pismor.core.keys import (
     VARIANT_CONFLICT, VARIANT_NORMAL, VARIANT_SNAPSHOT, VARIANT_TRACE,
@@ -33,13 +34,8 @@ from pismor.core.keys import (
 
 logger = logging.getLogger("mem.writer")
 
-# 合法迁移边（spec §6 状态机图）；INSERT 任意初始态、NOOP 同态强化不走迁移校验
-_LEGAL_TRANSITIONS = {
-    ("active", "degraded"), ("active", "archived"),
-    ("degraded", "active"), ("degraded", "archived"),
-    ("pending_review", "active"), ("pending_review", "deleted"),
-    ("orphan_topic", "active"), ("orphan_topic", "deleted"),
-}
+# 合法迁移边见 core/lifecycle.py（spec §6 状态机图）；
+# INSERT 任意初始态、NOOP 同态强化不走迁移校验。
 
 _ENTRY_COLS = ("user_source,user_id,dimension,topic,id,variant,variant_seq,"
                "confidence,status,body,summary,created_at,updated_at,last_reinforced_at,"
@@ -58,13 +54,8 @@ REVIVE_MIN_CONFIDENCE = 0.85
 _EMBED_ERRORS = (EmbedUnavailable, KeyError, json.JSONDecodeError, IndexError, TypeError)
 
 
-class IllegalTransition(Exception):
-    """非法状态迁移（spec §6 状态机之外的边），单条隔离不拖垮整批。"""
-
-
 def _check_transition(old_status, new_status):
-    if (old_status, new_status) not in _LEGAL_TRANSITIONS:
-        raise IllegalTransition(f"illegal transition: {old_status} -> {new_status}")
+    check_transition("auto", old_status, new_status)
 
 
 def apply_actions(conn, user_source, user_id, actions, embedder, origin_type, origin_ref, now,

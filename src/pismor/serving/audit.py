@@ -15,11 +15,12 @@ run_audit 只读；标记动作由 flag_violations 显式执行（spec §6 审�
 """
 import json
 
+from pismor.core.lifecycle import IllegalTransition, check_transition, is_tombstoned
 from pismor.core.keys import display_key
 from pismor.llm.prompts import INSTRUCTION_RE
 from pismor.pipeline.safety import quote_is_negated, topics_near
 
-_ALIVE = ("active", "degraded")  # 存活状态（恒胜/并存判定的范围）
+ALIVE_STATUSES = ("active", "degraded")  # 存活状态（恒胜/并存判定的范围）
 _ENTRY_FIELDS = ("user_source", "user_id", "dimension", "topic")
 
 
@@ -220,16 +221,17 @@ def flag_violations(conn, violations: list[dict], now: str) -> int:
             e = v.get("entry")
             if not e or not e.get("id"):
                 continue
-            if conn.execute(
-                "SELECT 1 FROM tombstones WHERE user_source=? AND user_id=?",
-                (e["user_source"], e["user_id"]),
-            ).fetchone():
+            if is_tombstoned(conn, e["user_source"], e["user_id"]):
                 continue
             row = conn.execute(
                 "SELECT status, updated_at FROM entries WHERE user_source=? AND user_id=?"
                 " AND id=?", (e["user_source"], e["user_id"], e["id"])
             ).fetchone()
             if row is None or row["status"] != "active":
+                continue
+            try:
+                check_transition("auto", row["status"], "pending_review")
+            except IllegalTransition:
                 continue
             cur = conn.execute(
                 "UPDATE entries SET status='pending_review', updated_at=?"

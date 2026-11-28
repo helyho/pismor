@@ -2,12 +2,10 @@
 import sqlite3
 
 from pismor.admin.queries.common import like_pattern
+from pismor.core.lifecycle import alive_sql
 
 
-_ALIVE = (
-    "NOT EXISTS (SELECT 1 FROM tombstones t"
-    " WHERE t.user_source=entries.user_source AND t.user_id=entries.user_id)"
-)
+_ALIVE = alive_sql("entries")
 
 
 def _entries_where(
@@ -23,10 +21,7 @@ def _entries_where(
     updated_from: str | None = None,
     updated_to: str | None = None,
 ) -> tuple[str, list]:
-    clauses = [
-        "NOT EXISTS (SELECT 1 FROM tombstones t"
-        " WHERE t.user_source=entries.user_source AND t.user_id=entries.user_id)"
-    ]
+    clauses = [_ALIVE]
     params: list = []
     if dimension:
         clauses.append("dimension=?")

@@ -16,18 +16,17 @@
 """
 import json
 
+from pismor.core.lifecycle import IllegalTransition, alive_sql, check_transition
 from pismor.core.taxonomy_edit import (
     flush_taxonomy_edits,
     plan_topic_alias,
     revert_taxonomy_edits,
 )
 
-
-_ALIVE = (
-    "NOT EXISTS (SELECT 1 FROM tombstones t"
-    " WHERE t.user_source=entries.user_source AND t.user_id=entries.user_id)"
-)
 from pismor.llm.prompts import ORPHAN_MERGE_SYSTEM, ORPHAN_MERGE_USER
+
+
+_ALIVE = alive_sql("entries")
 
 _MERGE_SCHEMA = {
     "name": "orphan_merge_decision",
@@ -242,6 +241,13 @@ def _rekey(conn, rows, dim, topic, now):
         if exists:
             _queue_audit(conn, [r], now, note=f"merge_key_conflict: {dim}_{topic}")
             continue
+        if r["status"] != "active":
+            try:
+                check_transition("auto", r["status"], "active")
+            except IllegalTransition:
+                _queue_audit(
+                    conn, [r], now, note=f"illegal_transition: {r['status']}->active")
+                continue
         conn.execute(
             "UPDATE entries SET dimension=?, topic=?, status='active', topic_new=NULL,"
             " updated_at=? WHERE id=?",
@@ -317,6 +323,7 @@ def _stage_taxonomy(taxonomy, dim, topic, topic_new, rows, appends):
 
 def _decay(conn, now, degrade_days: int = 90, degrade_confidence: float = 0.7):
     """degrade_days 天无强化且 conf<degrade_confidence 的 active 条目衰减（taboo 恒不时间衰减，spec §11）。"""
+    # 批量迁移：from 由 WHERE status='active' 保证，to 是常量；边表见 core.lifecycle。
     cur = conn.execute(
         "UPDATE entries SET status='degraded', degraded_reason='stale'"
         " WHERE status='active' AND variant='normal' AND dimension!='taboo' AND confidence<?"
@@ -328,6 +335,7 @@ def _decay(conn, now, degrade_days: int = 90, degrade_confidence: float = 0.7):
 
 def _archive(conn, now):
     """degraded 180 天无任何更新 → 归档（衰减 UPDATE 不刷 updated_at，观察期自 last write 起算）。"""
+    # 批量迁移：from 由 WHERE status='degraded' 保证，to 是常量。
     cur = conn.execute(
         "UPDATE entries SET status='archived', archived_at=?"
         f" WHERE status='degraded' AND julianday(updated_at) < julianday(?) - 180"

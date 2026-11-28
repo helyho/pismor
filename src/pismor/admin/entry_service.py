@@ -24,13 +24,12 @@ from pismor.pipeline.safety import (
     sensitive_cap,
     topics_near,
 )
+from pismor.core.lifecycle import (
+    STATUSES, IllegalTransition, check_transition, is_tombstoned,
+)
 from pismor.pipeline import writer
 from pismor.pipeline.resolver import neighbor_candidates, neighbor_conflict
 
-
-STATUSES = frozenset({
-    "pending_review", "orphan_topic", "active", "degraded", "archived",
-})
 
 # 键字段长度上限（与 core/schemas.py 的 source/user_ref max_length 一致）
 _KEY_MAX_LEN = 128
@@ -190,10 +189,7 @@ def check_safety(
 
 def check_tombstone(conn, user_source: str, user_id: str) -> list[FieldError]:
     """用户墓碑检查（查询模式同 serving/audit.py）。"""
-    if conn.execute(
-        "SELECT 1 FROM tombstones WHERE user_source=? AND user_id=?",
-        (user_source, user_id),
-    ).fetchone():
+    if is_tombstoned(conn, user_source, user_id):
         return [FieldError("user_id", "user_deleted", "用户已删除，恢复后才能新建条目")]
     return []
 
@@ -305,10 +301,7 @@ def check_entry_edit(
             "warnings": [],
             "conflicts": [],
         }
-    if conn.execute(
-        "SELECT 1 FROM tombstones WHERE user_source=? AND user_id=?",
-        (user_source, user_id),
-    ).fetchone():
+    if is_tombstoned(conn, user_source, user_id):
         return {
             "ok": False,
             "errors": ["用户已删除，恢复后才能编辑条目"],
@@ -467,6 +460,14 @@ def apply_entry_edit(
     if row is None:
         return {
             "ok": False, "errors": ["条目不存在或已被删除"], "warnings": [],
+            "conflicts": [], "stale": False, "id": None, "updated_at": None,
+        }
+
+    try:
+        check_transition("manual", row["status"], status)
+    except IllegalTransition as exc:
+        return {
+            "ok": False, "errors": [str(exc)], "warnings": [],
             "conflicts": [], "stale": False, "id": None, "updated_at": None,
         }
 

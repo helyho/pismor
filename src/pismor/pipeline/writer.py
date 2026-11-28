@@ -329,6 +329,23 @@ def _superseded_identity(conn, us, uid, d, t, now):
     return _next_variant_seq(conn, us, uid, d, t, VARIANT_TRACE)
 
 
+def archive_as_trace(conn, row, now, *, degraded_reason=None):
+    """整行原地转 trace 归档：让出 normal 唯一槽位，id/sources/引用一律保持不变。
+
+    与 _update 的“复制到新 trace 行”不同：这里原行不再承载规范值，所以直接改
+    variant 即可——同键后续 ADD 能重新占用 normal，证据链与 conflict_with 引用
+    也不会悬空。degraded_reason 传 None 保留原衰减原因（如 stale）。
+    """
+    _check_transition(row["status"], "archived")
+    d, t = row["dimension"], row["topic"]
+    seq = _next_variant_seq(conn, row["user_source"], row["user_id"], d, t, VARIANT_TRACE)
+    conn.execute(
+        "UPDATE entries SET variant=?, variant_seq=?, status='archived', archived_at=?,"
+        " degraded_reason=COALESCE(?, degraded_reason), superseded_by=NULL"
+        " WHERE id=?",
+        (VARIANT_TRACE, seq, now, degraded_reason, row["id"]))
+
+
 def _conflict(conn, us, uid, c, target, now, origin_type, origin_ref, vectors) -> bool:
     if not c.get("quote"):
         return False
@@ -383,6 +400,9 @@ def _noop(conn, us, uid, target, now) -> bool:
     old = _fetch_row(conn, us, uid, target) if target is not None else None
     if old is None:
         raise IllegalTransition(f"NOOP target not found: {target}")
+    if old["status"] not in ("active", "degraded"):
+        # 归档/待复核行不参与强化：静默 +1 是“假成功”（永不装配），按非法迁移丢弃
+        raise IllegalTransition(f"NOOP on {old['status']}: {target}")
     conn.execute(
         "UPDATE entries SET reinforcements=reinforcements+1, last_reinforced_at=?"
         " WHERE id=?",

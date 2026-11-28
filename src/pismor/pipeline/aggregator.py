@@ -22,6 +22,8 @@ from pismor.core.taxonomy_edit import (
     plan_topic_alias,
     revert_taxonomy_edits,
 )
+from pismor.core.keys import VARIANT_NORMAL
+from pismor.pipeline.writer import archive_as_trace
 
 from pismor.llm.prompts import ORPHAN_MERGE_SYSTEM, ORPHAN_MERGE_USER
 
@@ -334,14 +336,25 @@ def _decay(conn, now, degrade_days: int = 90, degrade_confidence: float = 0.7):
 
 
 def _archive(conn, now):
-    """degraded 180 天无任何更新 → 归档（衰减 UPDATE 不刷 updated_at，观察期自 last write 起算）。"""
-    # 批量迁移：from 由 WHERE status='degraded' 保证，to 是常量。
-    cur = conn.execute(
-        "UPDATE entries SET status='archived', archived_at=?"
-        f" WHERE status='degraded' AND julianday(updated_at) < julianday(?) - 180"
+    """degraded 180 天无任何更新 → 归档（衰减 UPDATE 不刷 updated_at，观察期自 last write 起算）。
+
+    normal 行原地转 trace：让出唯一槽位，同键后续 ADD 才能重新占用 normal；
+    conflict 行按 variant_seq 分裂存多行，不阻塞 normal 写入，只落终态。
+    """
+    rows = conn.execute(
+        "SELECT * FROM entries WHERE status='degraded'"
+        " AND julianday(updated_at) < julianday(?) - 180"
         f"   AND {_ALIVE}",
-        (now, now))
-    return cur.rowcount
+        (now,)).fetchall()
+    for row in rows:
+        if row["variant"] == VARIANT_NORMAL:
+            archive_as_trace(conn, row, now)
+        else:
+            check_transition("auto", row["status"], "archived")
+            conn.execute(
+                "UPDATE entries SET status='archived', archived_at=? WHERE id=?",
+                (now, row["id"]))
+    return len(rows)
 
 
 def _drop_expired_reviews(conn, now):

@@ -150,6 +150,17 @@ def init_schema(conn: sqlite3.Connection, vec_dimensions: int | None) -> None:
         )
     conn.executescript(SCHEMA)
     conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+    # 旧库自愈：normal 形态的归档行仍占 normal 唯一槽位（同键新记忆写不进来，
+    # 冲突/一致判定会撞非法迁移或被静默丢弃）。原地转 trace，id 与 sources 不动，
+    # 与 aggregator 归档口径一致；执行后该条件不再命中，幂等。
+    conn.execute(
+        "UPDATE entries SET variant='trace',"
+        " variant_seq=(SELECT COALESCE(MAX(e.variant_seq),0)+1 FROM entries e"
+        "  WHERE e.user_source=entries.user_source AND e.user_id=entries.user_id"
+        "    AND e.dimension=entries.dimension AND e.topic=entries.topic"
+        "    AND e.variant='trace'),"
+        " superseded_by=NULL"
+        " WHERE variant='normal' AND status='archived'")
     # 旧库升级：tombstones 增加 purged_at（软删除/彻底删除双态）
     columns = {row["name"] for row in conn.execute("PRAGMA table_info(tombstones)")}
     if "purged_at" not in columns:

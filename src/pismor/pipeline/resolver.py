@@ -55,7 +55,7 @@ def resolve(conn, user_source, user_id, candidates, llm):
             continue
         existing = conn.execute(
             "SELECT * FROM entries WHERE user_source=? AND user_id=? AND dimension=? AND topic=?"
-            " AND variant='normal'",
+            " AND variant='normal' AND status!='archived'",
             (user_source, user_id, c["dimension"], c["topic"])).fetchone()
         if existing is None:
             neighbor = _neighbor_conflict(conn, user_source, user_id, c, llm)

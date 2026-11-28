@@ -267,6 +267,13 @@ def test_illegal_transition_rejected(conn, seeded_archived, embedder_stub):
                       embedder_stub, "text", "e1", NOW)
 
 
+def test_noop_on_archived_rejected(conn, seeded_archived):
+    # 归档行不参与强化：静默 +1 是“假成功”（永不装配），按非法迁移丢弃
+    with pytest.raises(IllegalTransition):
+        apply_actions(conn, "w", "u", [noop_action("preference", "lang")],
+                      None, "text", "e1", NOW)
+
+
 def test_illegal_transition_rolls_back_batch(conn, seeded_active, embedder_stub):
     # 整批原子性：合法 NOOP + 非法 UPDATE 同批，抛出后 NOOP 强化也不落库
     actions = [noop_action("preference", "lang"),

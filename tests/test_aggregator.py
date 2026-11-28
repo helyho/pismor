@@ -11,6 +11,7 @@ import yaml
 
 from pismor.core.keys import new_id
 from pismor.pipeline.aggregator import run_daily
+from pismor.pipeline.writer import apply_actions
 from pismor.core.taxonomy import load_taxonomy
 from pismor.pipeline.extractor import extract as _extract
 from pismor.pipeline.normalize import normalize
@@ -349,8 +350,26 @@ def test_taboo_not_decayed_by_time(conn, seeded_stale_taboo, taxonomy):
 def test_degraded_archived_after_180d(conn, seeded_degraded_old, taxonomy):
     stats = run_daily(conn, taxonomy, FakeLLM([]), True, now=NOW)
     assert stats["archived"] == 1
-    row = conn.execute("SELECT status, archived_at FROM entries").fetchone()
-    assert row["status"] == "archived" and row["archived_at"] == NOW
+    row = conn.execute("SELECT status, archived_at, variant FROM entries").fetchone()
+    assert row["variant"] == "trace" and row["status"] == "archived"
+    assert row["archived_at"] == NOW
+    # 归档让出 normal 唯一槽位（不再以 normal 形态占位）
+    assert conn.execute(
+        "SELECT COUNT(*) c FROM entries WHERE variant='normal'").fetchone()["c"] == 0
+
+
+def test_archived_entry_releases_slot_for_same_topic(conn, seeded_degraded_old, taxonomy):
+    """归档转 trace 后，同键新记忆能重新占用 normal 槽位（旧实现会被唯一键静默丢弃）。"""
+    run_daily(conn, taxonomy, FakeLLM([]), True, now=NOW)
+    cand = {"dimension": "preference", "topic": "format", "body": "偏好纯文本",
+            "summary": "纯文本", "confidence": 0.9, "kind": "explicit",
+            "quote": "别用 markdown"}
+    applied = apply_actions(conn, "w", "u1", [{"op": "ADD", "candidate": cand}],
+                            None, "conversation", "s2:1", NOW)
+    assert applied
+    cur = conn.execute(
+        "SELECT * FROM entries WHERE variant='normal' AND topic='format'").fetchone()
+    assert cur["status"] == "active" and cur["body"] == "偏好纯文本"
 
 
 def test_review_expired(conn, seeded_old_pending_review, seeded_fresh_pending_review, taxonomy):

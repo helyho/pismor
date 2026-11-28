@@ -256,3 +256,23 @@ def test_edit_body_reembeds_vector_with_new_text(tmp_path):
     expected = [0.1, 0.2, 0.3, 0.4]
     norm = sum(v * v for v in expected) ** 0.5
     assert all(abs(a - b / norm) < 1e-6 for a, b in zip(raw, expected))
+
+
+def test_restore_archived_trace_to_active(tmp_path):
+    """归档行统一为 trace 形态后，编辑恢复必须改回 normal（否则违反 CHECK）。"""
+    app, client, db_path = _make_app(tmp_path)
+    with closing(get_conn(db_path)) as conn:
+        entry_id = _insert_entry(conn, status="archived")
+        conn.execute("UPDATE entries SET variant='trace', variant_seq=1 WHERE id=?",
+                     (entry_id,))
+        conn.commit()
+    res = client.patch("/admin/api/entries", json=_payload(
+        entry_id=entry_id, new_dimension="preference", new_topic="style",
+        status="active"))
+    assert res.status_code == 200, res.text
+    with closing(get_conn(db_path)) as conn:
+        row = conn.execute(
+            "SELECT variant, variant_seq, status, archived_at FROM entries WHERE id=?",
+            (entry_id,)).fetchone()
+    assert (row["variant"], row["variant_seq"], row["status"]) == ("normal", 0, "active")
+    assert row["archived_at"] is None

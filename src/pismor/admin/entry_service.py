@@ -201,7 +201,7 @@ def _conflict_columns() -> str:
 def find_same_key(
     conn, user_source: str, user_id: str, dimension: str, topic: str,
 ) -> dict | None:
-    """同键既有条目（不限状态：archived 也算，创建时提示走编辑恢复）；无 → None。"""
+    """同键规范行（normal 形态，不限状态）；归档行已转 trace，不再占用此键。"""
     row = conn.execute(
         f"SELECT {_conflict_columns()} FROM entries"
         " WHERE user_source=? AND user_id=? AND dimension=? AND topic=?"
@@ -459,16 +459,22 @@ def apply_entry_edit(
     else:
         archived_at = None
     superseded_by = row["superseded_by"] if status == "archived" else None
+    variant, variant_seq = row["variant"], row["variant_seq"]
+    if variant == writer.VARIANT_TRACE and status != "archived":
+        # 归档统一为 trace 形态：编辑恢复时改回规范行，否则违反
+        # CHECK(variant='trace' → status='archived')；同键已有 normal 行时
+        # check_entry_edit 已用 conflicts 拦下（ok=False），不会撞唯一键。
+        variant, variant_seq = writer.VARIANT_NORMAL, 0
 
     current = conn.execute(
         "UPDATE entries SET dimension=?, topic=?, confidence=?,"
         " status=?, body=?, summary=?, degraded_reason=?, archived_at=?,"
-        " superseded_by=?, topic_new=NULL, updated_at=?"
+        " superseded_by=?, topic_new=NULL, variant=?, variant_seq=?, updated_at=?"
         " WHERE user_source=? AND user_id=? AND id=? AND updated_at=?",
         (
             new_dimension, new_topic, confidence, status,
             body.strip(), summary.strip(), (degraded_reason or "").strip() or None,
-            archived_at, superseded_by, now,
+            archived_at, superseded_by, variant, variant_seq, now,
             user_source, user_id, entry_id, expected_version,
         ),
     )

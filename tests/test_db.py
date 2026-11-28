@@ -31,3 +31,23 @@ def test_legacy_v1_db_rejected(tmp_path):
     c.commit()
     with pytest.raises(RuntimeError, match="不兼容"):
         init_schema(c, vec_dimensions=None)
+
+
+def test_archived_normal_healed_to_trace(conn):
+    """v2 遗留的 normal+archived 占槽位 → init_schema 原地转 trace，同键可再写入。"""
+    conn.execute(
+        "INSERT INTO entries (user_source,user_id,dimension,topic,id,confidence,status,"
+        "body,summary,created_at,updated_at,last_reinforced_at,archived_at)"
+        " VALUES ('w','u','preference','lang','old_id',0.9,'archived','a','a',"
+        "'t','t','t','t')")
+    conn.commit()
+    init_schema(conn, vec_dimensions=None)
+    row = conn.execute("SELECT * FROM entries WHERE id='old_id'").fetchone()
+    assert row["variant"] == "trace" and row["variant_seq"] == 1
+    assert row["status"] == "archived"
+    # 槽位已释放：同键 normal 行可插入
+    conn.execute(
+        "INSERT INTO entries (user_source,user_id,dimension,topic,id,confidence,status,"
+        "body,summary,created_at,updated_at,last_reinforced_at)"
+        " VALUES ('w','u','preference','lang','new_id',0.9,'active','b','b','t','t','t')")
+    conn.commit()
